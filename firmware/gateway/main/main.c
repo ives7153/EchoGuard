@@ -1,47 +1,468 @@
+#include <inttypes.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "esp_err.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+
+/* Gateway 基本信息：开放 SoftAP，仅用于现场局域网发现与后续调试。 */
+#define WIFI_SOFTAP_SSID          "RuView-Rescue-GW-01"
+#define WIFI_SOFTAP_CHANNEL       6
+#define WIFI_SOFTAP_MAX_CONN      4
+
+/* LoRa/SX1278 引脚定义：与 hardware/readme.md 中 Gateway 接线保持一致。 */
+#define LORA_SPI_HOST             SPI2_HOST
+#define LORA_PIN_CS               GPIO_NUM_5
+#define LORA_PIN_SCK              GPIO_NUM_18
+#define LORA_PIN_MOSI             GPIO_NUM_23
+#define LORA_PIN_MISO             GPIO_NUM_19
+#define LORA_PIN_DIO0             GPIO_NUM_4
+#define LORA_PIN_RST              GPIO_NUM_21
+
+/* LoRa 空口参数：433 MHz、BW 125 kHz、SF7、CR 4/5、TX power 17 dBm。 */
+#define LORA_FREQ_HZ              433000000UL
+#define LORA_SPI_CLOCK_HZ         (4 * 1000 * 1000)
+#define LORA_EXPECTED_VERSION     0x12
+#define LORA_PACKET_RSSI_OFFSET   164
+
+/* 队列和任务参数：包很小，队列长度 16 足够覆盖短时突发。 */
+#define LORA_QUEUE_LENGTH         16
+#define LORA_RX_PAYLOAD_LEN       14
+#define WIFI_TASK_STACK_SIZE      4096
+#define LORA_TASK_STACK_SIZE      4096
+#define SERIAL_TASK_STACK_SIZE    4096
+
+/* SX1278 常用寄存器地址。 */
+#define REG_FIFO                  0x00
+#define REG_OP_MODE               0x01
+#define REG_FRF_MSB               0x06
+#define REG_FRF_MID               0x07
+#define REG_FRF_LSB               0x08
+#define REG_PA_CONFIG             0x09
+#define REG_LNA                   0x0C
+#define REG_FIFO_ADDR_PTR         0x0D
+#define REG_FIFO_TX_BASE_ADDR     0x0E
+#define REG_FIFO_RX_BASE_ADDR     0x0F
+#define REG_FIFO_RX_CURRENT_ADDR  0x10
+#define REG_IRQ_FLAGS             0x12
+#define REG_RX_NB_BYTES           0x13
+#define REG_PKT_RSSI_VALUE        0x1A
+#define REG_MODEM_CONFIG_1        0x1D
+#define REG_MODEM_CONFIG_2        0x1E
+#define REG_PREAMBLE_MSB          0x20
+#define REG_PREAMBLE_LSB          0x21
+#define REG_PAYLOAD_LENGTH        0x22
+#define REG_MODEM_CONFIG_3        0x26
+#define REG_DIO_MAPPING_1         0x40
+#define REG_VERSION               0x42
+#define REG_PA_DAC                0x4D
+
+#define MODE_LONG_RANGE           0x80
+#define MODE_SLEEP                0x00
+#define MODE_STDBY                0x01
+#define MODE_RX_CONTINUOUS        0x05
+
+#define IRQ_RX_DONE               0x40
+#define IRQ_PAYLOAD_CRC_ERROR     0x20
+
+typedef struct {
+    uint8_t id;
+    uint32_t seq;
+    uint8_t presence;
+    uint8_t motion;
+    uint8_t bpm;
+    uint8_t conf;
+    uint16_t gas;
+    int16_t temp_x10;
+    uint8_t hum;
+    int16_t rssi;
+    int64_t ts_ms;
+} rescue_lora_packet_t;
 
 static const char *TAG = "rescue_gateway";
 
-static void init_gateway_board(void)
+static QueueHandle_t s_lora_queue;
+static spi_device_handle_t s_lora_spi;
+
+static esp_err_t lora_spi_bus_init_once(void);
+static esp_err_t lora_chip_configure(void);
+static void lora_set_op_mode(uint8_t mode);
+static void lora_write_reg(uint8_t reg, uint8_t value);
+static uint8_t lora_read_reg(uint8_t reg);
+static bool lora_receive_once(rescue_lora_packet_t *packet);
+static bool parse_lora_payload(const uint8_t *payload, size_t len, rescue_lora_packet_t *packet);
+
+/* 串口初始化：ESP32-S3 USB Serial/JTAG 由 sdkconfig.defaults 选择，stdio 直接输出到上位机。 */
+static void serial_console_init(void)
 {
-    ESP_LOGI(TAG, "Gateway board resources initialized");
+    setvbuf(stdout, NULL, _IONBF, 0);
+    ESP_LOGI(TAG, "USB Serial/JTAG console ready, baud=115200");
 }
 
-static void init_lora_downlink(void)
-{
-    ESP_LOGI(TAG, "LoRa receiver initialized");
-}
-
-static void init_upper_computer_link(void)
-{
-    ESP_LOGI(TAG, "Upper computer serial link initialized, baud=115200");
-}
-
-static void gateway_forward_task(void *arg)
+/* WiFi SoftAP 任务：启动无密码热点，提供纯局域网调试入口，不做外网转发。 */
+static void wifi_softap_task(void *arg)
 {
     (void)arg;
 
-    uint32_t counter = 0;
+    ESP_LOGI(TAG, "Starting open SoftAP: %s", WIFI_SOFTAP_SSID);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
+    ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = WIFI_SOFTAP_SSID,
+            .ssid_len = strlen(WIFI_SOFTAP_SSID),
+            .channel = WIFI_SOFTAP_CHANNEL,
+            .password = "",
+            .max_connection = WIFI_SOFTAP_MAX_CONN,
+            .authmode = WIFI_AUTH_OPEN,
+            .pmf_cfg = {
+                .required = false,
+            },
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "SoftAP started, ssid=%s, channel=%d, auth=open",
+             WIFI_SOFTAP_SSID, WIFI_SOFTAP_CHANNEL);
+
+    /* WiFi 驱动启动后由系统任务维护；本任务保留心跳，便于现场判断 SoftAP 仍在线。 */
     while (true) {
-        printf("NODE,1,CSI,%lu,RSSI,-55,TEMP,25.3,HUM,60.1\n", (unsigned long)counter++);
-        fflush(stdout);
-        ESP_LOGI(TAG, "Forwarded one sample frame to upper computer");
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        ESP_LOGI(TAG, "SoftAP alive");
+    }
+}
+
+/* LoRa 接收任务：初始化 SX1278，轮询 DIO0/IRQ 标志，收到合法帧后送入队列。 */
+static void lora_receive_task(void *arg)
+{
+    (void)arg;
+
+    while (lora_spi_bus_init_once() != ESP_OK) {
+        ESP_LOGE(TAG, "LoRa SPI init failed, retrying");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    while (lora_chip_configure() != ESP_OK) {
+        ESP_LOGE(TAG, "SX1278 init failed, check wiring/power/antenna, retrying");
         vTaskDelay(pdMS_TO_TICKS(3000));
     }
+
+    ESP_LOGI(TAG, "SX1278 receive mode ready: 433MHz BW125 SF7 CR4/5");
+
+    while (true) {
+        rescue_lora_packet_t packet = {0};
+
+        if (lora_receive_once(&packet)) {
+            if (xQueueSend(s_lora_queue, &packet, 0) != pdTRUE) {
+                ESP_LOGE(TAG, "LoRa queue full, dropping packet id=%u seq=%" PRIu32,
+                         packet.id, packet.seq);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/* 串口转发任务：只把 LoRa 数据帧转成 JSON Lines，便于 Python 上位机按行解析。 */
+static void serial_forward_task(void *arg)
+{
+    (void)arg;
+
+    while (true) {
+        rescue_lora_packet_t packet = {0};
+        if (xQueueReceive(s_lora_queue, &packet, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        printf("{\"id\":%u,\"seq\":%" PRIu32 ",\"presence\":%u,\"motion\":%u,"
+               "\"bpm\":%u,\"conf\":%u,\"gas\":%u,\"temp\":%.1f,"
+               "\"hum\":%u,\"rssi\":%d,\"ts\":%" PRId64 "}\n",
+               packet.id,
+               packet.seq,
+               packet.presence,
+               packet.motion,
+               packet.bpm,
+               packet.conf,
+               packet.gas,
+               (double)packet.temp_x10 / 10.0,
+               packet.hum,
+               packet.rssi,
+               packet.ts_ms);
+        fflush(stdout);
+    }
+}
+
+static void nvs_init_for_wifi(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS needs erase before WiFi init, erasing");
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-S3 LoRa gateway starting");
+    serial_console_init();
+    ESP_LOGI(TAG, "ESP32-S3 LoRa rescue gateway starting");
 
-    init_gateway_board();
-    init_lora_downlink();
-    init_upper_computer_link();
+    nvs_init_for_wifi();
 
-    xTaskCreate(gateway_forward_task, "gateway_forward", 4096, NULL, 5, NULL);
+    s_lora_queue = xQueueCreate(LORA_QUEUE_LENGTH, sizeof(rescue_lora_packet_t));
+    if (s_lora_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create LoRa packet queue");
+        return;
+    }
+
+    BaseType_t wifi_task_ok = xTaskCreate(wifi_softap_task, "wifi_softap", WIFI_TASK_STACK_SIZE,
+                                          NULL, 5, NULL);
+    BaseType_t lora_task_ok = xTaskCreate(lora_receive_task, "lora_receive", LORA_TASK_STACK_SIZE,
+                                          NULL, 6, NULL);
+    BaseType_t serial_task_ok = xTaskCreate(serial_forward_task, "serial_forward",
+                                            SERIAL_TASK_STACK_SIZE, NULL, 5, NULL);
+
+    if (wifi_task_ok != pdPASS || lora_task_ok != pdPASS || serial_task_ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create one or more gateway tasks");
+    }
+}
+
+static esp_err_t lora_spi_bus_init_once(void)
+{
+    if (s_lora_spi != NULL) {
+        return ESP_OK;
+    }
+
+    spi_bus_config_t bus_config = {
+        .mosi_io_num = LORA_PIN_MOSI,
+        .miso_io_num = LORA_PIN_MISO,
+        .sclk_io_num = LORA_PIN_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 64,
+    };
+
+    esp_err_t ret = spi_bus_initialize(LORA_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    spi_device_interface_config_t dev_config = {
+        .clock_speed_hz = LORA_SPI_CLOCK_HZ,
+        .mode = 0,
+        .spics_io_num = LORA_PIN_CS,
+        .queue_size = 1,
+    };
+
+    ret = spi_bus_add_device(LORA_SPI_HOST, &dev_config, &s_lora_spi);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    gpio_config_t rst_config = {
+        .pin_bit_mask = 1ULL << LORA_PIN_RST,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&rst_config));
+
+    gpio_config_t dio0_config = {
+        .pin_bit_mask = 1ULL << LORA_PIN_DIO0,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&dio0_config));
+
+    return ESP_OK;
+}
+
+static esp_err_t lora_chip_configure(void)
+{
+    /* SX1278 硬复位：RST 低电平保持后释放，高电平等待晶振稳定。 */
+    gpio_set_level(LORA_PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(LORA_PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    uint8_t version = lora_read_reg(REG_VERSION);
+    if (version != LORA_EXPECTED_VERSION) {
+        ESP_LOGE(TAG, "Unexpected SX1278 version=0x%02x, expected=0x%02x",
+                 version, LORA_EXPECTED_VERSION);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    lora_set_op_mode(MODE_SLEEP);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    const uint64_t frf = ((uint64_t)LORA_FREQ_HZ << 19) / 32000000UL;
+    lora_write_reg(REG_FRF_MSB, (uint8_t)(frf >> 16));
+    lora_write_reg(REG_FRF_MID, (uint8_t)(frf >> 8));
+    lora_write_reg(REG_FRF_LSB, (uint8_t)frf);
+
+    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x00);
+    lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
+    lora_write_reg(REG_LNA, 0x23);
+
+    /* BW=125 kHz(0x7), CR=4/5(0x1), 显式头模式。 */
+    lora_write_reg(REG_MODEM_CONFIG_1, 0x72);
+    /* SF=7，开启 payload CRC，符号超时高位为 0。 */
+    lora_write_reg(REG_MODEM_CONFIG_2, 0x74);
+    /* SF7/BW125 不需要低速率优化；开启 AGC 自动增益。 */
+    lora_write_reg(REG_MODEM_CONFIG_3, 0x04);
+    lora_write_reg(REG_PREAMBLE_MSB, 0x00);
+    lora_write_reg(REG_PREAMBLE_LSB, 0x08);
+    lora_write_reg(REG_PAYLOAD_LENGTH, LORA_RX_PAYLOAD_LEN);
+
+    /* PA_BOOST 输出 17 dBm：0x80 | (17 - 2)，PA_DAC 保持常规 20 dBm 以下模式。 */
+    lora_write_reg(REG_PA_CONFIG, 0x8F);
+    lora_write_reg(REG_PA_DAC, 0x84);
+
+    /* DIO0 映射为 RxDone，清空历史中断，进入连续接收模式。 */
+    lora_write_reg(REG_DIO_MAPPING_1, 0x00);
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
+    lora_set_op_mode(MODE_RX_CONTINUOUS);
+
+    return ESP_OK;
+}
+
+static void lora_set_op_mode(uint8_t mode)
+{
+    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE | mode);
+}
+
+static void lora_write_reg(uint8_t reg, uint8_t value)
+{
+    uint8_t tx_data[2] = { (uint8_t)(reg | 0x80), value };
+    spi_transaction_t transaction = {
+        .length = 16,
+        .tx_buffer = tx_data,
+    };
+    esp_err_t ret = spi_device_transmit(s_lora_spi, &transaction);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LoRa write reg 0x%02x failed: %s", reg, esp_err_to_name(ret));
+    }
+}
+
+static uint8_t lora_read_reg(uint8_t reg)
+{
+    uint8_t tx_data[2] = { (uint8_t)(reg & 0x7F), 0x00 };
+    uint8_t rx_data[2] = {0};
+    spi_transaction_t transaction = {
+        .length = 16,
+        .tx_buffer = tx_data,
+        .rx_buffer = rx_data,
+    };
+
+    esp_err_t ret = spi_device_transmit(s_lora_spi, &transaction);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LoRa read reg 0x%02x failed: %s", reg, esp_err_to_name(ret));
+        return 0;
+    }
+
+    return rx_data[1];
+}
+
+static bool lora_receive_once(rescue_lora_packet_t *packet)
+{
+    uint8_t irq_flags = lora_read_reg(REG_IRQ_FLAGS);
+    if ((irq_flags & IRQ_RX_DONE) == 0 && gpio_get_level(LORA_PIN_DIO0) == 0) {
+        return false;
+    }
+
+    if ((irq_flags & IRQ_PAYLOAD_CRC_ERROR) != 0) {
+        ESP_LOGW(TAG, "LoRa CRC error, irq=0x%02x", irq_flags);
+        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_set_op_mode(MODE_RX_CONTINUOUS);
+        return false;
+    }
+
+    uint8_t payload_len = lora_read_reg(REG_RX_NB_BYTES);
+    uint8_t current_addr = lora_read_reg(REG_FIFO_RX_CURRENT_ADDR);
+    int16_t rssi = (int16_t)lora_read_reg(REG_PKT_RSSI_VALUE) - LORA_PACKET_RSSI_OFFSET;
+
+    lora_write_reg(REG_FIFO_ADDR_PTR, current_addr);
+
+    uint8_t payload[64] = {0};
+    uint8_t read_len = payload_len;
+    if (read_len > sizeof(payload)) {
+        read_len = sizeof(payload);
+    }
+
+    for (uint8_t i = 0; i < read_len; ++i) {
+        payload[i] = lora_read_reg(REG_FIFO);
+    }
+
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_set_op_mode(MODE_RX_CONTINUOUS);
+
+    if (payload_len != LORA_RX_PAYLOAD_LEN) {
+        ESP_LOGW(TAG, "Unexpected LoRa payload length=%u, expected=%u",
+                 payload_len, LORA_RX_PAYLOAD_LEN);
+        return false;
+    }
+
+    if (!parse_lora_payload(payload, payload_len, packet)) {
+        ESP_LOGW(TAG, "Failed to parse LoRa payload");
+        return false;
+    }
+
+    packet->rssi = rssi;
+    packet->ts_ms = esp_timer_get_time() / 1000;
+    return true;
+}
+
+static bool parse_lora_payload(const uint8_t *payload, size_t len, rescue_lora_packet_t *packet)
+{
+    if (payload == NULL || packet == NULL || len != LORA_RX_PAYLOAD_LEN) {
+        return false;
+    }
+
+    /* LoRa v1 小端二进制帧：
+     * id:u8, seq:u32, presence:u8, motion:u8, bpm:u8, conf:u8,
+     * gas:u16, temp_x10:i16, hum:u8。
+     */
+    packet->id = payload[0];
+    packet->seq = ((uint32_t)payload[1]) |
+                  ((uint32_t)payload[2] << 8) |
+                  ((uint32_t)payload[3] << 16) |
+                  ((uint32_t)payload[4] << 24);
+    packet->presence = payload[5];
+    packet->motion = payload[6];
+    packet->bpm = payload[7];
+    packet->conf = payload[8];
+    packet->gas = (uint16_t)payload[9] | ((uint16_t)payload[10] << 8);
+    packet->temp_x10 = (int16_t)((uint16_t)payload[11] | ((uint16_t)payload[12] << 8));
+    packet->hum = payload[13];
+
+    return true;
 }
