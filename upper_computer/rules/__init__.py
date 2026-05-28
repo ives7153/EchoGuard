@@ -1,4 +1,5 @@
-"""规则判断模块占位。
+"""规则判断模块。"""
 
-中文注释：后续在这里放置阈值报警、人员活动状态判断和传感器异常检测规则。
-"""
+from .alarm_rules import evaluate_sample, reset_alarm_state
+
+__all__ = ["evaluate_sample", "reset_alarm_state"]
