@@ -1,63 +1,106 @@
-"""Gateway 文本协议解析模块。"""
+"""Gateway JSON Lines 数据解析模块。"""
 
 from __future__ import annotations
 
+import json
+import time
 from typing import Any
 
 
 def parse_gateway_frame(line: str) -> dict[str, Any]:
-    """解析 Gateway 一行一帧的文本数据。
+    """解析 Gateway 串口输出的一行 JSON 数据。
 
-    中文注释：协议示例为
-    NODE,1,CSI,0,RSSI,-55,TEMP,25.3,HUM,60.1
+    Gateway 当前固件输出示例：
+    {"id":1,"seq":0,"presence":0,"motion":0,"bpm":0,"conf":0,"gas":0,"temp":25.0,"hum":50,"rssi":-60,"ts":12345}
+
+    中文注释：上位机只消费规范化后的字段，避免 UI 层到处关心固件字段别名。
     """
 
     raw = line.strip()
+    received_at = time.time()
     result: dict[str, Any] = {
-        "type": "",
-        "node_id": None,
-        "fields": {},
-        "raw": raw,
         "valid": False,
+        "raw": raw,
+        "error": "",
+        "node_id": None,
+        "seq": None,
+        "presence_score": 0.0,
+        "motion_score": 0.0,
+        "breath_bpm": 0.0,
+        "confidence": 0.0,
+        "gas": 0.0,
+        "temperature": 0.0,
+        "humidity": 0.0,
+        "rssi": 0.0,
+        "timestamp": received_at,
+        "source_ts_ms": None,
     }
 
     if not raw:
+        result["error"] = "空行"
         return result
 
-    parts = [part.strip() for part in raw.split(",")]
-    if len(parts) < 2:
-        result["type"] = parts[0]
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        result["error"] = f"不是有效 JSON Lines: {exc.msg}"
         return result
 
-    result["type"] = parts[0]
-    result["node_id"] = _to_number(parts[1])
+    if not isinstance(payload, dict):
+        result["error"] = "JSON 顶层不是对象"
+        return result
 
-    fields: dict[str, Any] = {}
-    valid_pairs = True
-    payload = parts[2:]
-    if len(payload) % 2 != 0:
-        valid_pairs = False
+    node_id = _first(payload, "id", "node_id")
+    if node_id is None:
+        result["error"] = "缺少节点 id"
+        return result
 
-    for index in range(0, len(payload) - 1, 2):
-        key = payload[index]
-        value = payload[index + 1]
-        if key:
-            fields[key] = _to_number(value)
-
-    result["fields"] = fields
-    result["valid"] = bool(result["type"] and result["node_id"] is not None and valid_pairs)
+    result.update(
+        {
+            "valid": True,
+            "node_id": int(_number(node_id, 0)),
+            "seq": _optional_int(_first(payload, "seq", "sequence")),
+            "presence_score": _normalize_score(_first(payload, "presence", "presence_score")),
+            "motion_score": _normalize_score(_first(payload, "motion", "motion_score")),
+            "breath_bpm": _number(_first(payload, "bpm", "breath_bpm"), 0.0),
+            "confidence": _normalize_score(_first(payload, "conf", "confidence")),
+            "gas": _number(_first(payload, "gas", "gas_raw"), 0.0),
+            "temperature": _number(_first(payload, "temp", "temperature"), 0.0),
+            "humidity": _number(_first(payload, "hum", "humidity"), 0.0),
+            "rssi": _number(_first(payload, "rssi"), 0.0),
+            "source_ts_ms": _optional_int(_first(payload, "ts", "timestamp_ms")),
+        }
+    )
     return result
 
 
-def _to_number(value: str) -> int | float | str:
-    """中文注释：尽量把协议字段转为数字，便于后续绘图与规则判断。"""
+def _first(payload: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in payload:
+            return payload[name]
+    return None
 
-    try:
-        return int(value)
-    except ValueError:
-        pass
 
+def _number(value: Any, default: float) -> float:
+    if value is None:
+        return default
     try:
         return float(value)
-    except ValueError:
-        return value
+    except (TypeError, ValueError):
+        return default
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_score(value: Any) -> float:
+    score = _number(value, 0.0)
+    if score > 1.0:
+        score /= 100.0
+    return max(0.0, min(score, 1.0))

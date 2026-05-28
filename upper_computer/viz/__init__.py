@@ -1,4 +1,5 @@
-"""可视化模块占位。
+"""Dear PyGui 可视化模块。"""
 
-中文注释：后续在这里放置 CSI 波形、RSSI 趋势、节点状态地图等 Dear PyGui 组件。
-"""
+from .dashboard import RescueDashboard
+
+__all__ = ["RescueDashboard"]
