@@ -24,10 +24,10 @@
 
 /* LoRa/SX1278 引脚定义：与 hardware/readme.md 中 Gateway 接线保持一致。 */
 #define LORA_SPI_HOST             SPI2_HOST
-#define LORA_PIN_CS               GPIO_NUM_5
-#define LORA_PIN_SCK              GPIO_NUM_18
-#define LORA_PIN_MOSI             GPIO_NUM_23
-#define LORA_PIN_MISO             GPIO_NUM_19
+#define LORA_PIN_CS               GPIO_NUM_10
+#define LORA_PIN_SCK              GPIO_NUM_12
+#define LORA_PIN_MOSI             GPIO_NUM_11
+#define LORA_PIN_MISO             GPIO_NUM_13
 #define LORA_PIN_DIO0             GPIO_NUM_4
 #define LORA_PIN_RST              GPIO_NUM_21
 

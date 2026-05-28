@@ -37,11 +37,10 @@
 
 /* LoRa/SX1278 引脚定义：必须与 Gateway 和 hardware/readme.md 完全一致。 */
 #define LORA_SPI_HOST                   SPI2_HOST
-#define LORA_PIN_CS                     GPIO_NUM_5
-#define LORA_PIN_SCK                    GPIO_NUM_18
-/* ESP32-S3 头文件不提供 GPIO_NUM_23 枚举名；这里保留硬件文档与 Gateway 约定的 GPIO 23 数值。 */
-#define LORA_PIN_MOSI                   ((gpio_num_t)23)
-#define LORA_PIN_MISO                   GPIO_NUM_19
+#define LORA_PIN_CS                     GPIO_NUM_10
+#define LORA_PIN_SCK                    GPIO_NUM_12
+#define LORA_PIN_MOSI                   GPIO_NUM_11
+#define LORA_PIN_MISO                   GPIO_NUM_13
 #define LORA_PIN_DIO0                   GPIO_NUM_4
 #define LORA_PIN_RST                    GPIO_NUM_21
 
