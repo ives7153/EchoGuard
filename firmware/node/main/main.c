@@ -1,51 +1,1029 @@
+#include <inttypes.h>
+#include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
+#include "driver/gpio.h"
+#include "driver/i2c_master.h"
+#include "driver/spi_master.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_check.h"
+#include "esp_err.h"
+#include "esp_event.h"
 #include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "nvs_flash.h"
+
+/* 节点基本信息：STA 连接 Gateway 开放 SoftAP，用于获得稳定的 WiFi 包流并触发 CSI 回调。 */
+#define NODE_ID                         1
+#define WIFI_STA_SSID                   "RuView-Rescue-GW-01"
+#define WIFI_STA_CHANNEL_HINT           6
+
+/* FreeRTOS 任务参数：本固件只创建 3 个业务任务，优先级与栈大小集中写在这里便于现场调整。 */
+#define WIFI_TASK_STACK_SIZE            4096
+#define CSI_SENSOR_TASK_STACK_SIZE      6144
+#define LORA_SEND_TASK_STACK_SIZE       4096
+#define WIFI_TASK_PRIORITY              5
+#define CSI_SENSOR_TASK_PRIORITY        6
+#define LORA_SEND_TASK_PRIORITY         5
+
+/* LoRa/SX1278 引脚定义：必须与 Gateway 和 hardware/readme.md 完全一致。 */
+#define LORA_SPI_HOST                   SPI2_HOST
+#define LORA_PIN_CS                     GPIO_NUM_5
+#define LORA_PIN_SCK                    GPIO_NUM_18
+/* ESP32-S3 头文件不提供 GPIO_NUM_23 枚举名；这里保留硬件文档与 Gateway 约定的 GPIO 23 数值。 */
+#define LORA_PIN_MOSI                   ((gpio_num_t)23)
+#define LORA_PIN_MISO                   GPIO_NUM_19
+#define LORA_PIN_DIO0                   GPIO_NUM_4
+#define LORA_PIN_RST                    GPIO_NUM_21
+
+/* LoRa 空口参数：433 MHz、BW 125 kHz、SF7、CR 4/5、显式头、payload CRC、TX power 17 dBm。 */
+#define LORA_FREQ_HZ                    433000000UL
+#define LORA_SPI_CLOCK_HZ               (4 * 1000 * 1000)
+#define LORA_EXPECTED_VERSION           0x12
+#define LORA_TX_PAYLOAD_LEN             14
+#define LORA_TX_TIMEOUT_MS              1000
+
+/* 节点传感器引脚：SHT30 与 MPU6050 共用 I2C，MQ-135 使用 GPIO6 ADC 输入。 */
+#define I2C_PORT_NUM                    I2C_NUM_0
+#define I2C_PIN_SDA                     GPIO_NUM_8
+#define I2C_PIN_SCL                     GPIO_NUM_9
+#define I2C_FREQ_HZ                     100000
+#define SHT30_ADDR                      0x44
+#define MPU6050_ADDR                    0x68
+#define MQ135_ADC_GPIO                  GPIO_NUM_6
+
+/* CSI 滑动窗口：callback 只写入轻量幅度统计，复杂特征在 csi_sensor_task 每秒计算。 */
+#define CSI_WINDOW_SIZE                 64
+#define CSI_MIN_VALID_SAMPLES           6
+
+/* WiFi 事件位：任务间只传递状态，不额外创建 WiFi 管理任务。 */
+#define WIFI_STARTED_BIT                BIT0
+#define WIFI_CONNECTED_BIT              BIT1
+
+/* SX1278 常用寄存器地址。 */
+#define REG_FIFO                        0x00
+#define REG_OP_MODE                     0x01
+#define REG_FRF_MSB                     0x06
+#define REG_FRF_MID                     0x07
+#define REG_FRF_LSB                     0x08
+#define REG_PA_CONFIG                   0x09
+#define REG_LNA                         0x0C
+#define REG_FIFO_ADDR_PTR               0x0D
+#define REG_FIFO_TX_BASE_ADDR           0x0E
+#define REG_FIFO_RX_BASE_ADDR           0x0F
+#define REG_IRQ_FLAGS                   0x12
+#define REG_MODEM_CONFIG_1              0x1D
+#define REG_MODEM_CONFIG_2              0x1E
+#define REG_PREAMBLE_MSB                0x20
+#define REG_PREAMBLE_LSB                0x21
+#define REG_PAYLOAD_LENGTH              0x22
+#define REG_MODEM_CONFIG_3              0x26
+#define REG_DIO_MAPPING_1               0x40
+#define REG_VERSION                     0x42
+#define REG_PA_DAC                      0x4D
+
+#define MODE_LONG_RANGE                 0x80
+#define MODE_SLEEP                      0x00
+#define MODE_STDBY                      0x01
+#define MODE_TX                         0x03
+
+#define IRQ_TX_DONE                     0x08
+
+/* 与 Gateway 完全一致的数据结构。注意：LoRa 发送时仍显式打包 14 字节，避免结构体 padding 影响空口协议。 */
+typedef struct {
+    uint8_t id;
+    uint32_t seq;
+    uint8_t presence;
+    uint8_t motion;
+    uint8_t bpm;
+    uint8_t conf;
+    uint16_t gas;
+    int16_t temp_x10;
+    uint8_t hum;
+    int16_t rssi;
+    int64_t ts_ms;
+} rescue_lora_packet_t;
+
+typedef struct {
+    uint8_t presence_score;
+    uint8_t motion_score;
+    uint8_t breath_bpm;
+    uint8_t confidence;
+    uint16_t gas_raw;
+    int16_t temp_x10;
+    uint8_t humidity;
+    bool sht30_ok;
+    bool mpu6050_ok;
+    bool mq135_ok;
+    bool csi_ok;
+    int64_t updated_ms;
+} node_fusion_sample_t;
+
+typedef struct {
+    float mean_amp;
+    float abs_dev;
+    float range;
+    uint16_t sample_count;
+    uint32_t total_packets;
+    int8_t last_rssi;
+} csi_window_features_t;
 
 static const char *TAG = "rescue_node";
 
-static void init_board_status(void)
-{
-    ESP_LOGI(TAG, "Board status resources initialized");
-}
+static EventGroupHandle_t s_wifi_event_group;
+static SemaphoreHandle_t s_sample_mutex;
+static spi_device_handle_t s_lora_spi;
+static i2c_master_bus_handle_t s_i2c_bus;
+static i2c_master_dev_handle_t s_sht30_dev;
+static i2c_master_dev_handle_t s_mpu6050_dev;
+static adc_oneshot_unit_handle_t s_mq135_adc;
+static adc_channel_t s_mq135_channel;
 
-static void init_sensor_pipeline(void)
-{
-    ESP_LOGI(TAG, "Sensor pipeline initialized");
-}
+static portMUX_TYPE s_csi_lock = portMUX_INITIALIZER_UNLOCKED;
+static float s_csi_window[CSI_WINDOW_SIZE];
+static uint16_t s_csi_head;
+static uint16_t s_csi_count;
+static uint32_t s_csi_total_packets;
+static int8_t s_csi_last_rssi;
 
-static void init_wifi_csi_pipeline(void)
-{
-    ESP_LOGI(TAG, "WiFi CSI pipeline initialized");
-}
+static node_fusion_sample_t s_latest_sample = {
+    .presence_score = 0,
+    .motion_score = 0,
+    .breath_bpm = 0,
+    .confidence = 0,
+    .gas_raw = 0,
+    .temp_x10 = 250,
+    .humidity = 50,
+};
 
-static void init_lora_uplink(void)
-{
-    ESP_LOGI(TAG, "LoRa uplink initialized");
-}
-
-static void node_heartbeat_task(void *arg)
-{
-    (void)arg;
-
-    uint32_t counter = 0;
-    while (true) {
-        ESP_LOGI(TAG, "Rescue node running, heartbeat=%lu", (unsigned long)counter++);
-        vTaskDelay(pdMS_TO_TICKS(5000));
-    }
-}
+static esp_err_t nvs_init_for_wifi(void);
+static void wifi_sta_task(void *arg);
+static void csi_sensor_task(void *arg);
+static void lora_send_task(void *arg);
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
+static esp_err_t wifi_sta_init(void);
+static esp_err_t csi_init_once(void);
+static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *data);
+static csi_window_features_t csi_window_snapshot(void);
+static void csi_features_to_scores(const csi_window_features_t *features,
+                                   float accel_delta_g,
+                                   node_fusion_sample_t *sample);
+static esp_err_t sensors_init_once(void);
+static esp_err_t sht30_read(float *temperature_c, float *humidity_percent);
+static esp_err_t mpu6050_read_accel(float *accel_g, float *accel_delta_g);
+static esp_err_t mq135_read_raw(uint16_t *raw);
+static esp_err_t lora_spi_bus_init_once(void);
+static esp_err_t lora_chip_configure(void);
+static esp_err_t lora_send_packet(const rescue_lora_packet_t *packet);
+static void build_lora_payload(const rescue_lora_packet_t *packet, uint8_t payload[LORA_TX_PAYLOAD_LEN]);
+static void lora_set_op_mode(uint8_t mode);
+static void lora_write_reg(uint8_t reg, uint8_t value);
+static uint8_t lora_read_reg(uint8_t reg);
+static uint8_t clamp_u8_int(int value);
+static uint8_t sht30_crc8(const uint8_t *data, size_t len);
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-S3 WiFi CSI + LoRa rescue node starting");
+    setvbuf(stdout, NULL, _IONBF, 0);
+    ESP_LOGI(TAG, "ESP32-S3 WiFi CSI + Sensor Fusion + LoRa rescue node starting");
+    ESP_LOGI(TAG, "任务优先级: wifi_sta=%d, csi_sensor=%d, lora_send=%d",
+             WIFI_TASK_PRIORITY, CSI_SENSOR_TASK_PRIORITY, LORA_SEND_TASK_PRIORITY);
 
-    init_board_status();
-    init_sensor_pipeline();
-    init_wifi_csi_pipeline();
-    init_lora_uplink();
+    ESP_ERROR_CHECK(nvs_init_for_wifi());
 
-    xTaskCreate(node_heartbeat_task, "node_heartbeat", 4096, NULL, 5, NULL);
+    s_wifi_event_group = xEventGroupCreate();
+    s_sample_mutex = xSemaphoreCreateMutex();
+    if (s_wifi_event_group == NULL || s_sample_mutex == NULL) {
+        ESP_LOGE(TAG, "创建 FreeRTOS 同步对象失败，系统无法继续启动");
+        return;
+    }
+
+    BaseType_t wifi_ok = xTaskCreate(wifi_sta_task, "wifi_sta", WIFI_TASK_STACK_SIZE,
+                                     NULL, WIFI_TASK_PRIORITY, NULL);
+    BaseType_t csi_ok = xTaskCreate(csi_sensor_task, "csi_sensor", CSI_SENSOR_TASK_STACK_SIZE,
+                                    NULL, CSI_SENSOR_TASK_PRIORITY, NULL);
+    BaseType_t lora_ok = xTaskCreate(lora_send_task, "lora_send", LORA_SEND_TASK_STACK_SIZE,
+                                     NULL, LORA_SEND_TASK_PRIORITY, NULL);
+
+    if (wifi_ok != pdPASS || csi_ok != pdPASS || lora_ok != pdPASS) {
+        ESP_LOGE(TAG, "创建 3 个核心任务失败，请增大 heap 或检查 FreeRTOS 配置");
+    }
+}
+
+static esp_err_t nvs_init_for_wifi(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS 版本或空间异常，擦除后重新初始化");
+        ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "nvs_flash_erase failed");
+        ret = nvs_flash_init();
+    }
+    return ret;
+}
+
+/* wifi_sta_task：负责 STA 初始化、连接开放 SoftAP、断线重连和状态心跳。 */
+static void wifi_sta_task(void *arg)
+{
+    (void)arg;
+
+    while (wifi_sta_init() != ESP_OK) {
+        ESP_LOGE(TAG, "WiFi STA 初始化失败，2 秒后重试");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    while (true) {
+        EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+        ESP_LOGI(TAG, "WiFi STA 心跳: ssid=%s, started=%d, connected=%d",
+                 WIFI_STA_SSID,
+                 (bits & WIFI_STARTED_BIT) != 0,
+                 (bits & WIFI_CONNECTED_BIT) != 0);
+        vTaskDelay(pdMS_TO_TICKS(30000));
+    }
+}
+
+static esp_err_t wifi_sta_init(void)
+{
+    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "esp_netif_init failed");
+    esp_err_t ret = esp_event_loop_create_default();
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_event_loop_create_default failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    if (sta_netif == NULL) {
+        ESP_LOGE(TAG, "创建默认 STA netif 失败");
+        return ESP_FAIL;
+    }
+
+    wifi_init_config_t init_config = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_RETURN_ON_ERROR(esp_wifi_init(&init_config), TAG, "esp_wifi_init failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "esp_wifi_set_storage failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                            wifi_event_handler, NULL, NULL),
+                        TAG, "register WIFI_EVENT handler failed");
+    ESP_RETURN_ON_ERROR(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                            wifi_event_handler, NULL, NULL),
+                        TAG, "register IP_EVENT handler failed");
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_STA_SSID,
+            .password = "",
+            .scan_method = WIFI_FAST_SCAN,
+            .channel = WIFI_STA_CHANNEL_HINT,
+            .threshold = {
+                .authmode = WIFI_AUTH_OPEN,
+            },
+            .pmf_cfg = {
+                .capable = true,
+                .required = false,
+            },
+        },
+    };
+
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "esp_wifi_set_mode STA failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "esp_wifi_set_config STA failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start failed");
+    ESP_LOGI(TAG, "WiFi STA 已启动，目标开放热点: %s", WIFI_STA_SSID);
+
+    return ESP_OK;
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        xEventGroupSetBits(s_wifi_event_group, WIFI_STARTED_BIT);
+        esp_err_t ret = esp_wifi_connect();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "首次连接 Gateway SoftAP 失败: %s", esp_err_to_name(ret));
+        }
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        wifi_event_sta_disconnected_t *disconnected = (wifi_event_sta_disconnected_t *)event_data;
+        ESP_LOGW(TAG, "WiFi 断开，reason=%d，准备自动重连", disconnected->reason);
+        esp_err_t ret = esp_wifi_connect();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "WiFi 重连调用失败: %s", esp_err_to_name(ret));
+        }
+        return;
+    }
+
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "WiFi 已连接 Gateway，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+/* csi_sensor_task：初始化 CSI/I2C/ADC，每秒融合 CSI 与传感器读数，写入 LoRa 发送快照。 */
+static void csi_sensor_task(void *arg)
+{
+    (void)arg;
+
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_STARTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+
+    bool csi_ready = (csi_init_once() == ESP_OK);
+    bool sensors_ready = (sensors_init_once() == ESP_OK);
+    if (!csi_ready) {
+        ESP_LOGW(TAG, "CSI 初始化失败，后续特征将主要依赖传感器并持续重试");
+    }
+    if (!sensors_ready) {
+        ESP_LOGW(TAG, "传感器初始化存在失败项，LoRa 仍会持续发送默认/上次有效值");
+    }
+
+    while (true) {
+        if (!csi_ready) {
+            csi_ready = (csi_init_once() == ESP_OK);
+        }
+        if (!sensors_ready) {
+            sensors_ready = (sensors_init_once() == ESP_OK);
+        }
+
+        node_fusion_sample_t sample = s_latest_sample;
+        float temperature_c = 25.0f;
+        float humidity_percent = 50.0f;
+        float accel_g = 1.0f;
+        float accel_delta_g = 0.0f;
+        uint16_t gas_raw = sample.gas_raw;
+
+        esp_err_t sht_ret = sht30_read(&temperature_c, &humidity_percent);
+        esp_err_t mpu_ret = mpu6050_read_accel(&accel_g, &accel_delta_g);
+        esp_err_t mq_ret = mq135_read_raw(&gas_raw);
+
+        csi_window_features_t csi_features = csi_window_snapshot();
+        csi_features_to_scores(&csi_features, accel_delta_g, &sample);
+
+        if (sht_ret == ESP_OK) {
+            sample.temp_x10 = (int16_t)lroundf(temperature_c * 10.0f);
+            sample.humidity = clamp_u8_int((int)lroundf(humidity_percent));
+            sample.sht30_ok = true;
+        } else {
+            sample.sht30_ok = false;
+            ESP_LOGW(TAG, "SHT30 读取失败: %s，保留上次温湿度", esp_err_to_name(sht_ret));
+        }
+
+        if (mpu_ret == ESP_OK) {
+            sample.mpu6050_ok = true;
+        } else {
+            sample.mpu6050_ok = false;
+            ESP_LOGW(TAG, "MPU6050 读取失败: %s，motion_score 仅使用 CSI", esp_err_to_name(mpu_ret));
+        }
+
+        if (mq_ret == ESP_OK) {
+            sample.gas_raw = gas_raw;
+            sample.mq135_ok = true;
+        } else {
+            sample.mq135_ok = false;
+            ESP_LOGW(TAG, "MQ-135 ADC 读取失败: %s，保留上次 gas_raw", esp_err_to_name(mq_ret));
+        }
+
+        sample.csi_ok = csi_features.sample_count >= CSI_MIN_VALID_SAMPLES;
+        sample.updated_ms = esp_timer_get_time() / 1000;
+
+        int confidence = sample.confidence;
+        confidence += sample.sht30_ok ? 8 : 0;
+        confidence += sample.mpu6050_ok ? 8 : 0;
+        confidence += sample.mq135_ok ? 6 : 0;
+        confidence += (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) ? 10 : 0;
+        sample.confidence = clamp_u8_int(confidence);
+
+        if (xSemaphoreTake(s_sample_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            s_latest_sample = sample;
+            xSemaphoreGive(s_sample_mutex);
+        } else {
+            ESP_LOGW(TAG, "更新融合快照超时，本周期数据丢弃");
+        }
+
+        ESP_LOGI(TAG, "融合特征: presence=%u motion=%u bpm=%u conf=%u gas=%u temp=%.1f hum=%u csi_n=%u accel=%.2fg",
+                 sample.presence_score,
+                 sample.motion_score,
+                 sample.breath_bpm,
+                 sample.confidence,
+                 sample.gas_raw,
+                 (double)sample.temp_x10 / 10.0,
+                 sample.humidity,
+                 csi_features.sample_count,
+                 (double)accel_g);
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static esp_err_t csi_init_once(void)
+{
+    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+    if ((bits & WIFI_STARTED_BIT) == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    wifi_csi_config_t csi_config = {
+        .lltf_en = true,
+        .htltf_en = true,
+        .stbc_htltf2_en = true,
+        .ltf_merge_en = true,
+        .channel_filter_en = false,
+        .manu_scale = false,
+        .shift = 0,
+        .dump_ack_en = false,
+    };
+
+    ESP_RETURN_ON_ERROR(esp_wifi_set_csi_config(&csi_config), TAG, "esp_wifi_set_csi_config failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_csi_rx_cb(wifi_csi_rx_cb, NULL), TAG, "esp_wifi_set_csi_rx_cb failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_csi(true), TAG, "esp_wifi_set_csi enable failed");
+    ESP_LOGI(TAG, "WiFi CSI 已启用：LLTF/HT-LTF + 滑动窗口幅度扰动特征");
+    return ESP_OK;
+}
+
+static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *data)
+{
+    (void)ctx;
+
+    if (data == NULL || data->buf == NULL || data->len < 8) {
+        return;
+    }
+
+    int start = data->first_word_invalid ? 4 : 0;
+    uint32_t magnitude_sum = 0;
+    uint16_t pair_count = 0;
+
+    for (int i = start; i + 1 < data->len; i += 2) {
+        int i_part = data->buf[i];
+        int q_part = data->buf[i + 1];
+        magnitude_sum += (uint32_t)(abs(i_part) + abs(q_part));
+        pair_count++;
+    }
+
+    if (pair_count == 0) {
+        return;
+    }
+
+    float mean_magnitude = (float)magnitude_sum / (float)pair_count;
+
+    portENTER_CRITICAL(&s_csi_lock);
+    s_csi_window[s_csi_head] = mean_magnitude;
+    s_csi_head = (s_csi_head + 1) % CSI_WINDOW_SIZE;
+    if (s_csi_count < CSI_WINDOW_SIZE) {
+        s_csi_count++;
+    }
+    s_csi_total_packets++;
+    s_csi_last_rssi = data->rx_ctrl.rssi;
+    portEXIT_CRITICAL(&s_csi_lock);
+}
+
+static csi_window_features_t csi_window_snapshot(void)
+{
+    float local_window[CSI_WINDOW_SIZE] = {0};
+    uint16_t local_count = 0;
+    uint32_t total_packets = 0;
+    int8_t last_rssi = 0;
+
+    portENTER_CRITICAL(&s_csi_lock);
+    local_count = s_csi_count;
+    total_packets = s_csi_total_packets;
+    last_rssi = s_csi_last_rssi;
+    for (uint16_t i = 0; i < local_count; ++i) {
+        local_window[i] = s_csi_window[i];
+    }
+    portEXIT_CRITICAL(&s_csi_lock);
+
+    csi_window_features_t features = {
+        .sample_count = local_count,
+        .total_packets = total_packets,
+        .last_rssi = last_rssi,
+    };
+
+    if (local_count == 0) {
+        return features;
+    }
+
+    float sum = 0.0f;
+    float min_value = local_window[0];
+    float max_value = local_window[0];
+    for (uint16_t i = 0; i < local_count; ++i) {
+        float value = local_window[i];
+        sum += value;
+        min_value = fminf(min_value, value);
+        max_value = fmaxf(max_value, value);
+    }
+
+    features.mean_amp = sum / (float)local_count;
+    features.range = max_value - min_value;
+
+    float abs_dev_sum = 0.0f;
+    for (uint16_t i = 0; i < local_count; ++i) {
+        abs_dev_sum += fabsf(local_window[i] - features.mean_amp);
+    }
+    features.abs_dev = abs_dev_sum / (float)local_count;
+
+    return features;
+}
+
+static void csi_features_to_scores(const csi_window_features_t *features,
+                                   float accel_delta_g,
+                                   node_fusion_sample_t *sample)
+{
+    if (features == NULL || sample == NULL) {
+        return;
+    }
+
+    if (features->sample_count < CSI_MIN_VALID_SAMPLES) {
+        sample->presence_score = 0;
+        sample->motion_score = clamp_u8_int((int)lroundf(accel_delta_g * 120.0f));
+        sample->breath_bpm = 0;
+        sample->confidence = 10;
+        return;
+    }
+
+    int csi_presence = (int)lroundf(features->abs_dev * 2.0f + features->range * 0.4f);
+    int csi_motion = (int)lroundf(features->range * 1.8f + features->abs_dev * 1.2f);
+    int imu_motion = (int)lroundf(accel_delta_g * 140.0f);
+
+    sample->presence_score = clamp_u8_int(csi_presence);
+    sample->motion_score = clamp_u8_int(csi_motion > imu_motion ? csi_motion : imu_motion);
+
+    /*
+     * 呼吸率 v1：用 CSI 幅度扰动强弱给出粗略稳定范围。
+     * 后续迭代可在这里替换为带通滤波 + FFT/峰值间隔估计，不影响 LoRa 包格式。
+     */
+    if (sample->presence_score < 12 || sample->motion_score > 75) {
+        sample->breath_bpm = 0;
+    } else {
+        int bpm = 12 + (int)lroundf(features->abs_dev * 0.35f);
+        sample->breath_bpm = clamp_u8_int(bpm > 28 ? 28 : bpm);
+    }
+
+    int confidence = 20 + (features->sample_count > 40 ? 30 : features->sample_count);
+    confidence += (features->last_rssi > -75) ? 10 : 0;
+    sample->confidence = clamp_u8_int(confidence);
+}
+
+static esp_err_t sensors_init_once(void)
+{
+    esp_err_t overall = ESP_OK;
+
+    if (s_i2c_bus == NULL) {
+        i2c_master_bus_config_t bus_config = {
+            .i2c_port = I2C_PORT_NUM,
+            .sda_io_num = I2C_PIN_SDA,
+            .scl_io_num = I2C_PIN_SCL,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .flags = {
+                .enable_internal_pullup = true,
+            },
+        };
+
+        esp_err_t ret = i2c_new_master_bus(&bus_config, &s_i2c_bus);
+        if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "I2C 总线初始化失败 SDA=%d SCL=%d: %s",
+                     I2C_PIN_SDA, I2C_PIN_SCL, esp_err_to_name(ret));
+            overall = ret;
+        } else {
+            ESP_LOGI(TAG, "I2C 总线已初始化 SDA=GPIO%d SCL=GPIO%d freq=%dHz",
+                     I2C_PIN_SDA, I2C_PIN_SCL, I2C_FREQ_HZ);
+        }
+    }
+
+    if (s_i2c_bus != NULL && s_sht30_dev == NULL) {
+        i2c_device_config_t sht30_config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = SHT30_ADDR,
+            .scl_speed_hz = I2C_FREQ_HZ,
+        };
+        esp_err_t ret = i2c_master_bus_add_device(s_i2c_bus, &sht30_config, &s_sht30_dev);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "添加 SHT30 I2C 设备失败 addr=0x%02x: %s",
+                     SHT30_ADDR, esp_err_to_name(ret));
+            overall = ret;
+        }
+    }
+
+    if (s_i2c_bus != NULL && s_mpu6050_dev == NULL) {
+        i2c_device_config_t mpu_config = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = MPU6050_ADDR,
+            .scl_speed_hz = I2C_FREQ_HZ,
+        };
+        esp_err_t ret = i2c_master_bus_add_device(s_i2c_bus, &mpu_config, &s_mpu6050_dev);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "添加 MPU6050 I2C 设备失败 addr=0x%02x: %s",
+                     MPU6050_ADDR, esp_err_to_name(ret));
+            overall = ret;
+        } else {
+            uint8_t wake_cmd[] = {0x6B, 0x00};
+            ret = i2c_master_transmit(s_mpu6050_dev, wake_cmd, sizeof(wake_cmd), 100);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "MPU6050 唤醒失败: %s", esp_err_to_name(ret));
+                overall = ret;
+            }
+        }
+    }
+
+    if (s_mq135_adc == NULL) {
+        adc_unit_t unit = ADC_UNIT_1;
+        adc_channel_t channel = ADC_CHANNEL_0;
+        esp_err_t ret = adc_oneshot_io_to_channel(MQ135_ADC_GPIO, &unit, &channel);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "GPIO%d 不能映射到 ADC 通道: %s", MQ135_ADC_GPIO, esp_err_to_name(ret));
+            overall = ret;
+        } else {
+            adc_oneshot_unit_init_cfg_t unit_config = {
+                .unit_id = unit,
+                .clk_src = 0,
+                .ulp_mode = ADC_ULP_MODE_DISABLE,
+            };
+            ret = adc_oneshot_new_unit(&unit_config, &s_mq135_adc);
+            if (ret != ESP_OK && ret != ESP_ERR_NOT_FOUND) {
+                ESP_LOGE(TAG, "ADC oneshot unit 初始化失败: %s", esp_err_to_name(ret));
+                overall = ret;
+            } else if (ret == ESP_OK) {
+                adc_oneshot_chan_cfg_t chan_config = {
+                    .atten = ADC_ATTEN_DB_12,
+                    .bitwidth = ADC_BITWIDTH_DEFAULT,
+                };
+                ret = adc_oneshot_config_channel(s_mq135_adc, channel, &chan_config);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(TAG, "MQ-135 ADC 通道配置失败 GPIO%d: %s",
+                             MQ135_ADC_GPIO, esp_err_to_name(ret));
+                    overall = ret;
+                } else {
+                    s_mq135_channel = channel;
+                    ESP_LOGI(TAG, "MQ-135 ADC 已初始化 GPIO%d unit=%d channel=%d",
+                             MQ135_ADC_GPIO, unit, channel);
+                }
+            }
+        }
+    }
+
+    return overall;
+}
+
+static esp_err_t sht30_read(float *temperature_c, float *humidity_percent)
+{
+    if (s_sht30_dev == NULL || temperature_c == NULL || humidity_percent == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t cmd[] = {0x24, 0x00};
+    uint8_t data[6] = {0};
+
+    esp_err_t ret = i2c_master_transmit(s_sht30_dev, cmd, sizeof(cmd), 100);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    ret = i2c_master_receive(s_sht30_dev, data, sizeof(data), 100);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (sht30_crc8(&data[0], 2) != data[2] || sht30_crc8(&data[3], 2) != data[5]) {
+        return ESP_ERR_INVALID_CRC;
+    }
+
+    uint16_t raw_temp = ((uint16_t)data[0] << 8) | data[1];
+    uint16_t raw_hum = ((uint16_t)data[3] << 8) | data[4];
+    *temperature_c = -45.0f + 175.0f * (float)raw_temp / 65535.0f;
+    *humidity_percent = 100.0f * (float)raw_hum / 65535.0f;
+    return ESP_OK;
+}
+
+static esp_err_t mpu6050_read_accel(float *accel_g, float *accel_delta_g)
+{
+    static bool has_last = false;
+    static float last_accel_g = 1.0f;
+
+    if (s_mpu6050_dev == NULL || accel_g == NULL || accel_delta_g == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t reg = 0x3B;
+    uint8_t data[6] = {0};
+    esp_err_t ret = i2c_master_transmit_receive(s_mpu6050_dev, &reg, 1, data, sizeof(data), 100);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    int16_t ax = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
+    int16_t ay = (int16_t)(((uint16_t)data[2] << 8) | data[3]);
+    int16_t az = (int16_t)(((uint16_t)data[4] << 8) | data[5]);
+
+    float ax_g = (float)ax / 16384.0f;
+    float ay_g = (float)ay / 16384.0f;
+    float az_g = (float)az / 16384.0f;
+    float magnitude = sqrtf(ax_g * ax_g + ay_g * ay_g + az_g * az_g);
+
+    *accel_g = magnitude;
+    *accel_delta_g = has_last ? fabsf(magnitude - last_accel_g) : 0.0f;
+    last_accel_g = magnitude;
+    has_last = true;
+    return ESP_OK;
+}
+
+static esp_err_t mq135_read_raw(uint16_t *raw)
+{
+    if (s_mq135_adc == NULL || raw == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t sum = 0;
+    for (int i = 0; i < 8; ++i) {
+        int value = 0;
+        esp_err_t ret = adc_oneshot_read(s_mq135_adc, s_mq135_channel, &value);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+        sum += (uint32_t)value;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    *raw = (uint16_t)(sum / 8);
+    return ESP_OK;
+}
+
+/* lora_send_task：初始化 SX1278 后，每秒读取最新融合快照并发送到 Gateway。 */
+static void lora_send_task(void *arg)
+{
+    (void)arg;
+
+    while (lora_spi_bus_init_once() != ESP_OK) {
+        ESP_LOGE(TAG, "LoRa SPI 初始化失败，2 秒后重试");
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+
+    while (lora_chip_configure() != ESP_OK) {
+        ESP_LOGE(TAG, "SX1278 初始化失败，请检查 GPIO/SPI/RST/天线，3 秒后重试");
+        vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+
+    ESP_LOGI(TAG, "SX1278 发送模式就绪：433MHz BW125 SF7 CR4/5");
+
+    uint32_t seq = 0;
+    while (true) {
+        node_fusion_sample_t sample = {0};
+        if (xSemaphoreTake(s_sample_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+            sample = s_latest_sample;
+            xSemaphoreGive(s_sample_mutex);
+        } else {
+            ESP_LOGW(TAG, "读取融合快照超时，本次 LoRa 使用空数据");
+        }
+
+        rescue_lora_packet_t packet = {
+            .id = NODE_ID,
+            .seq = seq++,
+            .presence = sample.presence_score,
+            .motion = sample.motion_score,
+            .bpm = sample.breath_bpm,
+            .conf = sample.confidence,
+            .gas = sample.gas_raw,
+            .temp_x10 = sample.temp_x10,
+            .hum = sample.humidity,
+            .rssi = 0,
+            .ts_ms = esp_timer_get_time() / 1000,
+        };
+
+        esp_err_t ret = lora_send_packet(&packet);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "LoRa sent id=%u seq=%" PRIu32 " presence=%u motion=%u bpm=%u conf=%u gas=%u temp_x10=%d hum=%u",
+                     packet.id, packet.seq, packet.presence, packet.motion, packet.bpm,
+                     packet.conf, packet.gas, packet.temp_x10, packet.hum);
+        } else {
+            ESP_LOGW(TAG, "LoRa 发送失败 seq=%" PRIu32 ": %s", packet.seq, esp_err_to_name(ret));
+            if (ret == ESP_ERR_TIMEOUT) {
+                lora_chip_configure();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+static esp_err_t lora_spi_bus_init_once(void)
+{
+    if (s_lora_spi != NULL) {
+        return ESP_OK;
+    }
+
+    spi_bus_config_t bus_config = {
+        .mosi_io_num = LORA_PIN_MOSI,
+        .miso_io_num = LORA_PIN_MISO,
+        .sclk_io_num = LORA_PIN_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = 64,
+    };
+
+    esp_err_t ret = spi_bus_initialize(LORA_SPI_HOST, &bus_config, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    spi_device_interface_config_t dev_config = {
+        .clock_speed_hz = LORA_SPI_CLOCK_HZ,
+        .mode = 0,
+        .spics_io_num = LORA_PIN_CS,
+        .queue_size = 1,
+    };
+
+    ret = spi_bus_add_device(LORA_SPI_HOST, &dev_config, &s_lora_spi);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_add_device failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    gpio_config_t rst_config = {
+        .pin_bit_mask = 1ULL << LORA_PIN_RST,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&rst_config), TAG, "LoRa RST gpio_config failed");
+
+    gpio_config_t dio0_config = {
+        .pin_bit_mask = 1ULL << LORA_PIN_DIO0,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&dio0_config), TAG, "LoRa DIO0 gpio_config failed");
+
+    return ESP_OK;
+}
+
+static esp_err_t lora_chip_configure(void)
+{
+    gpio_set_level(LORA_PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(LORA_PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    uint8_t version = lora_read_reg(REG_VERSION);
+    if (version != LORA_EXPECTED_VERSION) {
+        ESP_LOGE(TAG, "SX1278 version=0x%02x，期望 0x%02x", version, LORA_EXPECTED_VERSION);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    lora_set_op_mode(MODE_SLEEP);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    const uint64_t frf = ((uint64_t)LORA_FREQ_HZ << 19) / 32000000UL;
+    lora_write_reg(REG_FRF_MSB, (uint8_t)(frf >> 16));
+    lora_write_reg(REG_FRF_MID, (uint8_t)(frf >> 8));
+    lora_write_reg(REG_FRF_LSB, (uint8_t)frf);
+
+    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x00);
+    lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
+    lora_write_reg(REG_LNA, 0x23);
+
+    /* 与 Gateway 保持一致：BW=125kHz(0x7)、CR=4/5(0x1)、显式头模式。 */
+    lora_write_reg(REG_MODEM_CONFIG_1, 0x72);
+    /* SF=7，开启 payload CRC。 */
+    lora_write_reg(REG_MODEM_CONFIG_2, 0x74);
+    /* SF7/BW125 不需要低速率优化，AGC 自动增益打开。 */
+    lora_write_reg(REG_MODEM_CONFIG_3, 0x04);
+    lora_write_reg(REG_PREAMBLE_MSB, 0x00);
+    lora_write_reg(REG_PREAMBLE_LSB, 0x08);
+    lora_write_reg(REG_PAYLOAD_LENGTH, LORA_TX_PAYLOAD_LEN);
+
+    /* PA_BOOST 17 dBm：0x80 | (17 - 2)，PA_DAC 保持 20 dBm 以下常规模式。 */
+    lora_write_reg(REG_PA_CONFIG, 0x8F);
+    lora_write_reg(REG_PA_DAC, 0x84);
+
+    /* DIO0 映射 TxDone，清空历史中断并停在 Standby，等待发送任务触发。 */
+    lora_write_reg(REG_DIO_MAPPING_1, 0x40);
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_set_op_mode(MODE_STDBY);
+    return ESP_OK;
+}
+
+static esp_err_t lora_send_packet(const rescue_lora_packet_t *packet)
+{
+    if (packet == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t payload[LORA_TX_PAYLOAD_LEN] = {0};
+    build_lora_payload(packet, payload);
+
+    lora_set_op_mode(MODE_STDBY);
+    lora_write_reg(REG_DIO_MAPPING_1, 0x40);
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
+
+    for (size_t i = 0; i < LORA_TX_PAYLOAD_LEN; ++i) {
+        lora_write_reg(REG_FIFO, payload[i]);
+    }
+    lora_write_reg(REG_PAYLOAD_LENGTH, LORA_TX_PAYLOAD_LEN);
+    lora_set_op_mode(MODE_TX);
+
+    int64_t start_ms = esp_timer_get_time() / 1000;
+    while (((esp_timer_get_time() / 1000) - start_ms) < LORA_TX_TIMEOUT_MS) {
+        uint8_t irq_flags = lora_read_reg(REG_IRQ_FLAGS);
+        if ((irq_flags & IRQ_TX_DONE) != 0 || gpio_get_level(LORA_PIN_DIO0) == 1) {
+            lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+            lora_set_op_mode(MODE_STDBY);
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_set_op_mode(MODE_STDBY);
+    return ESP_ERR_TIMEOUT;
+}
+
+static void build_lora_payload(const rescue_lora_packet_t *packet, uint8_t payload[LORA_TX_PAYLOAD_LEN])
+{
+    payload[0] = packet->id;
+    payload[1] = (uint8_t)(packet->seq & 0xFF);
+    payload[2] = (uint8_t)((packet->seq >> 8) & 0xFF);
+    payload[3] = (uint8_t)((packet->seq >> 16) & 0xFF);
+    payload[4] = (uint8_t)((packet->seq >> 24) & 0xFF);
+    payload[5] = packet->presence;
+    payload[6] = packet->motion;
+    payload[7] = packet->bpm;
+    payload[8] = packet->conf;
+    payload[9] = (uint8_t)(packet->gas & 0xFF);
+    payload[10] = (uint8_t)((packet->gas >> 8) & 0xFF);
+    payload[11] = (uint8_t)((uint16_t)packet->temp_x10 & 0xFF);
+    payload[12] = (uint8_t)(((uint16_t)packet->temp_x10 >> 8) & 0xFF);
+    payload[13] = packet->hum;
+}
+
+static void lora_set_op_mode(uint8_t mode)
+{
+    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE | mode);
+}
+
+static void lora_write_reg(uint8_t reg, uint8_t value)
+{
+    uint8_t tx_data[2] = {(uint8_t)(reg | 0x80), value};
+    spi_transaction_t transaction = {
+        .length = 16,
+        .tx_buffer = tx_data,
+    };
+    esp_err_t ret = spi_device_transmit(s_lora_spi, &transaction);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LoRa 写寄存器 0x%02x 失败: %s", reg, esp_err_to_name(ret));
+    }
+}
+
+static uint8_t lora_read_reg(uint8_t reg)
+{
+    uint8_t tx_data[2] = {(uint8_t)(reg & 0x7F), 0x00};
+    uint8_t rx_data[2] = {0};
+    spi_transaction_t transaction = {
+        .length = 16,
+        .tx_buffer = tx_data,
+        .rx_buffer = rx_data,
+    };
+
+    esp_err_t ret = spi_device_transmit(s_lora_spi, &transaction);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "LoRa 读寄存器 0x%02x 失败: %s", reg, esp_err_to_name(ret));
+        return 0;
+    }
+    return rx_data[1];
+}
+
+static uint8_t clamp_u8_int(int value)
+{
+    if (value < 0) {
+        return 0;
+    }
+    if (value > 100) {
+        return 100;
+    }
+    return (uint8_t)value;
+}
+
+static uint8_t sht30_crc8(const uint8_t *data, size_t len)
+{
+    uint8_t crc = 0xFF;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
 }
