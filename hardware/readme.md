@@ -8,10 +8,10 @@
 
 | 功能          | ESP32-S3 引脚（推荐） | 说明 & 注意事项                              | 节点/Gateway |
 |---------------|-----------------------|---------------------------------------------|--------------|
-| LoRa NSS (CS) | GPIO 5               | LoRa片选                                     | 所有         |
-| LoRa SCK      | GPIO 18              | SPI时钟                                      | 所有         |
-| LoRa MOSI     | GPIO 23              | SPI发送                                      | 所有         |
-| LoRa MISO     | GPIO 19              | SPI接收                                      | 所有         |
+| LoRa NSS (CS) | GPIO 10              | LoRa片选                                     | 所有         |
+| LoRa SCK      | GPIO 12              | SPI时钟                                      | 所有         |
+| LoRa MOSI     | GPIO 11              | SPI发送                                      | 所有         |
+| LoRa MISO     | GPIO 13              | SPI接收                                      | 所有         |
 | LoRa DIO0     | GPIO 4               | 中断                                         | 所有         |
 | LoRa RST      | GPIO 21              | 复位                                         | 所有         |
 | I2C SDA       | GPIO 8               | SHT30 + MPU6050 共用                        | 节点         |
@@ -30,7 +30,7 @@
 #### Ra-02 LoRa 模块
 
 Ra-02 的 VCC 接 ESP32-S3 的 3V3，GND 接公共地，禁止接入 5V。  
-SPI 接线为 NSS 接 GPIO5、SCK 接 GPIO18、MOSI 接 GPIO23、MISO 接 GPIO19；控制线 DIO0 接 GPIO4，RST 接 GPIO21。  
+SPI 接线为 NSS 接 GPIO10、SCK 接 GPIO12、MOSI 接 GPIO11、MISO 接 GPIO13；控制线 DIO0 接 GPIO4，RST 接 GPIO21。  
 LoRa 天线必须在上电和发射前安装好，模块尽量远离 USB 线、电源线和传感器加热区域。
 
 #### SHT30 温湿度传感器
