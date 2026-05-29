@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, overload
 
 OFFLINE_SECONDS = 8.0
 DEDUP_SECONDS = 5.0
@@ -23,11 +23,25 @@ def reset_alarm_state() -> None:
     _LAST_ALARM_AT.clear()
 
 
+@overload
+def evaluate_sample(sample: dict[str, Any] | None) -> list[str]:
+    ...
+
+
+@overload
+def evaluate_sample(
+    sample: dict[str, Any] | None,
+    node_states: dict[int, dict[str, Any]],
+    now: float,
+) -> list[dict[str, Any]]:
+    ...
+
+
 def evaluate_sample(
     sample: dict[str, Any] | None,
     node_states: dict[int, dict[str, Any]] | None = None,
     now: float | None = None,
-) -> list[dict[str, Any]]:
+) -> list[str] | list[dict[str, Any]]:
     """根据最新样本和节点状态返回报警事件列表。
 
     中文注释：目标接口要求支持 evaluate_sample(sample)，当前 main.py 仍会传入
@@ -39,21 +53,27 @@ def evaluate_sample(
 
         now = time.time()
 
-    events: list[dict[str, Any]] = []
+    dict_events: list[dict[str, Any]] = []
+    text_events: list[str] = []
 
     if sample and sample.get("valid", True):
         node_id = int(sample.get("node_id") or 0)
-        presence = float(sample.get("presence_score") or 0.0)
-        confidence = float(sample.get("confidence") or 0.0)
-        gas = float(sample.get("gas") or 0.0)
+        presence = _score(sample, "presence_score", "presence")
+        confidence = _score(sample, "confidence", "conf")
+        gas = _number(sample.get("gas"))
 
         if node_id > 0 and presence > PRESENCE_THRESHOLD and confidence > CONFIDENCE_THRESHOLD:
-            _append_alarm(events, now, node_id, "life_motion", "疑似生命微动")
+            _append_alarm(dict_events, text_events, now, node_id, "life_motion", "疑似生命微动")
         if node_id > 0 and gas > GAS_THRESHOLD:
-            _append_alarm(events, now, node_id, "gas", "气体异常")
+            _append_alarm(dict_events, text_events, now, node_id, "gas", "气体异常")
+
+        # 中文注释：单样本调用如果带有 last_received，也可以独立判断离线。
+        last_received = sample.get("last_received")
+        if node_states is None and last_received is not None and now - _number(last_received, now) > OFFLINE_SECONDS:
+            _append_alarm(dict_events, text_events, now, node_id, "offline", "离线")
 
     if node_states is None:
-        return events
+        return text_events
 
     # 中文注释：离线规则依赖全局节点状态，单样本调用时不会误报离线。
     for node_id, state in node_states.items():
@@ -61,13 +81,14 @@ def evaluate_sample(
         if last_received is None:
             last_received = state.get("created_at", now)
         if now - float(last_received) > OFFLINE_SECONDS:
-            _append_alarm(events, now, int(node_id), "offline", "节点离线")
+            _append_alarm(dict_events, text_events, now, int(node_id), "offline", "节点离线")
 
-    return events
+    return dict_events
 
 
 def _append_alarm(
-    events: list[dict[str, Any]],
+    dict_events: list[dict[str, Any]],
+    text_events: list[str],
     now: float,
     node_id: int,
     kind: str,
@@ -79,7 +100,8 @@ def _append_alarm(
         return
 
     _LAST_ALARM_AT[key] = now
-    events.append(
+    text_events.append(f"Node {node_id} {message}")
+    dict_events.append(
         {
             "time": now,
             "node_id": node_id,
@@ -88,3 +110,17 @@ def _append_alarm(
             "message": message,
         }
     )
+
+
+def _score(sample: dict[str, Any], primary: str, alias: str) -> float:
+    value = _number(sample.get(primary, sample.get(alias, 0.0)))
+    if value > 1.0:
+        value /= 100.0
+    return max(0.0, min(value, 1.0))
+
+
+def _number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
