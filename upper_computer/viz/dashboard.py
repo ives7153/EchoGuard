@@ -184,7 +184,7 @@ class RescueDashboard:
             if self._font_big:
                 dpg.bind_item_font(dpg.last_item(), self._font_big)
             for node_id in range(1, 5):
-                with dpg.child_window(tag=f"node_card_{node_id}", height=136, border=True):
+                with dpg.child_window(tag=f"node_card_{node_id}", height=154, border=True):
                     dpg.add_text(f"Node {node_id}", tag=f"node_title_{node_id}")
                     dpg.add_text("离线", tag=f"node_online_{node_id}", color=(255, 112, 112))
                     dpg.add_text("RSSI: - dBm", tag=f"node_rssi_{node_id}")
@@ -192,6 +192,7 @@ class RescueDashboard:
                     dpg.add_text("最后收到: -", tag=f"node_last_{node_id}")
                     dpg.add_text("presence: 0.00", tag=f"node_presence_{node_id}")
                     dpg.add_text("motion: 0.00 | bpm: 0", tag=f"node_motion_bpm_{node_id}")
+                    dpg.add_text("gas: 0", tag=f"node_gas_{node_id}")
 
     def _build_center_panel(self) -> None:
         # 中文注释：所有曲线共用 60 秒相对时间轴，bpm/gas 做归一化后用于趋势比较。
@@ -290,6 +291,7 @@ class RescueDashboard:
                 f"motion: {_score(state, 'motion_score', 'motion'):.2f} | "
                 f"bpm: {_number(state, 'breath_bpm', 'bpm'):.0f}",
             )
+            dpg.set_value(f"node_gas_{node_id}", f"gas: {_number(state, 'gas', 'gas_raw'):.0f}")
 
     def _update_plot(self, history: list[dict[str, Any]]) -> None:
         now = time.time()
