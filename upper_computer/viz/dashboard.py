@@ -38,6 +38,11 @@ class RescueDashboard:
         self._font_huge: int | str | None = None
         self._themes: dict[str, int | str] = {}
         self._last_alarm_count = 0
+        self._node_states: dict[int, dict[str, Any]] = {
+            node_id: {"node_id": node_id, "online": False}
+            for node_id in range(1, 5)
+        }
+        self._alarms: list[dict[str, Any] | str] = []
 
     def build(self) -> None:
         self._load_fonts()
@@ -87,14 +92,46 @@ class RescueDashboard:
         self,
         node_states: dict[int, dict[str, Any]],
         history: list[dict[str, Any]],
-        alarms: list[dict[str, Any]],
+        alarms: list[dict[str, Any] | str],
         countdown_seconds: int,
     ) -> None:
+        self._node_states = node_states
+        self._alarms = alarms
         self._update_node_cards(node_states)
         self._update_plot(history)
         self._update_heatmap(node_states)
         self._update_countdown(countdown_seconds)
         self._update_alarm_log(alarms)
+
+    def update_node(self, node_id: int, data: dict[str, Any]) -> None:
+        """更新单个节点卡片和热力图。
+
+        中文注释：当前 main.py 使用批量 update(...)，这里保留单节点接口，
+        方便后续直接从串口回调或测试脚本驱动界面。
+        """
+
+        if node_id not in self._node_states:
+            return
+
+        state = self._node_states[node_id]
+        state.update(data)
+        state["node_id"] = node_id
+        self._update_node_cards(self._node_states)
+        self._update_heatmap(self._node_states)
+
+    def add_alarm(self, msg: str) -> None:
+        """追加一条字符串报警并刷新报警日志。"""
+
+        self._alarms.append(msg)
+        if len(self._alarms) > 200:
+            del self._alarms[: len(self._alarms) - 200]
+        self._last_alarm_count = -1
+        self._update_alarm_log(self._alarms)
+
+    def update_countdown(self, seconds: int) -> None:
+        """更新右侧部署倒计时。"""
+
+        self._update_countdown(seconds)
 
     def _load_fonts(self) -> None:
         candidates = [
@@ -147,12 +184,14 @@ class RescueDashboard:
             if self._font_big:
                 dpg.bind_item_font(dpg.last_item(), self._font_big)
             for node_id in range(1, 5):
-                with dpg.child_window(tag=f"node_card_{node_id}", height=104, border=True):
+                with dpg.child_window(tag=f"node_card_{node_id}", height=136, border=True):
                     dpg.add_text(f"Node {node_id}", tag=f"node_title_{node_id}")
                     dpg.add_text("离线", tag=f"node_online_{node_id}", color=(255, 112, 112))
                     dpg.add_text("RSSI: - dBm", tag=f"node_rssi_{node_id}")
                     dpg.add_text("电池: - %", tag=f"node_battery_{node_id}")
                     dpg.add_text("最后收到: -", tag=f"node_last_{node_id}")
+                    dpg.add_text("presence: 0.00", tag=f"node_presence_{node_id}")
+                    dpg.add_text("motion: 0.00 | bpm: 0", tag=f"node_motion_bpm_{node_id}")
 
     def _build_center_panel(self) -> None:
         # 中文注释：所有曲线共用 60 秒相对时间轴，bpm/gas 做归一化后用于趋势比较。
@@ -245,6 +284,12 @@ class RescueDashboard:
             dpg.set_value(f"node_rssi_{node_id}", f"RSSI: {state.get('rssi', 0):.0f} dBm")
             dpg.set_value(f"node_battery_{node_id}", f"电池: {state.get('battery', 0):.0f} %")
             dpg.set_value(f"node_last_{node_id}", f"最后收到: {age_text}")
+            dpg.set_value(f"node_presence_{node_id}", f"presence: {_score(state, 'presence_score', 'presence'):.2f}")
+            dpg.set_value(
+                f"node_motion_bpm_{node_id}",
+                f"motion: {_score(state, 'motion_score', 'motion'):.2f} | "
+                f"bpm: {_number(state, 'breath_bpm', 'bpm'):.0f}",
+            )
 
     def _update_plot(self, history: list[dict[str, Any]]) -> None:
         now = time.time()
@@ -278,7 +323,7 @@ class RescueDashboard:
     def _update_countdown(self, countdown_seconds: int) -> None:
         dpg.set_value("countdown_text", f"{countdown_seconds:02d}")
 
-    def _update_alarm_log(self, alarms: list[dict[str, Any]]) -> None:
+    def _update_alarm_log(self, alarms: list[dict[str, Any] | str]) -> None:
         if len(alarms) == self._last_alarm_count:
             return
 
@@ -292,9 +337,13 @@ class RescueDashboard:
             return
 
         for alarm in list(reversed(alarms[-18:])):
-            ts = time.strftime("%H:%M:%S", time.localtime(float(alarm["time"])))
+            if isinstance(alarm, str):
+                text = alarm
+            else:
+                ts = time.strftime("%H:%M:%S", time.localtime(float(alarm["time"])))
+                text = f"[{ts}] Node {alarm['node_id']}  {alarm['message']}"
             dpg.add_text(
-                f"[{ts}] Node {alarm['node_id']}  {alarm['message']}",
+                text,
                 parent="alarm_log_window",
                 color=(255, 78, 78),
             )
@@ -304,5 +353,22 @@ def _heat_value(state: dict[str, Any]) -> float:
     if not state.get("online"):
         return 0.0
     # 中文注释：目标要求热力图颜色随 presence_score 渐变，这里不混入 motion/gas。
-    presence = float(state.get("presence_score", 0.0))
+    presence = _score(state, "presence_score", "presence")
     return max(0.0, min(presence, 1.0))
+
+
+def _score(state: dict[str, Any], primary: str, alias: str) -> float:
+    """读取 0~1 分数字段，同时兼容固件或 demo 数据中的别名。"""
+
+    value = _number(state, primary, alias)
+    if value > 1.0:
+        value /= 100.0
+    return max(0.0, min(value, 1.0))
+
+
+def _number(state: dict[str, Any], primary: str, alias: str) -> float:
+    value = state.get(primary, state.get(alias, 0.0))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
