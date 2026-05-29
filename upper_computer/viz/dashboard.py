@@ -1,4 +1,8 @@
-"""RuView-Rescue Dear PyGui 仪表盘。"""
+"""RuView-Rescue Dear PyGui 仪表盘。
+
+中文注释：本文件只负责界面创建和刷新，串口、规则、导出等业务逻辑由
+main.py 协调，保持竞赛演示界面足够清晰、稳定、易维护。
+"""
 
 from __future__ import annotations
 
@@ -48,12 +52,16 @@ class RescueDashboard:
                 self._build_right_panel()
             dpg.add_separator()
             self._build_alarm_panel()
+            dpg.add_separator()
+            self._build_bottom_status_bar()
 
         dpg.set_primary_window("main_window", True)
 
     def set_status(self, text: str, ok: bool = True) -> None:
         dpg.set_value("serial_status_text", text)
         dpg.configure_item("serial_status_text", color=(92, 230, 155) if ok else (255, 112, 112))
+        dpg.set_value("bottom_status_text", text)
+        dpg.configure_item("bottom_status_text", color=(92, 230, 155) if ok else (255, 112, 112))
 
     def set_ports(self, ports: list[str], selected: str | None = None) -> None:
         values = ports or ["无可用串口"]
@@ -69,6 +77,7 @@ class RescueDashboard:
 
     def set_latest_frame(self, text: str) -> None:
         dpg.set_value("latest_frame_text", text)
+        dpg.set_value("bottom_latest_frame_text", text)
 
     def set_export_message(self, text: str, ok: bool = True) -> None:
         dpg.set_value("export_message_text", text)
@@ -118,6 +127,7 @@ class RescueDashboard:
             self._themes[name] = theme
 
     def _build_header(self) -> None:
+        # 中文注释：顶部只放操作控件，底部再重复展示运行状态，便于投影时远距离观察。
         with dpg.group(horizontal=True):
             dpg.add_text("RuView-Rescue 救援感知上位机", tag="title_text")
             if self._font_big:
@@ -131,6 +141,7 @@ class RescueDashboard:
         dpg.add_text("最新帧：-", tag="latest_frame_text", wrap=1260)
 
     def _build_left_panel(self) -> None:
+        # 中文注释：4 个节点固定展示，现场演示时不会因为离线节点消失导致布局跳动。
         with dpg.child_window(label="节点状态", width=270, height=500, border=True):
             dpg.add_text("节点状态")
             if self._font_big:
@@ -144,6 +155,7 @@ class RescueDashboard:
                     dpg.add_text("最后收到: -", tag=f"node_last_{node_id}")
 
     def _build_center_panel(self) -> None:
+        # 中文注释：所有曲线共用 60 秒相对时间轴，bpm/gas 做归一化后用于趋势比较。
         with dpg.child_window(label="实时曲线", width=690, height=500, border=True):
             dpg.add_text("60 秒滚动趋势")
             if self._font_big:
@@ -168,6 +180,7 @@ class RescueDashboard:
             dpg.add_text("最新值：-", tag="latest_values_text")
 
     def _build_right_panel(self) -> None:
+        # 中文注释：热力图按 Node1~4 的 2x2 部署位展示，颜色强度仅随 presence_score 变化。
         with dpg.child_window(label="部署态势", width=300, height=500, border=True):
             dpg.add_text("部署倒计时")
             if self._font_big:
@@ -198,6 +211,7 @@ class RescueDashboard:
             dpg.add_text("Node3 0.00 | Node4 0.00", tag="heat_row_2")
 
     def _build_alarm_panel(self) -> None:
+        # 中文注释：报警日志保留在底部上方，红色高亮用于现场快速定位异常节点。
         with dpg.group(horizontal=True):
             dpg.add_text("报警日志")
             if self._font_big:
@@ -208,6 +222,13 @@ class RescueDashboard:
             dpg.add_text("", tag="export_message_text")
         with dpg.child_window(tag="alarm_log_window", height=160, border=True):
             dpg.add_text("暂无报警", tag="alarm_empty_text", color=(180, 180, 180))
+
+    def _build_bottom_status_bar(self) -> None:
+        # 中文注释：底部状态栏承载串口状态与最新帧，满足大屏投影时的总览需求。
+        with dpg.group(horizontal=True):
+            dpg.add_text("系统状态：", color=(210, 220, 235))
+            dpg.add_text("串口状态：初始化中", tag="bottom_status_text", color=(92, 230, 155))
+        dpg.add_text("最新帧：-", tag="bottom_latest_frame_text", wrap=1260, color=(210, 220, 235))
 
     def _update_node_cards(self, node_states: dict[int, dict[str, Any]]) -> None:
         now = time.time()
@@ -282,7 +303,6 @@ class RescueDashboard:
 def _heat_value(state: dict[str, Any]) -> float:
     if not state.get("online"):
         return 0.0
+    # 中文注释：目标要求热力图颜色随 presence_score 渐变，这里不混入 motion/gas。
     presence = float(state.get("presence_score", 0.0))
-    motion = float(state.get("motion_score", 0.0))
-    gas = min(float(state.get("gas", 0.0)) / 800.0, 1.0)
-    return max(0.0, min(presence * 0.45 + motion * 0.35 + gas * 0.20, 1.0))
+    return max(0.0, min(presence, 1.0))
