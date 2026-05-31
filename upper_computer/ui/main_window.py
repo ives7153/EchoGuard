@@ -119,7 +119,7 @@ class MainWindow(QMainWindow):
     mesh_toggled = pyqtSignal(bool)
     sync_requested = pyqtSignal()
     matrix_filter_changed = pyqtSignal(str)
-    add_node_requested = pyqtSignal()
+    add_node_requested = pyqtSignal(object)
     matrix_remove_requested = pyqtSignal(int)
     matrix_maintenance_requested = pyqtSignal(int)
     diagnostics_requested = pyqtSignal()
@@ -200,11 +200,6 @@ class MainWindow(QMainWindow):
         disconnect_btn.clicked.connect(self.disconnect_requested.emit)
         layout.addWidget(disconnect_btn)
 
-        for glyph in ("⚙", "🔔", "👤"):
-            icon = QLabel(glyph)
-            icon.setObjectName("TopIcon")
-            layout.addWidget(icon)
-
         return top
 
     def _build_left_nav(self) -> QWidget:
@@ -240,13 +235,6 @@ class MainWindow(QMainWindow):
         line.setStyleSheet(f"background: {THEME['divider']};")
         layout.addWidget(line)
         layout.addSpacing(10)
-
-        node_state = QLabel("节点状态")
-        node_state.setStyleSheet(f"color: {THEME['muted']}; font-weight: 700; font-size: 13px;")
-        layout.addWidget(node_state)
-        self.nav_progress = QLabel("●●●●●●●●●●●●●●●●  98%")
-        self.nav_progress.setStyleSheet(f"color: {THEME['blue_soft']}; font-size: 11px;")
-        layout.addWidget(self.nav_progress)
 
         layout.addStretch(1)
 

@@ -165,7 +165,7 @@ class CsiTrendPlot(CardFrame):
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
 
-        self.node_badge = QLabel("NODE_01_PROX")
+        self.node_badge = QLabel("node1")
         self.node_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.rssi_badge = QLabel("RSSI: -- dBm")
         self.rssi_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -195,6 +195,10 @@ class CsiTrendPlot(CardFrame):
             axis.setTextPen(pg.mkPen("#6C7280"))
         self.plot.getPlotItem().setContentsMargins(4, 4, 4, 4)
         self.plot.setMinimumHeight(220)
+        self.empty_label = QLabel("等待 Gateway 串口数据")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setObjectName("SubtleText")
+        self.empty_label.setStyleSheet(f"color: {THEME['muted']}; font-size: 13px;")
 
         self.amplitude_curve = self.plot.plot(
             [], [], pen=pg.mkPen(THEME["blue_bright"], width=2.4), name="载波 A-14"
@@ -216,6 +220,7 @@ class CsiTrendPlot(CardFrame):
         legend.addWidget(self.sample_rate_label)
 
         layout.addWidget(self.plot)
+        layout.addWidget(self.empty_label)
         layout.addLayout(legend)
 
     def set_history(self, history: list[dict[str, Any]], active_node: int, node_state: dict[str, Any]) -> None:
@@ -230,6 +235,7 @@ class CsiTrendPlot(CardFrame):
             recent = [
                 sample for sample in history if now - _float(sample.get("timestamp"), now) <= 60.0
             ][-90:]
+        self.empty_label.setVisible(not bool(recent))
 
         xs: list[float] = []
         ys: list[float] = []
@@ -251,7 +257,7 @@ class CsiTrendPlot(CardFrame):
         self.plot.setXRange(-60.0, 0.0, padding=0)
         self.plot.setYRange(0.0, 1.0, padding=0)
 
-        self.node_badge.setText(f"NODE_{active_node:02d}_PROX")
+        self.node_badge.setText(NODE_LABELS.get(active_node, f"node{active_node}"))
         # 中文注释：CSI 徽标显示 WiFi RSSI（较强），缺失时回退到 LoRa rssi。
         wifi_rssi = node_state.get("wifi_rssi")
         rssi_value = _float(wifi_rssi if wifi_rssi is not None else node_state.get("rssi"))
@@ -447,11 +453,22 @@ class BatteryBar(QWidget):
         layout.addWidget(self.percent)
         layout.addStretch(1)
 
+    def set_unknown(self) -> None:
+        self._value = 0.0
+        self.bar.setValue(0)
+        self.percent.setText("未上报")
+        self.percent.setStyleSheet(f"color: {THEME['muted']}; font-size: 13px;")
+        self.bar.setStyleSheet(
+            "QProgressBar { background: #2B2D34; border: 0; border-radius: 4px; }"
+            f" QProgressBar::chunk {{ background: {THEME['muted_2']}; border-radius: 4px; }}"
+        )
+
     def set_value(self, value: float) -> None:
         value = max(0.0, min(100.0, float(value)))
         self._value = value
         self.bar.setValue(int(value))
         self.percent.setText(f"{value:.0f}%")
+        self.percent.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 13px;")
         if value <= 35:
             chunk = THEME["red_soft"]
         elif value <= 60:
@@ -750,9 +767,7 @@ def _event_color(event: dict[str, Any]) -> str:
     title = str(event.get("title", ""))
     if level == "ALARM":
         return THEME["red"]
-    if "BREATH" in title:
-        return THEME["green"]
-    if "PRESENCE" in title:
+    if "PRESENCE" in title or "微动" in title:
         return THEME["blue_soft"]
     if level == "WARN":
         return THEME["orange"]

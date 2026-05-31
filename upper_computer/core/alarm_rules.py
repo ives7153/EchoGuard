@@ -30,9 +30,9 @@ except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
 
 
 _TITLE_BY_KIND = {
-    "life_motion": "LIFE MOTION ALERT",
-    "gas": "GAS THRESHOLD ALERT",
-    "offline": "NODE OFFLINE",
+    "life_motion": "疑似生命微动",
+    "gas": "有害气体异常",
+    "offline": "节点离线",
     "alarm": "SYSTEM ALARM",
 }
 

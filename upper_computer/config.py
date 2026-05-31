@@ -79,10 +79,10 @@ THEME = {
 # 中文注释：key 用于 QStackedWidget 路由，icon 为简单字形避免外部资源依赖。
 # ---------------------------------------------------------------------------
 NAV_ITEMS = (
-    {"key": "dashboard", "text": "仪表盘", "icon": "▦"},
-    {"key": "sensors", "text": "传感器", "icon": "((·))"},
-    {"key": "analysis", "text": "数据分析", "icon": "▣"},
-    {"key": "diagnostics", "text": "技术诊断", "icon": "✚"},
+    {"key": "dashboard", "text": "仪表盘", "icon": "▥"},
+    {"key": "sensors", "text": "节点管理", "icon": "◎"},
+    {"key": "analysis", "text": "数据分析", "icon": "⌁"},
+    {"key": "diagnostics", "text": "技术诊断", "icon": "＋"},
     {"key": "history", "text": "历史记录", "icon": "↺"},
 )
 
@@ -91,10 +91,10 @@ NAV_ITEMS = (
 # 仪表盘页：4 个生命体征感知节点
 # ---------------------------------------------------------------------------
 NODE_LABELS = {
-    1: "SENS_01",
-    2: "SENS_02",
-    3: "SENS_03",
-    4: "SENS_04",
+    1: "node1",
+    2: "node2",
+    3: "node3",
+    4: "node4",
 }
 
 # 中文注释：拓扑图使用归一化坐标，绘制时按控件尺寸映射到圆形轨道。
@@ -115,20 +115,20 @@ TOPOLOGY_NODE_POSITIONS = {
 OPERATING_MODES = ("POWER_SAVE", "HIGH_PERF", "SLEEP", "DEBUG_MODE", "NORMAL")
 
 NODE_MATRIX = (
-    {"matrix_id": 1, "code": "NODE-AX-772", "mode": "POWER_SAVE", "bound_node": 1, "battery": 82},
-    {"matrix_id": 2, "code": "NODE-BX-104", "mode": "HIGH_PERF", "bound_node": 2, "battery": 31},
-    {"matrix_id": 3, "code": "NODE-AX-991", "mode": "SLEEP", "bound_node": 3, "battery": 100},
-    {"matrix_id": 4, "code": "NODE-CZ-012", "mode": "DEBUG_MODE", "bound_node": None, "battery": 56},
-    {"matrix_id": 5, "code": "NODE-AX-102", "mode": "POWER_SAVE", "bound_node": 4, "battery": 75},
-    {"matrix_id": 6, "code": "NODE-BX-233", "mode": "HIGH_PERF", "bound_node": None, "battery": 64},
-    {"matrix_id": 7, "code": "NODE-DX-318", "mode": "NORMAL", "bound_node": None, "battery": 88},
-    {"matrix_id": 8, "code": "NODE-AX-540", "mode": "POWER_SAVE", "bound_node": None, "battery": 47},
-    {"matrix_id": 9, "code": "NODE-CZ-077", "mode": "NORMAL", "bound_node": None, "battery": 72},
-    {"matrix_id": 10, "code": "NODE-BX-861", "mode": "NORMAL", "bound_node": None, "battery": 90},
-    {"matrix_id": 11, "code": "NODE-AX-405", "mode": "SLEEP", "bound_node": None, "battery": 100},
-    {"matrix_id": 12, "code": "NODE-DX-690", "mode": "HIGH_PERF", "bound_node": None, "battery": 53},
-    {"matrix_id": 13, "code": "NODE-AX-219", "mode": "POWER_SAVE", "bound_node": None, "battery": 79},
-    {"matrix_id": 14, "code": "NODE-BX-948", "mode": "NORMAL", "bound_node": None, "battery": 68},
+    {"matrix_id": 1, "code": "node1", "mode": "POWER_SAVE", "bound_node": 1, "battery": 82},
+    {"matrix_id": 2, "code": "node2", "mode": "HIGH_PERF", "bound_node": 2, "battery": 31},
+    {"matrix_id": 3, "code": "node3", "mode": "SLEEP", "bound_node": 3, "battery": 100},
+    {"matrix_id": 4, "code": "node4", "mode": "DEBUG_MODE", "bound_node": None, "battery": 56},
+    {"matrix_id": 5, "code": "node5", "mode": "POWER_SAVE", "bound_node": 4, "battery": 75},
+    {"matrix_id": 6, "code": "node6", "mode": "HIGH_PERF", "bound_node": None, "battery": 64},
+    {"matrix_id": 7, "code": "node7", "mode": "NORMAL", "bound_node": None, "battery": 88},
+    {"matrix_id": 8, "code": "node8", "mode": "POWER_SAVE", "bound_node": None, "battery": 47},
+    {"matrix_id": 9, "code": "node9", "mode": "NORMAL", "bound_node": None, "battery": 72},
+    {"matrix_id": 10, "code": "node10", "mode": "NORMAL", "bound_node": None, "battery": 90},
+    {"matrix_id": 11, "code": "node11", "mode": "SLEEP", "bound_node": None, "battery": 100},
+    {"matrix_id": 12, "code": "node12", "mode": "HIGH_PERF", "bound_node": None, "battery": 53},
+    {"matrix_id": 13, "code": "node13", "mode": "POWER_SAVE", "bound_node": None, "battery": 79},
+    {"matrix_id": 14, "code": "node14", "mode": "NORMAL", "bound_node": None, "battery": 68},
 )
 
 # 运行健康度等级（设计稿：极佳 / 良好 / 未激活 / 严重错误）
