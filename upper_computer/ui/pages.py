@@ -7,7 +7,7 @@ DataManager 快照刷新自身，不可见时会自动跳过重活，降低 CPU 
 页面清单：
 * DashboardPage   —— 设计稿图 2：CSI 振幅趋势 + 生命体征指标 + 环境/无线 + 事件流 + 拓扑。
 * SensorMatrixPage—— 设计稿图 1：活动节点矩阵表 + 右侧系统核心配置 + 底部系统警告条。
-* AnalysisPage    —— 数据分析：聚合统计 + 呼吸/运动趋势曲线。
+ * AnalysisPage    —— 数据分析：聚合统计 + 运动/存在趋势曲线。
 * DiagnosticsPage —— 技术诊断：链路质量表 + 系统信息。
 * HistoryPage     —— 历史记录：可滚动样本表 + CSV 导出。
 """
@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QScrollArea,
@@ -101,6 +102,7 @@ _MATRIX_COLUMNS = (
     ("LORA RSSI", 110),
     ("电池电量", 185),
     ("运行健康度", 130),
+    ("建议动作", 140),
     ("操作", 56),
 )
 
@@ -124,6 +126,7 @@ class DashboardPage(QWidget):
         self.group_values: dict[str, QLabel] = {}
         self._last_event_count = -1
         self._paused = False
+        self._last_verdict = ("等待数据", "尚未收到有效节点数据", THEME["muted"])
 
         body = QHBoxLayout(self)
         body.setContentsMargins(0, 0, 0, 0)
@@ -162,6 +165,29 @@ class DashboardPage(QWidget):
         controls.addStretch(1)
         layout.addLayout(controls)
 
+        self.verdict_card = CardFrame()
+        verdict_layout = QHBoxLayout(self.verdict_card)
+        verdict_layout.setContentsMargins(18, 12, 18, 12)
+        verdict_layout.setSpacing(18)
+        verdict_title_box = QVBoxLayout()
+        verdict_title_box.setSpacing(3)
+        verdict_title = QLabel("综合研判结果")
+        verdict_title.setObjectName("SectionTitle")
+        verdict_subtitle = QLabel("基于当前节点数据的辅助判断")
+        verdict_subtitle.setObjectName("SubtleText")
+        verdict_title_box.addWidget(verdict_title)
+        verdict_title_box.addWidget(verdict_subtitle)
+        self.verdict_status = QLabel("等待数据")
+        self.verdict_status.setObjectName("MetricValue")
+        self.verdict_status.setStyleSheet(f"font-size: 22px; color: {THEME['muted']};")
+        self.verdict_detail = QLabel("尚未收到有效节点数据")
+        self.verdict_detail.setObjectName("SubtleText")
+        self.verdict_detail.setWordWrap(True)
+        verdict_layout.addLayout(verdict_title_box, 1)
+        verdict_layout.addWidget(self.verdict_status)
+        verdict_layout.addWidget(self.verdict_detail, 2)
+        layout.addWidget(self.verdict_card)
+
         self.csi_plot = CsiTrendPlot()
         layout.addWidget(self.csi_plot, 5)
 
@@ -170,7 +196,6 @@ class DashboardPage(QWidget):
         metrics.setVerticalSpacing(16)
         self.metric_cards["motion"] = MetricCard("运动分值\n(MOTION SCORE)", "0.00", "等待数据")
         self.metric_cards["presence"] = MetricCard("存在感应\n(PRESENCE)", "CLEAR", "未检测")
-        self.metric_cards["breath"] = MetricCard("呼吸频率\n(BREATH BPM)", "-- 次/分", "锁定中")
         self.metric_cards["confidence"] = MetricCard("置信度\n(CONFIDENCE)", "-- %", "模型输出")
         for index, card in enumerate(self.metric_cards.values()):
             metrics.addWidget(card, 0, index)
@@ -184,7 +209,7 @@ class DashboardPage(QWidget):
                 (
                     ("temp", "温度 TEMP", "-- °C"),
                     ("hum", "湿度 HUM", "-- %"),
-                    ("gas", "甲醛 GAS", "-- ppm"),
+                    ("gas", "有害气体指数", "--"),
                 ),
             ),
             1,
@@ -314,6 +339,7 @@ class DashboardPage(QWidget):
             return
 
         self.csi_plot.set_history(history, active_node, active_state)
+        self._update_verdict(active_node, active_state, history)
         self._update_metric_cards(active_state)
         self._update_group_cards(active_state)
 
@@ -346,12 +372,18 @@ class DashboardPage(QWidget):
                 ("在线状态", "在线" if state.get("online") else "离线"),
                 ("Presence", f"{_score(state.get('presence_score')):.2f}"),
                 ("Motion", f"{_score(state.get('motion_score')):.2f}"),
-                ("Breath BPM", f"{_float(state.get('breath_bpm')):.0f}"),
                 ("Confidence", f"{_score(state.get('confidence')) * 100:.0f}%"),
-                ("Gas", f"{_float(state.get('gas')):.0f} ppm"),
+                ("有害气体指数", f"{_float(state.get('gas')):.0f}"),
                 ("RSSI", f"{_float(state.get('rssi')):.0f} dBm"),
             ),
         )
+
+    def _update_verdict(self, active_node: int, state: dict[str, Any], history: list[dict[str, Any]]) -> None:
+        status, detail, color = _detection_state(active_node, state, history)
+        self._last_verdict = (status, detail, color)
+        self.verdict_status.setText(status)
+        self.verdict_status.setStyleSheet(f"font-size: 22px; color: {color};")
+        self.verdict_detail.setText(detail)
 
     def set_export_message(self, text: str, ok: bool = True) -> None:
         self.export_message.setText(text)
@@ -363,12 +395,9 @@ class DashboardPage(QWidget):
         motion = _score(state.get("motion_score"))
         presence = _score(state.get("presence_score"))
         confidence = _score(state.get("confidence"))
-        breath = _float(state.get("breath_bpm"))
-
         motion_hint = "活跃" if motion >= 0.52 else "平稳"
-        presence_text = "DETECT" if presence >= 0.5 else "CLEAR"
+        presence_text = "疑似微动" if presence >= 0.5 and confidence >= 0.62 else "未检测"
         presence_hint = f"{presence * 100:.0f}% 阈值响应"
-        breath_hint = "BREATH LOCKED" if breath >= 8 and confidence >= 0.68 else "ACQUIRING"
         conf_hint = "可信" if confidence >= 0.75 else "观测中"
 
         self.metric_cards["motion"].set_value(
@@ -377,9 +406,8 @@ class DashboardPage(QWidget):
         self.metric_cards["presence"].set_value(
             presence_text,
             presence_hint,
-            THEME["green"] if presence_text == "DETECT" else THEME["blue_soft"],
+            THEME["green"] if presence_text == "疑似微动" else THEME["blue_soft"],
         )
-        self.metric_cards["breath"].set_value(f"{breath:.0f} 次/分", breath_hint, THEME["text"])
         self.metric_cards["confidence"].set_value(
             f"{confidence * 100:.0f} %", conf_hint, THEME["blue_soft"]
         )
@@ -394,7 +422,7 @@ class DashboardPage(QWidget):
 
         self.group_values["temp"].setText(f"{temp:.1f}°C")
         self.group_values["hum"].setText(f"{hum:.0f}%")
-        self.group_values["gas"].setText(f"{gas:.0f} ppm")
+        self.group_values["gas"].setText(f"{gas:.0f}")
         self.group_values["gas"].setStyleSheet(
             f"font-size: 19px; color: {THEME['red'] if gas >= 550 else THEME['text']};"
         )
@@ -456,12 +484,18 @@ class _MatrixRow(QFrame):
         self.health = HealthBadge()
         layout.addWidget(self._fixed(self.health, _MATRIX_COLUMNS[4][1], align_left=True))
 
+        # 建议动作
+        self.advice_label = QLabel("等待数据")
+        self.advice_label.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 13px;")
+        self.advice_label.setWordWrap(True)
+        layout.addWidget(self._fixed(self.advice_label, _MATRIX_COLUMNS[5][1], align_left=True))
+
         # 操作
         self.menu_btn = QPushButton("⋯")
         self.menu_btn.setObjectName("RowMenu")
         self.menu_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.menu_btn.clicked.connect(lambda: self.menu_requested.emit(self.matrix_id))
-        layout.addWidget(self._fixed(self.menu_btn, _MATRIX_COLUMNS[5][1], align_left=False))
+        layout.addWidget(self._fixed(self.menu_btn, _MATRIX_COLUMNS[6][1], align_left=False))
 
     @staticmethod
     def _fixed(widget: QWidget, width: int, align_left: bool) -> QWidget:
@@ -487,8 +521,14 @@ class _MatrixRow(QFrame):
         self.rssi_label.setStyleSheet(
             f"color: {THEME['text_soft'] if online else THEME['muted_2']}; font-size: 14px;"
         )
-        self.battery.set_value(_float(state.get("battery")))
+        if state.get("battery") is None:
+            self.battery.set_unknown()
+        else:
+            self.battery.set_value(_float(state.get("battery")))
         self.health.set_health(str(state.get("health", "")))
+        advice, color = _matrix_advice(state)
+        self.advice_label.setText(advice)
+        self.advice_label.setStyleSheet(f"color: {color}; font-size: 13px;")
 
 
 class SensorMatrixPage(QWidget):
@@ -499,7 +539,7 @@ class SensorMatrixPage(QWidget):
     afh_toggled = pyqtSignal(bool)
     mesh_toggled = pyqtSignal(bool)
     sync_requested = pyqtSignal()
-    add_node_requested = pyqtSignal()
+    add_node_requested = pyqtSignal(object)
     matrix_filter_changed = pyqtSignal(str)
     matrix_remove_requested = pyqtSignal(int)
     matrix_maintenance_requested = pyqtSignal(int)
@@ -548,10 +588,14 @@ class SensorMatrixPage(QWidget):
         self.filter_btn = QPushButton("≡  筛选：全部")
         self.filter_btn.setObjectName("GhostButton")
         self.filter_btn.clicked.connect(self._open_filter_menu)
+        delete_btn = QPushButton("删除节点")
+        delete_btn.setObjectName("DangerButton")
+        delete_btn.clicked.connect(self._open_delete_node_dialog)
         add_btn = QPushButton("+  新增节点")
         add_btn.setObjectName("PrimaryButton")
-        add_btn.clicked.connect(self.add_node_requested.emit)
+        add_btn.clicked.connect(self._open_add_node_dialog)
         header.addWidget(self.filter_btn)
+        header.addWidget(delete_btn)
         header.addWidget(add_btn)
         layout.addLayout(header)
 
@@ -636,7 +680,7 @@ class SensorMatrixPage(QWidget):
         layout.addWidget(self.presence_slider)
 
         self.gas_slider = ThresholdSlider(
-            "气体检测阈值 (Gas)",
+            "有害气体阈值",
             minimum=0.0,
             maximum=1000.0,
             value=GAS_THRESHOLD_PPM,
@@ -745,6 +789,170 @@ class SensorMatrixPage(QWidget):
             state = self._latest_matrix.get(matrix_id, {})
             row.setVisible(self._matrix_matches(state))
 
+    def _open_add_node_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("新增节点")
+        dialog.setMinimumWidth(430)
+        dialog.setStyleSheet(
+            f"QDialog {{ background: {THEME['bg']}; }}"
+            f"QLabel {{ color: {THEME['text_soft']}; }}"
+            f"QLineEdit {{ background: {THEME['card_alt']};"
+            f" border: 1px solid {THEME['border']}; border-radius: 8px;"
+            f" padding: 7px 10px; color: {THEME['text']}; }}"
+            f"QLineEdit:focus {{ border-color: {THEME['blue']}; }}"
+        )
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("添加观察节点")
+        title.setObjectName("SectionTitle")
+        title.setStyleSheet("font-size: 17px; font-weight: 700;")
+        layout.addWidget(title)
+
+        card = CardFrame()
+        form = QGridLayout(card)
+        form.setContentsMargins(16, 14, 16, 14)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(12)
+
+        code_edit = QLineEdit(self._next_local_node_code())
+        bound_combo = QComboBox()
+        bound_combo.addItem("未绑定", None)
+        for node_id in NODE_IDS:
+            bound_combo.addItem(f"硬件 ID {node_id}", node_id)
+
+        fields = (
+            ("节点编号", code_edit),
+            ("绑定硬件 ID", bound_combo),
+        )
+        for row, (label_text, widget) in enumerate(fields):
+            label = QLabel(label_text)
+            label.setObjectName("SubtleText")
+            form.addWidget(label, row, 0)
+            form.addWidget(widget, row, 1)
+        layout.addWidget(card)
+
+        message = QLabel("仅添加到当前上位机列表，不写入硬件配置。当前固件未上报电池电量。")
+        message.setObjectName("SubtleText")
+        message.setWordWrap(True)
+        layout.addWidget(message)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("GhostButton")
+        confirm_btn = QPushButton("确认添加")
+        confirm_btn.setObjectName("PrimaryButton")
+        footer.addWidget(cancel_btn)
+        footer.addWidget(confirm_btn)
+        layout.addLayout(footer)
+
+        def submit() -> None:
+            code = code_edit.text().strip()
+            if not code:
+                message.setText("节点编号不能为空。")
+                message.setStyleSheet(f"color: {THEME['red_soft']};")
+                return
+            existing = {str(entry.get("code", "")).lower() for entry in self._latest_matrix.values()}
+            if code.lower() in existing:
+                message.setText("节点编号已存在，请换一个编号。")
+                message.setStyleSheet(f"color: {THEME['red_soft']};")
+                return
+            bound_node = bound_combo.currentData()
+            if bound_node is not None and any(
+                int(entry.get("bound_node") or 0) == int(bound_node)
+                for entry in self._latest_matrix.values()
+            ):
+                message.setText("该硬件 ID 已在当前列表中。")
+                message.setStyleSheet(f"color: {THEME['red_soft']};")
+                return
+            self.add_node_requested.emit(
+                {
+                    "code": code,
+                    "bound_node": bound_node,
+                }
+            )
+            dialog.accept()
+
+        cancel_btn.clicked.connect(dialog.reject)
+        confirm_btn.clicked.connect(submit)
+        dialog.exec()
+
+    def _open_delete_node_dialog(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("从列表移除节点")
+        dialog.setMinimumWidth(430)
+        dialog.setStyleSheet(
+            f"QDialog {{ background: {THEME['bg']}; }}"
+            f"QLabel {{ color: {THEME['text_soft']}; }}"
+        )
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(14)
+
+        title = QLabel("从列表移除节点")
+        title.setObjectName("SectionTitle")
+        title.setStyleSheet("font-size: 17px; font-weight: 700;")
+        layout.addWidget(title)
+
+        card = CardFrame()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(16, 14, 16, 14)
+        card_layout.setSpacing(10)
+
+        matrix_nodes = list(self._latest_matrix.values())
+        node_combo = QComboBox()
+        for entry in sorted(matrix_nodes, key=lambda item: int(item.get("matrix_id") or 0)):
+            matrix_id = int(entry.get("matrix_id") or 0)
+            node_combo.addItem(f"{entry.get('code', f'node{matrix_id}')}  ·  ID {matrix_id}", matrix_id)
+
+        if matrix_nodes:
+            label = QLabel("选择要从当前列表移除的节点")
+            label.setObjectName("SubtleText")
+            card_layout.addWidget(label)
+            card_layout.addWidget(node_combo)
+            message_text = "仅影响本次运行内的上位机列表，不会向硬件下发删除命令。绑定节点再次上报后会自动恢复显示。"
+        else:
+            empty = QLabel("当前列表暂无可移除节点")
+            empty.setStyleSheet(f"color: {THEME['text']}; font-size: 14px; font-weight: 600;")
+            card_layout.addWidget(empty)
+            message_text = "请连接网关或先添加观察节点。"
+        layout.addWidget(card)
+
+        message = QLabel(message_text)
+        message.setObjectName("SubtleText")
+        message.setWordWrap(True)
+        layout.addWidget(message)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("GhostButton")
+        confirm_btn = QPushButton("确认移除")
+        confirm_btn.setObjectName("DangerButton")
+        confirm_btn.setEnabled(bool(matrix_nodes))
+        footer.addWidget(cancel_btn)
+        footer.addWidget(confirm_btn)
+        layout.addLayout(footer)
+
+        def submit() -> None:
+            matrix_id = node_combo.currentData()
+            if matrix_id is not None:
+                self.matrix_remove_requested.emit(int(matrix_id))
+            dialog.accept()
+
+        cancel_btn.clicked.connect(dialog.reject)
+        confirm_btn.clicked.connect(submit)
+        dialog.exec()
+
+    def _next_local_node_code(self) -> str:
+        matrix_ids = [int(entry.get("matrix_id") or 0) for entry in self._latest_matrix.values()]
+        matrix_ids.extend(self._rows.keys())
+        return f"node{max(matrix_ids, default=0) + 1}"
+
     def _visible_matrix(self, matrix: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [entry for entry in matrix if self._matrix_matches(entry)]
 
@@ -766,8 +974,7 @@ class SensorMatrixPage(QWidget):
         detail_action.triggered.connect(lambda: self._show_matrix_detail(state))
         maintenance_action = QAction("取消维护标记" if state.get("maintenance") else "标记维护", self)
         maintenance_action.triggered.connect(lambda: self.matrix_maintenance_requested.emit(int(matrix_id)))
-        remove_action = QAction("移除本地节点", self)
-        remove_action.setEnabled(bool(state.get("local")))
+        remove_action = QAction("从列表移除", self)
         remove_action.triggered.connect(lambda: self.matrix_remove_requested.emit(int(matrix_id)))
         menu.addAction(detail_action)
         menu.addAction(maintenance_action)
@@ -785,7 +992,7 @@ class SensorMatrixPage(QWidget):
                 ("运行模式", state.get("mode", "-")),
                 ("在线状态", "在线" if state.get("online") else "离线"),
                 ("RSSI", f"{_float(state.get('rssi')):.0f} dBm"),
-                ("电池", f"{_float(state.get('battery')):.0f}%"),
+                ("电池", "未上报" if state.get("battery") is None else f"{_float(state.get('battery')):.0f}%"),
                 ("健康度", state.get("health", "-")),
                 ("维护标记", "是" if state.get("maintenance") else "否"),
                 ("本地节点", "是" if state.get("local") else "否"),
@@ -797,7 +1004,7 @@ class SensorMatrixPage(QWidget):
 # 数据分析页
 # ===========================================================================
 class AnalysisPage(QWidget):
-    """聚合统计 + 呼吸/运动趋势曲线。"""
+    """聚合统计 + 运动/存在趋势曲线。"""
 
     active_node_changed = pyqtSignal(int)
     analysis_shot_requested = pyqtSignal(object)
@@ -805,7 +1012,7 @@ class AnalysisPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._last_plot_at = 0.0
-        self._metric_key = "breath_bpm"
+        self._metric_key = "motion_score"
         self._window_seconds = 60
         self._selected_node = 0
 
@@ -830,10 +1037,9 @@ class AnalysisPage(QWidget):
         self.analysis_node_combo.currentIndexChanged.connect(self._on_analysis_control_changed)
         self.metric_combo = QComboBox()
         for label, key in (
-            ("呼吸 BPM", "breath_bpm"),
             ("运动分值", "motion_score"),
             ("存在感应", "presence_score"),
-            ("气体浓度", "gas"),
+            ("有害气体指数", "gas"),
             ("LoRa RSSI", "rssi"),
         ):
             self.metric_combo.addItem(label, key)
@@ -860,8 +1066,8 @@ class AnalysisPage(QWidget):
         stats.setVerticalSpacing(16)
         self.stat_cards: dict[str, MetricCard] = {
             "samples": MetricCard("累计样本\n(SAMPLES)", "0", "历史缓存"),
-            "avg_breath": MetricCard("平均呼吸\n(AVG BPM)", "-- 次/分", "全部节点"),
-            "max_gas": MetricCard("峰值气体\n(MAX GAS)", "-- ppm", "全部节点"),
+            "avg_motion": MetricCard("平均运动\n(AVG MOTION)", "--", "全部节点"),
+            "max_gas": MetricCard("有害气体峰值\n(GAS INDEX)", "--", "全部节点"),
             "online": MetricCard("在线节点\n(ONLINE)", "0 / 4", "生命体征节点"),
         }
         for index, card in enumerate(self.stat_cards.values()):
@@ -872,7 +1078,7 @@ class AnalysisPage(QWidget):
         plot_layout = QVBoxLayout(plot_card)
         plot_layout.setContentsMargins(20, 18, 20, 18)
         plot_layout.setSpacing(12)
-        self.plot_title = QLabel("呼吸频率趋势 (BREATH BPM Trend)")
+        self.plot_title = QLabel("运动分值趋势 (MOTION SCORE Trend)")
         self.plot_title.setObjectName("SectionTitle")
         plot_layout.addWidget(self.plot_title)
 
@@ -896,7 +1102,12 @@ class AnalysisPage(QWidget):
                 [], [], pen=pg.mkPen(palette[index % len(palette)], width=2.0),
                 name=NODE_LABELS[node_id],
             )
+        self.analysis_empty_label = QLabel("暂无可分析样本")
+        self.analysis_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.analysis_empty_label.setObjectName("SubtleText")
+        self.analysis_empty_label.setStyleSheet(f"color: {THEME['muted']}; padding: 8px;")
         plot_layout.addWidget(self.plot)
+        plot_layout.addWidget(self.analysis_empty_label)
         layout.addWidget(plot_card, 1)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -906,15 +1117,16 @@ class AnalysisPage(QWidget):
         self._metric_key = str(self.metric_combo.currentData() or "breath_bpm")
         self._window_seconds = int(self.window_combo.currentData() or 0)
         filtered_history = self._analysis_history(history)
+        self.analysis_empty_label.setVisible(not bool(filtered_history))
 
         self.stat_cards["samples"].set_value(f"{len(filtered_history)}", "当前筛选")
-        breaths = [_float(s.get("breath_bpm")) for s in filtered_history if _float(s.get("breath_bpm")) > 0]
-        avg_breath = sum(breaths) / len(breaths) if breaths else 0.0
-        self.stat_cards["avg_breath"].set_value(f"{avg_breath:.0f} 次/分", "当前筛选")
+        motions = [_score(s.get("motion_score")) for s in filtered_history]
+        avg_motion = sum(motions) / len(motions) if motions else 0.0
+        self.stat_cards["avg_motion"].set_value(f"{avg_motion:.2f}", "当前筛选")
         gases = [_float(s.get("gas")) for s in filtered_history]
         max_gas = max(gases) if gases else 0.0
         self.stat_cards["max_gas"].set_value(
-            f"{max_gas:.0f} ppm", "当前筛选", THEME["red"] if max_gas >= 550 else None
+            f"{max_gas:.0f}", "当前筛选", THEME["red"] if max_gas >= 550 else None
         )
         online = sum(1 for n in nodes.values() if n.get("online"))
         self.stat_cards["online"].set_value(
@@ -1126,7 +1338,7 @@ class HistoryPage(QWidget):
     export_filtered_csv_requested = pyqtSignal(object)
     clear_history_requested = pyqtSignal()
 
-    _COLUMNS = ("时间", "节点", "存在", "运动", "呼吸 BPM", "置信度", "气体", "温度", "湿度", "RSSI")
+    _COLUMNS = ("时间", "节点", "有效性", "存在", "运动", "置信度", "气体", "温度", "湿度", "RSSI")
 
     def __init__(self) -> None:
         super().__init__()
@@ -1176,6 +1388,11 @@ class HistoryPage(QWidget):
         self.export_message = QLabel("")
         self.export_message.setObjectName("SubtleText")
         layout.addWidget(self.export_message)
+        self.empty_label = QLabel("暂无历史样本，请连接网关后开始采集")
+        self.empty_label.setObjectName("SubtleText")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setStyleSheet(f"color: {THEME['muted']}; padding: 8px;")
+        layout.addWidget(self.empty_label)
 
         self.table = QTableWidget(0, len(self._COLUMNS))
         self.table.setHorizontalHeaderLabels(self._COLUMNS)
@@ -1195,6 +1412,9 @@ class HistoryPage(QWidget):
         filtered = self._filter_history(history)
         self._latest_filtered = filtered
         self.subtitle.setText(f"最近 {len(history)} 条样本（当前筛选 {len(filtered)} 条）")
+        limit = int(self.history_limit_combo.currentData() or 0)
+        recent = (filtered[-limit:] if limit else filtered)[::-1]
+        self.empty_label.setVisible(not bool(recent))
 
         if not self.isVisible():
             return
@@ -1203,17 +1423,15 @@ class HistoryPage(QWidget):
             return
         self._last_refresh_at = now
 
-        limit = int(self.history_limit_combo.currentData() or 0)
-        recent = (filtered[-limit:] if limit else filtered)[::-1]
         self.table.setRowCount(len(recent))
         for row, sample in enumerate(recent):
             ts = _float(sample.get("timestamp"), now)
             values = (
                 time.strftime("%H:%M:%S", time.localtime(ts)),
                 str(sample.get("node_code", sample.get("node_id", ""))),
+                _sample_validity(sample),
                 f"{_score(sample.get('presence_score')):.2f}",
                 f"{_score(sample.get('motion_score')):.2f}",
-                f"{_float(sample.get('breath_bpm')):.0f}",
                 f"{_score(sample.get('confidence')) * 100:.0f}%",
                 f"{_float(sample.get('gas')):.0f}",
                 f"{_float(sample.get('temperature')):.1f}",
@@ -1246,9 +1464,8 @@ class HistoryPage(QWidget):
                 ("序号", sample.get("seq", "-")),
                 ("Presence", f"{_score(sample.get('presence_score')):.2f}"),
                 ("Motion", f"{_score(sample.get('motion_score')):.2f}"),
-                ("Breath BPM", f"{_float(sample.get('breath_bpm')):.0f}"),
                 ("Confidence", f"{_score(sample.get('confidence')) * 100:.0f}%"),
-                ("Gas", f"{_float(sample.get('gas')):.0f} ppm"),
+                ("有害气体指数", f"{_float(sample.get('gas')):.0f}"),
                 ("Raw", sample.get("raw", "")),
             ),
         )
@@ -1300,6 +1517,51 @@ def _show_detail_dialog(parent: QWidget, title: str, rows: tuple[tuple[str, Any]
     footer.addWidget(close_btn)
     layout.addLayout(footer)
     dialog.exec()
+
+
+def _detection_state(
+    active_node: int,
+    state: dict[str, Any],
+    history: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    label = NODE_LABELS.get(active_node, f"node{active_node}")
+    if not history or state.get("last_received") is None:
+        return "等待数据", f"{label} 尚未收到有效帧", THEME["muted"]
+    if not state.get("online"):
+        return "节点离线", f"{label} 最近未更新，请检查节点或网关链路", THEME["orange"]
+
+    presence = _score(state.get("presence_score"))
+    confidence = _score(state.get("confidence"))
+    if presence >= 0.5 and confidence >= 0.62:
+        hint = f"{label} 存在分值 {presence * 100:.0f}%，置信度 {confidence * 100:.0f}%"
+        return "疑似生命微动", hint, THEME["green"]
+    return "未检测到稳定微动", f"{label} 有数据输入，但暂未达到稳定微动阈值", THEME["blue_soft"]
+
+
+def _matrix_advice(state: dict[str, Any]) -> tuple[str, str]:
+    if state.get("maintenance"):
+        return "请检查节点", THEME["red"]
+    if not state.get("online"):
+        return "等待数据", THEME["muted"]
+    rssi = _float(state.get("rssi"))
+    if rssi < -95:
+        return "信号较弱", THEME["orange"]
+    if state.get("health") == HEALTH_CRITICAL:
+        return "请检查节点", THEME["red"]
+    return "正常监测", THEME["blue_soft"]
+
+
+def _sample_validity(sample: dict[str, Any]) -> str:
+    presence = _score(sample.get("presence_score"))
+    confidence = _score(sample.get("confidence"))
+    gas = _float(sample.get("gas"))
+    if gas >= 550:
+        return "异常"
+    if presence >= 0.5 and confidence >= 0.62:
+        return "疑似微动"
+    if confidence and confidence < 0.45:
+        return "低置信"
+    return "有效"
 
 
 def _score(value: Any) -> float:
