@@ -1,4 +1,14 @@
-"""Gateway JSON Lines 数据解析模块。"""
+"""Gateway JSON Lines 数据解析模块。
+
+中文注释：Gateway 固件（firmware/gateway/main/main.c）把每个 LoRa 数据帧
+转成一行 JSON 输出，示例：
+
+    {"id":1,"seq":0,"presence":0,"motion":0,"bpm":0,"conf":0,
+     "gas":0,"temp":25.0,"hum":50,"rssi":-60,"ts":12345}
+
+上位机只消费规范化后的字段，避免 UI 层到处关心固件字段别名。本模块是纯函数，
+不依赖 PyQt/串口，便于离线单元测试。
+"""
 
 from __future__ import annotations
 
@@ -10,10 +20,8 @@ from typing import Any
 def parse_gateway_frame(line: str) -> dict[str, Any]:
     """解析 Gateway 串口输出的一行 JSON 数据。
 
-    Gateway 当前固件输出示例：
-    {"id":1,"seq":0,"presence":0,"motion":0,"bpm":0,"conf":0,"gas":0,"temp":25.0,"hum":50,"rssi":-60,"ts":12345}
-
-    中文注释：上位机只消费规范化后的字段，避免 UI 层到处关心固件字段别名。
+    返回的字典始终包含全部规范化字段；``valid`` 表示是否为一帧有效 Gateway 数据。
+    解析失败时 ``error`` 描述原因，便于上位机在状态栏提示而不是直接崩溃。
     """
 
     raw = line.strip()
@@ -100,6 +108,12 @@ def _optional_int(value: Any) -> int | None:
 
 
 def _normalize_score(value: Any) -> float:
+    """把 presence/motion/conf 等字段统一到 0~1。
+
+    中文注释：固件可能用 0~100 的整数表示百分比，这里超过 1.0 自动除以 100，
+    保证 UI 与报警规则永远拿到 0~1 的标准分值。
+    """
+
     score = _number(value, 0.0)
     if score > 1.0:
         score /= 100.0

@@ -1,0 +1,366 @@
+"""EchoGuard 上位机主窗口。
+
+中文注释：主窗口只负责整体骨架——顶部栏、左侧导航、页面容器（QStackedWidget）和
+信号转发。每个页面自己处理快照刷新；串口 / Demo / 规则 / 导出动作都通过信号交给
+DataManager，保证界面不会被后台 I/O 卡顿。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtWidgets import (
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+try:
+    from ..config import (
+        APP_TITLE,
+        BRAND_NAME,
+        BRAND_VERSION,
+        NAV_ITEMS,
+        THEME,
+    )
+    from .components import StatusPill
+    from .pages import (
+        AnalysisPage,
+        DashboardPage,
+        DiagnosticsPage,
+        HistoryPage,
+        SensorMatrixPage,
+    )
+except ImportError:
+    from config import (
+        APP_TITLE,
+        BRAND_NAME,
+        BRAND_VERSION,
+        NAV_ITEMS,
+        THEME,
+    )
+    from ui.components import StatusPill
+    from ui.pages import (
+        AnalysisPage,
+        DashboardPage,
+        DiagnosticsPage,
+        HistoryPage,
+        SensorMatrixPage,
+    )
+
+
+class NavItem(QFrame):
+    """左侧导航条目，点击切换页面。"""
+
+    clicked = pyqtSignal(str)
+
+    def __init__(self, key: str, text: str, icon: str, selected: bool = False) -> None:
+        super().__init__()
+        self.key = key
+        self.setObjectName("NavItem")
+        self.setProperty("selected", selected)
+        self.setFixedHeight(52)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 14, 0)
+        layout.setSpacing(14)
+
+        self.icon_label = QLabel(icon)
+        self.icon_label.setObjectName("NavIcon")
+        self.icon_label.setProperty("selected", selected)
+        self.icon_label.setFixedWidth(34)
+        self.text_label = QLabel(text)
+        self.text_label.setObjectName("NavText")
+        self.text_label.setProperty("selected", selected)
+        layout.addWidget(self.icon_label)
+        layout.addWidget(self.text_label)
+        layout.addStretch(1)
+
+    def set_selected(self, selected: bool) -> None:
+        self.setProperty("selected", selected)
+        self.icon_label.setProperty("selected", selected)
+        self.text_label.setProperty("selected", selected)
+        for widget in (self, self.icon_label, self.text_label):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+    def mousePressEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        del event
+        self.clicked.emit(self.key)
+
+
+class MainWindow(QMainWindow):
+    """EchoGuard 控制台主窗口。"""
+
+    # UI -> DataManager
+    refresh_ports_requested = pyqtSignal()
+    connect_requested = pyqtSignal(str)
+    disconnect_requested = pyqtSignal()
+    export_csv_requested = pyqtSignal()
+    export_filtered_csv_requested = pyqtSignal(object)
+    screenshot_requested = pyqtSignal(object)
+    csi_shot_requested = pyqtSignal(object)
+    analysis_shot_requested = pyqtSignal(object)
+    active_node_changed = pyqtSignal(int)
+    pause_toggled = pyqtSignal(bool)
+    clear_events_requested = pyqtSignal()
+    clear_history_requested = pyqtSignal()
+    presence_threshold_changed = pyqtSignal(float)
+    gas_threshold_changed = pyqtSignal(float)
+    afh_toggled = pyqtSignal(bool)
+    mesh_toggled = pyqtSignal(bool)
+    sync_requested = pyqtSignal()
+    matrix_filter_changed = pyqtSignal(str)
+    add_node_requested = pyqtSignal()
+    matrix_remove_requested = pyqtSignal(int)
+    matrix_maintenance_requested = pyqtSignal(int)
+    diagnostics_requested = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle(APP_TITLE)
+        self.resize(1500, 940)
+        self.setMinimumSize(1240, 840)
+
+        self.nav_items: dict[str, NavItem] = {}
+        self.pages: dict[str, QWidget] = {}
+        self._current_key = "dashboard"
+
+        self._build_ui()
+        self._wire_pages()
+
+    # ------------------------------------------------------------------ 构建
+    def _build_ui(self) -> None:
+        root = QWidget()
+        root.setObjectName("Root")
+        self.setCentralWidget(root)
+
+        root_layout = QVBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self._build_top_bar())
+
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self._build_left_nav())
+        body.addWidget(self._build_stack(), 1)
+        root_layout.addLayout(body, 1)
+
+    def _build_top_bar(self) -> QWidget:
+        top = QFrame()
+        top.setObjectName("TopBar")
+        top.setFixedHeight(60)
+
+        layout = QHBoxLayout(top)
+        layout.setContentsMargins(20, 0, 20, 0)
+        layout.setSpacing(14)
+
+        brand = QLabel(f"{BRAND_NAME} {BRAND_VERSION}")
+        brand.setObjectName("AppTitle")
+        layout.addWidget(brand)
+
+        sep = QLabel("|")
+        sep.setStyleSheet(f"color: {THEME['muted_3']};")
+        layout.addWidget(sep)
+
+        self.page_subtitle = QLabel("实时生命体征监测")
+        self.page_subtitle.setObjectName("TopSubtitle")
+        layout.addWidget(self.page_subtitle)
+
+        layout.addStretch(1)
+
+        self.status_pill = StatusPill()
+        layout.addWidget(self.status_pill)
+
+        self.port_combo = QComboBox()
+        self.port_combo.setFixedWidth(140)
+        layout.addWidget(self.port_combo)
+
+        refresh_btn = QPushButton("刷新")
+        refresh_btn.setObjectName("GhostButton")
+        refresh_btn.clicked.connect(self.refresh_ports_requested.emit)
+        layout.addWidget(refresh_btn)
+
+        connect_btn = QPushButton("连接")
+        connect_btn.setObjectName("PrimaryButton")
+        connect_btn.clicked.connect(lambda: self.connect_requested.emit(self.port_combo.currentText()))
+        layout.addWidget(connect_btn)
+
+        disconnect_btn = QPushButton("断开")
+        disconnect_btn.setObjectName("DangerButton")
+        disconnect_btn.clicked.connect(self.disconnect_requested.emit)
+        layout.addWidget(disconnect_btn)
+
+        for glyph in ("⚙", "🔔", "👤"):
+            icon = QLabel(glyph)
+            icon.setObjectName("TopIcon")
+            layout.addWidget(icon)
+
+        return top
+
+    def _build_left_nav(self) -> QWidget:
+        nav = QFrame()
+        nav.setObjectName("LeftNav")
+        nav.setFixedWidth(258)
+
+        layout = QVBoxLayout(nav)
+        layout.setContentsMargins(18, 24, 18, 22)
+        layout.setSpacing(8)
+
+        caption = QLabel("系统核心")
+        caption.setObjectName("NavCaption")
+        session = QLabel("● 当前会话")
+        session.setObjectName("NavSession")
+        session.setStyleSheet(f"color: {THEME['green']}; font-size: 12px;")
+        layout.addWidget(caption)
+        layout.addWidget(session)
+        layout.addSpacing(16)
+
+        for entry in NAV_ITEMS:
+            item = NavItem(
+                entry["key"], entry["text"], entry["icon"],
+                selected=entry["key"] == self._current_key,
+            )
+            item.clicked.connect(self._on_nav_clicked)
+            self.nav_items[entry["key"]] = item
+            layout.addWidget(item)
+
+        layout.addSpacing(16)
+        line = QFrame()
+        line.setFixedHeight(1)
+        line.setStyleSheet(f"background: {THEME['divider']};")
+        layout.addWidget(line)
+        layout.addSpacing(10)
+
+        node_state = QLabel("节点状态")
+        node_state.setStyleSheet(f"color: {THEME['muted']}; font-weight: 700; font-size: 13px;")
+        layout.addWidget(node_state)
+        self.nav_progress = QLabel("●●●●●●●●●●●●●●●●  98%")
+        self.nav_progress.setStyleSheet(f"color: {THEME['blue_soft']}; font-size: 11px;")
+        layout.addWidget(self.nav_progress)
+
+        layout.addStretch(1)
+
+        self.latest_frame_label = QLabel("最新帧：-")
+        self.latest_frame_label.setObjectName("SubtleText")
+        self.latest_frame_label.setWordWrap(True)
+        layout.addWidget(self.latest_frame_label)
+
+        self.status_detail = QLabel("串口状态：初始化中")
+        self.status_detail.setObjectName("SubtleText")
+        self.status_detail.setWordWrap(True)
+        layout.addWidget(self.status_detail)
+
+        return nav
+
+    def _build_stack(self) -> QWidget:
+        self.stack = QStackedWidget()
+
+        self.dashboard_page = DashboardPage()
+        self.sensor_page = SensorMatrixPage()
+        self.analysis_page = AnalysisPage()
+        self.diagnostics_page = DiagnosticsPage()
+        self.history_page = HistoryPage()
+
+        self.pages = {
+            "dashboard": self.dashboard_page,
+            "sensors": self.sensor_page,
+            "analysis": self.analysis_page,
+            "diagnostics": self.diagnostics_page,
+            "history": self.history_page,
+        }
+        for page in self.pages.values():
+            self.stack.addWidget(page)
+
+        self.stack.setCurrentWidget(self.dashboard_page)
+        return self.stack
+
+    def _wire_pages(self) -> None:
+        # Dashboard 导出动作
+        self.dashboard_page.export_csv_requested.connect(self.export_csv_requested.emit)
+        self.dashboard_page.screenshot_requested.connect(self.screenshot_requested.emit)
+        self.dashboard_page.csi_shot_requested.connect(self.csi_shot_requested.emit)
+        self.dashboard_page.active_node_changed.connect(self.active_node_changed.emit)
+        self.dashboard_page.pause_toggled.connect(self.pause_toggled.emit)
+        self.dashboard_page.clear_events_requested.connect(self.clear_events_requested.emit)
+
+        # 历史页导出
+        self.history_page.export_csv_requested.connect(self.export_csv_requested.emit)
+        self.history_page.export_filtered_csv_requested.connect(self.export_filtered_csv_requested.emit)
+        self.history_page.clear_history_requested.connect(self.clear_history_requested.emit)
+
+        # 传感器页配置
+        self.sensor_page.presence_threshold_changed.connect(self.presence_threshold_changed.emit)
+        self.sensor_page.gas_threshold_changed.connect(self.gas_threshold_changed.emit)
+        self.sensor_page.afh_toggled.connect(self.afh_toggled.emit)
+        self.sensor_page.mesh_toggled.connect(self.mesh_toggled.emit)
+        self.sensor_page.sync_requested.connect(self.sync_requested.emit)
+        self.sensor_page.matrix_filter_changed.connect(self.matrix_filter_changed.emit)
+        self.sensor_page.add_node_requested.connect(self.add_node_requested.emit)
+        self.sensor_page.matrix_remove_requested.connect(self.matrix_remove_requested.emit)
+        self.sensor_page.matrix_maintenance_requested.connect(self.matrix_maintenance_requested.emit)
+
+        # 分析 / 诊断页动作
+        self.analysis_page.active_node_changed.connect(self.active_node_changed.emit)
+        self.analysis_page.analysis_shot_requested.connect(self.analysis_shot_requested.emit)
+        self.diagnostics_page.diagnostics_requested.connect(self.diagnostics_requested.emit)
+
+    # ------------------------------------------------------------------ 导航
+    _SUBTITLE = {
+        "dashboard": "实时生命体征监测",
+        "sensors": "节点管理与配置",
+        "analysis": "数据分析与趋势",
+        "diagnostics": "诊断与维护",
+        "history": "历史记录",
+    }
+
+    def _on_nav_clicked(self, key: str) -> None:
+        if key not in self.pages or key == self._current_key:
+            if key in self.pages:
+                self.stack.setCurrentWidget(self.pages[key])
+            return
+
+        self.nav_items[self._current_key].set_selected(False)
+        self.nav_items[key].set_selected(True)
+        self._current_key = key
+        self.stack.setCurrentWidget(self.pages[key])
+        self.page_subtitle.setText(self._SUBTITLE.get(key, ""))
+
+    # ------------------------------------------------------------------ DataManager -> UI
+    def update_ports(self, ports: list[str], selected: str | None = None) -> None:
+        self.port_combo.blockSignals(True)
+        self.port_combo.clear()
+        values = ports or ["无可用串口"]
+        self.port_combo.addItems(values)
+        if selected and selected in values:
+            self.port_combo.setCurrentText(selected)
+        self.port_combo.blockSignals(False)
+
+    def set_status(self, text: str, ok: bool = True) -> None:
+        self.status_pill.set_state("● 实时生命体征监测" if ok else "● 待连接真实串口", ok)
+        self.status_detail.setText(text)
+        self.status_detail.setStyleSheet(
+            f"color: {THEME['green'] if ok else THEME['orange']}; font-size: 12px;"
+        )
+
+    def set_latest_frame(self, text: str) -> None:
+        self.latest_frame_label.setText(text)
+
+    def show_export_message(self, text: str, ok: bool = True) -> None:
+        self.dashboard_page.set_export_message(text, ok)
+        self.history_page.set_export_message(text, ok)
+
+    def update_snapshot(self, snapshot: dict[str, Any]) -> None:
+        # 中文注释：所有页面都拿到同一份快照，但页面内部会判断自身是否可见，
+        # 避免后台页面做无意义的重绘。
+        for page in self.pages.values():
+            page.update_snapshot(snapshot)
