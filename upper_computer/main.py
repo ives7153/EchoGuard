@@ -56,12 +56,22 @@ def main() -> int:
     window.matrix_filter_changed.connect(manager.set_matrix_filter)
     window.matrix_maintenance_requested.connect(manager.toggle_matrix_maintenance)
     window.diagnostics_requested.connect(manager.generate_diagnostics_report)
+    window.ai_config_save_requested.connect(manager.save_ai_config)
+    window.ai_jina_start_requested.connect(manager.start_local_jina)
+    window.ai_jina_stop_requested.connect(manager.stop_local_jina)
+    window.ai_embedding_test_requested.connect(manager.test_local_embedding)
+    window.ai_models_requested.connect(manager.fetch_ai_models)
+    window.ai_llm_test_requested.connect(manager.test_llm_api)
+    window.ai_action_requested.connect(manager.handle_ai_action)
 
     # ---------------- DataManager -> UI ----------------
     manager.ports_changed.connect(window.update_ports)
     manager.status_changed.connect(window.set_status)
     manager.latest_frame_changed.connect(window.set_latest_frame)
     manager.export_message_changed.connect(window.show_export_message)
+    manager.ai_operation_message_changed.connect(window.show_ai_operation_message)
+    manager.ai_operation_result_changed.connect(window.set_ai_operation_result)
+    manager.ai_models_changed.connect(window.set_ai_models)
     manager.snapshot_changed.connect(window.update_snapshot)
 
     app.aboutToQuit.connect(manager.shutdown)

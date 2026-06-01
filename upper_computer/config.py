@@ -465,6 +465,63 @@ def build_qss() -> str:
         color: {t["text_soft"]};
     }}
 
+    QMenu {{
+        background: {t["card_alt"]};
+        border: 1px solid {t["border"]};
+        border-radius: 8px;
+        padding: 6px;
+    }}
+
+    QMenu::item {{
+        color: {t["text_soft"]};
+        padding: 8px 24px 8px 12px;
+        border-radius: 6px;
+    }}
+
+    QMenu::item:selected {{
+        background: {t["blue"]};
+        color: #FFFFFF;
+    }}
+
+    QMenu::item:disabled {{
+        color: {t["muted_2"]};
+    }}
+
+    QLineEdit {{
+        background: {t["card_alt"]};
+        border: 1px solid {t["border"]};
+        border-radius: 8px;
+        padding: 7px 10px;
+        color: {t["text_soft"]};
+    }}
+
+    QLineEdit:hover {{
+        border-color: #3C3F48;
+    }}
+
+    QLineEdit:focus {{
+        border-color: {t["blue"]};
+    }}
+
+    QCheckBox {{
+        color: {t["text_soft"]};
+        spacing: 8px;
+        font-weight: 600;
+    }}
+
+    QCheckBox::indicator {{
+        width: 16px;
+        height: 16px;
+        border-radius: 4px;
+        border: 1px solid {t["border"]};
+        background: {t["card_alt"]};
+    }}
+
+    QCheckBox::indicator:checked {{
+        background: {t["blue"]};
+        border-color: {t["blue"]};
+    }}
+
     /* ---------------- 进度/电量条 ---------------- */
     QProgressBar {{
         background: #2B2D34;

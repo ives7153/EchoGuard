@@ -121,6 +121,13 @@ class MainWindow(QMainWindow):
     matrix_filter_changed = pyqtSignal(str)
     matrix_maintenance_requested = pyqtSignal(int)
     diagnostics_requested = pyqtSignal()
+    ai_config_save_requested = pyqtSignal(object)
+    ai_jina_start_requested = pyqtSignal()
+    ai_jina_stop_requested = pyqtSignal()
+    ai_embedding_test_requested = pyqtSignal()
+    ai_models_requested = pyqtSignal()
+    ai_llm_test_requested = pyqtSignal()
+    ai_action_requested = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -278,6 +285,13 @@ class MainWindow(QMainWindow):
         self.dashboard_page.active_node_changed.connect(self.active_node_changed.emit)
         self.dashboard_page.pause_toggled.connect(self.pause_toggled.emit)
         self.dashboard_page.clear_events_requested.connect(self.clear_events_requested.emit)
+        self.dashboard_page.ai_config_save_requested.connect(self.ai_config_save_requested.emit)
+        self.dashboard_page.ai_jina_start_requested.connect(self.ai_jina_start_requested.emit)
+        self.dashboard_page.ai_jina_stop_requested.connect(self.ai_jina_stop_requested.emit)
+        self.dashboard_page.ai_embedding_test_requested.connect(self.ai_embedding_test_requested.emit)
+        self.dashboard_page.ai_models_requested.connect(self.ai_models_requested.emit)
+        self.dashboard_page.ai_llm_test_requested.connect(self.ai_llm_test_requested.emit)
+        self.dashboard_page.ai_action_requested.connect(self.ai_action_requested.emit)
 
         # 历史页导出
         self.history_page.export_csv_requested.connect(self.export_csv_requested.emit)
@@ -342,6 +356,15 @@ class MainWindow(QMainWindow):
     def show_export_message(self, text: str, ok: bool = True) -> None:
         self.dashboard_page.set_export_message(text, ok)
         self.history_page.set_export_message(text, ok)
+
+    def show_ai_operation_message(self, text: str, ok: bool = True) -> None:
+        self.dashboard_page.set_ai_operation_message(text, ok)
+
+    def set_ai_models(self, models: object) -> None:
+        self.dashboard_page.set_ai_models(models)
+
+    def set_ai_operation_result(self, result: object) -> None:
+        self.dashboard_page.set_ai_operation_result(result)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
         # 中文注释：所有页面都拿到同一份快照，但页面内部会判断自身是否可见，

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -41,6 +42,21 @@ try:
         UI_REFRESH_MS,
     )
     from ..data_parser import parse_gateway_frame
+    from ..ai import (
+        AISettings,
+        LocalJinaRuntime,
+        fetch_llm_models,
+        fetch_llm_models_result,
+        load_ai_settings,
+        run_ai_judgement,
+        save_ai_settings,
+        settings_from_dict,
+        test_embedding,
+        test_llm,
+        test_llm_result,
+        wait_for_embedding_ready,
+    )
+    from ..rules.detection_fusion import ai_fallback_text, build_detection_summary
     from ..serial_handler import SerialReader
     from .alarm_rules import AlarmEngine
     from .exporter import (
@@ -70,6 +86,21 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         UI_REFRESH_MS,
     )
     from data_parser import parse_gateway_frame
+    from ai import (  # type: ignore
+        AISettings,
+        LocalJinaRuntime,
+        fetch_llm_models,
+        fetch_llm_models_result,
+        load_ai_settings,
+        run_ai_judgement,
+        save_ai_settings,
+        settings_from_dict,
+        test_embedding,
+        test_llm,
+        test_llm_result,
+        wait_for_embedding_ready,
+    )
+    from rules.detection_fusion import ai_fallback_text, build_detection_summary  # type: ignore
     from serial_handler import SerialReader
     from core.alarm_rules import AlarmEngine
     from core.exporter import (
@@ -195,6 +226,13 @@ class DataManager(QObject):
     latest_frame_changed = pyqtSignal(str)
     ports_changed = pyqtSignal(object, object)
     export_message_changed = pyqtSignal(str, bool)
+    ai_operation_message_changed = pyqtSignal(str, bool)
+    ai_operation_result_changed = pyqtSignal(object)
+    ai_models_changed = pyqtSignal(object)
+    _ai_analysis_ready = pyqtSignal(int, object)
+    _ai_operation_ready = pyqtSignal(str, bool)
+    _ai_operation_result_ready = pyqtSignal(object)
+    _ai_models_ready = pyqtSignal(object, bool, str)
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -204,6 +242,25 @@ class DataManager(QObject):
         self.selected_port = ""
         self.history: list[dict[str, Any]] = []
         self.events: list[EventRecord] = []
+        self.ai_settings: AISettings = load_ai_settings()
+        self.ai_runtime = LocalJinaRuntime()
+        self.ai_state: dict[str, Any] = {
+            "enabled": self.ai_settings.enabled,
+            "running": False,
+            "status": "规则回退",
+            "text": ai_fallback_text("等待数据"),
+            "source": "rule_fallback",
+            "window_start": 0.0,
+            "window_end": 0.0,
+            "updated_at": 0.0,
+            "top_matches": [],
+            "error": "",
+            "config": asdict(self.ai_settings),
+        }
+        self._ai_busy = False
+        self._ai_request_id = 0
+        self._ai_last_started_at = 0.0
+        self._ai_last_state_key = ""
 
         # 报警引擎（阈值可被传感器页热更新）
         self.alarm_engine = AlarmEngine()
@@ -254,12 +311,22 @@ class DataManager(QObject):
         self._auto_timer.setInterval(AUTO_PORT_REFRESH_MS)
         self._auto_timer.timeout.connect(self._auto_service)
 
+        self._ai_timer = QTimer(self)
+        self._ai_timer.setInterval(1000)
+        self._ai_timer.timeout.connect(self._maybe_schedule_ai_analysis)
+
+        self._ai_analysis_ready.connect(self._handle_ai_analysis_ready)
+        self._ai_operation_ready.connect(self._handle_ai_operation_ready)
+        self._ai_operation_result_ready.connect(self._handle_ai_operation_result_ready)
+        self._ai_models_ready.connect(self._handle_ai_models_ready)
+
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
         """启动数据服务：刷新串口列表并自动探测真实 Gateway。"""
 
         self._ui_timer.start()
         self._offline_timer.start()
+        self._ai_timer.start()
         self.refresh_ports()
         self._auto_timer.start()
         self._auto_service()
@@ -270,7 +337,9 @@ class DataManager(QObject):
         self._ui_timer.stop()
         self._offline_timer.stop()
         self._auto_timer.stop()
+        self._ai_timer.stop()
         self.stop_serial()
+        self.ai_runtime.stop()
 
     # ------------------------------------------------------------------ UI 槽
     @pyqtSlot()
@@ -408,6 +477,200 @@ class DataManager(QObject):
         self.history.clear()
         self._append_event("HISTORY CLEARED", "本地历史样本缓存已清空", level="WARN", kind="history")
         self._dirty = True
+
+    @pyqtSlot(object)
+    def save_ai_config(self, payload: object) -> None:
+        """保存 AI 设置到本机用户配置。"""
+
+        if not isinstance(payload, dict):
+            self.ai_operation_message_changed.emit("AI 设置格式无效", False)
+            return
+        try:
+            path = self._apply_ai_settings(payload)
+        except Exception as exc:  # noqa: BLE001
+            self.ai_operation_message_changed.emit(f"AI 设置保存失败：{exc}", False)
+            return
+        self.ai_state["enabled"] = self.ai_settings.enabled
+        self.ai_state["config"] = asdict(self.ai_settings)
+        self.ai_state["status"] = "AI 设置已保存"
+        self._ai_last_state_key = ""
+        self.ai_operation_message_changed.emit(f"AI 设置已保存：{path}", True)
+        self._append_event("AI CONFIG SAVED", "AI 辅助研判设置已保存", level="OK", kind="ai")
+        self._dirty = True
+
+    @pyqtSlot(object)
+    def handle_ai_action(self, payload: object) -> None:
+        """统一处理 AI 设置弹窗动作，动作直接携带当前表单配置。"""
+
+        if not isinstance(payload, dict):
+            self._ai_operation_result_ready.emit(
+                {"action": "unknown", "ok": False, "message": "AI 操作格式无效"}
+            )
+            return
+        action = str(payload.get("action") or "").strip()
+        config = payload.get("config")
+        if isinstance(config, dict):
+            try:
+                self._apply_ai_settings(config)
+            except Exception as exc:  # noqa: BLE001
+                self._ai_operation_result_ready.emit(
+                    {"action": action, "ok": False, "message": f"AI 设置保存失败：{exc}"}
+                )
+                return
+
+        if action == "save":
+            self._ai_operation_result_ready.emit(
+                {"action": action, "ok": True, "message": "AI 设置已保存", "config": asdict(self.ai_settings)}
+            )
+            return
+        if action == "stop_jina":
+            try:
+                message = self.ai_runtime.stop()
+            except Exception as exc:  # noqa: BLE001
+                self._ai_operation_result_ready.emit({"action": action, "ok": False, "message": str(exc)})
+                return
+            self._ai_operation_result_ready.emit({"action": action, "ok": True, "message": message})
+            return
+
+        settings = self.ai_settings.copy()
+
+        def worker() -> dict[str, Any]:
+            if action == "start_jina":
+                start_message = self.ai_runtime.start(settings)
+                ready = wait_for_embedding_ready(settings)
+                endpoint = f"{settings.jina_base_url.rstrip('/')}/v1/embeddings"
+                return {
+                    "action": action,
+                    "ok": True,
+                    "message": f"{start_message}；真实请求成功：POST {endpoint} · {ready['dimension']} 维",
+                    "dimension": ready["dimension"],
+                    "endpoint": endpoint,
+                    "provider": "local_jina",
+                    "real_request": True,
+                }
+            if action == "test_embedding":
+                result = test_embedding(settings)
+                endpoint = f"{settings.jina_base_url.rstrip('/')}/v1/embeddings"
+                return {
+                    "action": action,
+                    "ok": True,
+                    "message": f"真实请求成功：POST {endpoint} · {result['dimension']} 维",
+                    "dimension": result["dimension"],
+                    "endpoint": endpoint,
+                    "provider": "local_jina",
+                    "real_request": True,
+                }
+            if action == "fetch_models":
+                model_result = fetch_llm_models_result(settings)
+                models = list(model_result.get("models") or [])
+                model_source = str(model_result.get("model_source") or "api")
+                if model_source == "preset":
+                    message = str(model_result.get("message") or "已加载供应商预设模型 ID")
+                else:
+                    message = f"真实请求成功：GET {model_result.get('endpoint')} · 已获取 {len(models)} 个模型"
+                return {
+                    "action": action,
+                    "ok": True,
+                    "message": message,
+                    "models": models,
+                    "endpoint": model_result.get("endpoint"),
+                    "http_status": model_result.get("http_status"),
+                    "provider": model_result.get("provider"),
+                    "real_request": model_result.get("real_request"),
+                    "model_source": model_source,
+                }
+            if action == "test_llm":
+                llm_result = test_llm_result(settings)
+                return {
+                    "action": action,
+                    "ok": True,
+                    "message": (
+                        f"真实请求成功：POST {llm_result.get('endpoint')} · "
+                        f"{llm_result.get('model')} · {llm_result.get('content')}"
+                    ),
+                    "endpoint": llm_result.get("endpoint"),
+                    "http_status": llm_result.get("http_status"),
+                    "provider": llm_result.get("provider"),
+                    "real_request": True,
+                }
+            raise RuntimeError("未知 AI 操作")
+
+        self._start_structured_ai_operation(action, worker)
+
+    @pyqtSlot()
+    def start_local_jina(self) -> None:
+        """按当前配置启动本地 llama-server embedding 服务。"""
+
+        try:
+            message = self.ai_runtime.start(self.ai_settings)
+        except Exception as exc:  # noqa: BLE001
+            self.ai_state["error"] = str(exc)
+            self.ai_operation_message_changed.emit(f"本地 Jina 启动失败：{exc}", False)
+            self._dirty = True
+            return
+        self.ai_state["status"] = message
+        self.ai_state["running"] = self.ai_runtime.is_running()
+        self.ai_operation_message_changed.emit(message, True)
+        self._append_event("JINA SERVICE START", message, level="OK", kind="ai")
+        self._dirty = True
+
+    @pyqtSlot()
+    def stop_local_jina(self) -> None:
+        """停止由上位机启动的本地 llama-server。"""
+
+        try:
+            message = self.ai_runtime.stop()
+        except Exception as exc:  # noqa: BLE001
+            self.ai_operation_message_changed.emit(f"本地 Jina 停止失败：{exc}", False)
+            return
+        self.ai_state["status"] = message
+        self.ai_state["running"] = False
+        self.ai_operation_message_changed.emit(message, True)
+        self._append_event("JINA SERVICE STOP", message, level="WARN", kind="ai")
+        self._dirty = True
+
+    @pyqtSlot()
+    def test_local_embedding(self) -> None:
+        """异步测试本地 Jina embedding 接口。"""
+
+        settings = self.ai_settings.copy()
+
+        def worker() -> tuple[str, bool]:
+            result = test_embedding(settings)
+            return f"Embedding 测试通过：{result['dimension']} 维", True
+
+        self._start_ai_operation(worker)
+
+    @pyqtSlot()
+    def fetch_ai_models(self) -> None:
+        """异步获取 OpenAI 兼容大模型列表。"""
+
+        settings = self.ai_settings.copy()
+
+        def worker() -> list[str]:
+            return fetch_llm_models(settings)
+
+        def run() -> None:
+            try:
+                models = worker()
+            except Exception as exc:  # noqa: BLE001
+                self._ai_models_ready.emit([], False, str(exc))
+                return
+            self._ai_models_ready.emit(models, True, f"已获取 {len(models)} 个模型")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @pyqtSlot()
+    def test_llm_api(self) -> None:
+        """异步测试 OpenAI 兼容大模型接口。"""
+
+        settings = self.ai_settings.copy()
+
+        def worker() -> tuple[str, bool]:
+            message = test_llm(settings)
+            return f"大模型测试通过：{message}", True
+
+        self._start_ai_operation(worker)
 
     @pyqtSlot(str)
     def set_matrix_filter(self, value: str) -> None:
@@ -834,18 +1097,213 @@ class DataManager(QObject):
 
         self._auto_service()
 
+    # ------------------------------------------------------------------ AI 辅助研判
+    def _apply_ai_settings(self, payload: dict[str, Any]) -> object:
+        self.ai_settings = settings_from_dict(payload)
+        path = save_ai_settings(self.ai_settings)
+        self.ai_state["enabled"] = self.ai_settings.enabled
+        self.ai_state["config"] = asdict(self.ai_settings)
+        self._ai_last_state_key = ""
+        self._dirty = True
+        return path
+
+    def _start_structured_ai_operation(self, action: str, worker: object) -> None:
+        self.ai_operation_message_changed.emit("AI 操作执行中...", True)
+        self._ai_operation_result_ready.emit(
+            {"action": action, "ok": True, "running": True, "message": "AI 操作执行中..."}
+        )
+
+        def run() -> None:
+            try:
+                result = worker()  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001
+                self._ai_operation_result_ready.emit(
+                    {"action": action, "ok": False, "running": False, "message": str(exc)}
+                )
+                return
+            if isinstance(result, dict):
+                result.setdefault("action", action)
+                result.setdefault("running", False)
+                self._ai_operation_result_ready.emit(result)
+            else:
+                self._ai_operation_result_ready.emit(
+                    {"action": action, "ok": True, "running": False, "message": str(result)}
+                )
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _start_ai_operation(self, worker: object) -> None:
+        """在后台线程执行 AI 测试 / 获取模型等短任务。"""
+
+        self.ai_operation_message_changed.emit("AI 操作执行中...", True)
+
+        def run() -> None:
+            try:
+                message, ok = worker()  # type: ignore[misc]
+            except Exception as exc:  # noqa: BLE001
+                self._ai_operation_ready.emit(str(exc), False)
+                return
+            self._ai_operation_ready.emit(str(message), bool(ok))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _maybe_schedule_ai_analysis(self) -> None:
+        """低频异步生成 AI 辅助解释；实时主判断仍由规则融合负责。"""
+
+        summary = build_detection_summary(self._node_dicts(), self.history)
+        self._refresh_ai_fallback(summary)
+        if not self.ai_settings.enabled or not self.ai_settings.embedding_enabled:
+            return
+        if not summary.participant_ids:
+            return
+        if self._ai_busy:
+            return
+
+        now = time.time()
+        if now - self._ai_last_started_at < 3.0:
+            return
+        if summary.state_key == self._ai_last_state_key and now - _float(self.ai_state.get("updated_at")) < 8.0:
+            return
+
+        self._ai_busy = True
+        self._ai_request_id += 1
+        request_id = self._ai_request_id
+        self._ai_last_started_at = now
+        self._ai_last_state_key = summary.state_key
+        self.ai_state.update(
+            {
+                "running": True,
+                "status": "AI 分析中",
+                "text": "AI辅助研判：分析中... 规则结论已实时刷新",
+                "state_key": summary.state_key,
+                "window_start": summary.window_start,
+                "window_end": summary.window_end,
+                "config": asdict(self.ai_settings),
+            }
+        )
+        self._dirty = True
+        settings = self.ai_settings.copy()
+
+        def run() -> None:
+            result = run_ai_judgement(settings, summary)
+            self._ai_analysis_ready.emit(request_id, result)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @pyqtSlot(int, object)
+    def _handle_ai_analysis_ready(self, request_id: int, result: object) -> None:
+        self._ai_busy = False
+        if request_id != self._ai_request_id or not isinstance(result, dict):
+            return
+
+        current_summary = build_detection_summary(self._node_dicts(), self.history)
+        if str(result.get("state_key", "")) != current_summary.state_key:
+            self.ai_state.update(
+                {
+                    "running": False,
+                    "status": "上一轮 AI 结果已过期，等待更新",
+                    "text": ai_fallback_text(current_summary.status),
+                    "source": "rule_fallback",
+                    "window_start": current_summary.window_start,
+                    "window_end": current_summary.window_end,
+                    "updated_at": time.time(),
+                    "top_matches": [],
+                    "error": "",
+                    "state_key": current_summary.state_key,
+                    "config": asdict(self.ai_settings),
+                }
+            )
+        else:
+            result["running"] = False
+            result["config"] = asdict(self.ai_settings)
+            result["jina_running"] = self.ai_runtime.is_running()
+            self.ai_state.update(result)
+
+        self._dirty = True
+
+    @pyqtSlot(str, bool)
+    def _handle_ai_operation_ready(self, message: str, ok: bool) -> None:
+        self.ai_operation_message_changed.emit(message, ok)
+        self.ai_state["status"] = message
+        self.ai_state["error"] = "" if ok else message
+        self.ai_state["config"] = asdict(self.ai_settings)
+        self._dirty = True
+
+    @pyqtSlot(object)
+    def _handle_ai_operation_result_ready(self, result: object) -> None:
+        if not isinstance(result, dict):
+            return
+        ok = bool(result.get("ok", False))
+        message = str(result.get("message") or "")
+        action = str(result.get("action") or "")
+        running = bool(result.get("running", False))
+        self.ai_operation_result_changed.emit(result)
+        self.ai_operation_message_changed.emit(message, ok)
+        if "models" in result:
+            self.ai_models_changed.emit(result.get("models") or [])
+        self.ai_state["running"] = running
+        self.ai_state["status"] = message
+        self.ai_state["error"] = "" if ok else message
+        self.ai_state["jina_running"] = self.ai_runtime.is_running()
+        self.ai_state["config"] = asdict(self.ai_settings)
+        if action == "stop_jina":
+            self.ai_state["jina_running"] = False
+        if ok and action in {"test_embedding", "start_jina"}:
+            self.ai_state["source"] = "local_jina"
+        self._dirty = True
+
+    @pyqtSlot(object, bool, str)
+    def _handle_ai_models_ready(self, models: object, ok: bool, message: str) -> None:
+        self.ai_models_changed.emit(models if ok else [])
+        self.ai_operation_message_changed.emit(message if ok else f"获取模型失败：{message}", ok)
+        self.ai_state["status"] = message if ok else "获取模型失败"
+        self.ai_state["error"] = "" if ok else message
+        self._dirty = True
+
+    def _refresh_ai_fallback(self, summary: object) -> None:
+        if not hasattr(summary, "state_key"):
+            return
+        current_key = str(summary.state_key)
+        if self._ai_busy and self.ai_state.get("state_key") == current_key:
+            return
+        if self.ai_state.get("source") != "rule_fallback" and self.ai_state.get("state_key") == current_key:
+            return
+        self.ai_state.update(
+            {
+                "enabled": self.ai_settings.enabled,
+                "running": False,
+                "status": "规则回退" if self.ai_settings.enabled else "AI 未启用，使用规则回退",
+                "text": ai_fallback_text(summary.status),
+                "source": "rule_fallback",
+                "window_start": summary.window_start,
+                "window_end": summary.window_end,
+                "updated_at": _float(self.ai_state.get("updated_at")),
+                "top_matches": [],
+                "error": "",
+                "state_key": current_key,
+                "jina_running": self.ai_runtime.is_running(),
+                "config": asdict(self.ai_settings),
+            }
+        )
+
     # ------------------------------------------------------------------ 快照
     def _publish_snapshot(self) -> None:
         if not self._dirty:
             return
 
         self._dirty = False
+        summary = build_detection_summary(self._node_dicts(), self.history)
+        self._refresh_ai_fallback(summary)
+        self.ai_state["running"] = self._ai_busy
+        self.ai_state["jina_running"] = self.ai_runtime.is_running()
+        self.ai_state["config"] = asdict(self.ai_settings)
         self.snapshot_changed.emit(
             {
                 "nodes": self._node_dicts(),
                 "matrix": [state.to_dict() for state in self.matrix.values()],
                 "history": list(self.history),
                 "events": [event.to_dict() for event in self.events],
+                "ai": dict(self.ai_state),
                 "active_node": self._active_node,
                 "serial_connected": self._serial_connected,
                 "paused": self._paused,

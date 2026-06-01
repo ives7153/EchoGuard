@@ -22,13 +22,16 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QScrollArea,
@@ -66,6 +69,7 @@ try:
         ThresholdSlider,
         TopologyWidget,
     )
+    from ..rules.detection_fusion import ai_fallback_text, build_detection_summary, verdict_color_key
 except ImportError:
     from config import (
         CONTROL_ID,
@@ -92,6 +96,7 @@ except ImportError:
         ThresholdSlider,
         TopologyWidget,
     )
+    from rules.detection_fusion import ai_fallback_text, build_detection_summary, verdict_color_key  # type: ignore
 
 
 # 矩阵表列宽（首列拉伸，其余固定，保证表头与每行对齐）
@@ -106,6 +111,397 @@ _MATRIX_COLUMNS = (
 )
 
 
+class AISettingsDialog(QDialog):
+    """仪表盘 AI 设置卡片式弹窗。"""
+
+    action_requested = pyqtSignal(object)
+    save_requested = pyqtSignal(object)
+    start_jina_requested = pyqtSignal()
+    stop_jina_requested = pyqtSignal()
+    test_embedding_requested = pyqtSignal()
+    fetch_models_requested = pyqtSignal()
+    test_llm_requested = pyqtSignal()
+
+    def __init__(self, config: dict[str, Any], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("AI 辅助研判设置")
+        self.setMinimumWidth(760)
+        self.setStyleSheet(
+            f"QDialog {{ background: {THEME['bg']}; }}"
+            f"QLabel {{ color: {THEME['text_soft']}; }}"
+        )
+        self._config = dict(config or {})
+        self._action_buttons: dict[str, QPushButton] = {}
+        self._last_operation_active = False
+        self._available_models: list[str] = []
+        self._model_source = ""
+        self._build_ui()
+        self._load_config(self._config)
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 18, 20, 18)
+        outer.setSpacing(14)
+
+        title = QLabel("AI 辅助研判设置")
+        title.setObjectName("SectionTitle")
+        title.setStyleSheet("font-size: 17px; font-weight: 700;")
+        subtitle = QLabel("规则融合仍负责实时主判断；AI 只做异步解释和模式辅助。")
+        subtitle.setObjectName("SubtleText")
+        outer.addWidget(title)
+        outer.addWidget(subtitle)
+
+        main_card = CardFrame()
+        main_layout = QVBoxLayout(main_card)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(14)
+
+        self.enabled_box = QCheckBox("启用 AI 辅助研判")
+        self.embedding_box = QCheckBox("启用本地 Jina embedding")
+        self.llm_box = QCheckBox("启用大模型 API 辅助解释")
+        flags = QHBoxLayout()
+        flags.setSpacing(18)
+        flags.addWidget(self.enabled_box)
+        flags.addWidget(self.embedding_box)
+        flags.addWidget(self.llm_box)
+        flags.addStretch(1)
+        main_layout.addLayout(flags)
+
+        jina_title = QLabel("本地 Jina embedding")
+        jina_title.setObjectName("SectionTitle")
+        main_layout.addWidget(jina_title)
+        self.server_path_edit = self._line_edit()
+        self.model_path_edit = self._line_edit()
+        self.jina_url_edit = self._line_edit()
+        self.embedding_model_edit = self._line_edit()
+        main_layout.addLayout(
+            self._path_row(
+                "llama-server",
+                self.server_path_edit,
+                "选择 llama-server.exe",
+                "Executable (*.exe);;All Files (*)",
+            )
+        )
+        main_layout.addLayout(
+            self._path_row(
+                "GGUF 模型",
+                self.model_path_edit,
+                "选择 Jina GGUF 模型",
+                "GGUF Model (*.gguf);;All Files (*)",
+            )
+        )
+        main_layout.addLayout(self._field_row("服务地址", self.jina_url_edit))
+        main_layout.addLayout(self._field_row("Embedding 模型名", self.embedding_model_edit))
+        jina_actions = QHBoxLayout()
+        jina_actions.setSpacing(10)
+        start_btn = QPushButton("启动本地 Jina")
+        start_btn.setObjectName("PrimaryButton")
+        start_btn.clicked.connect(lambda: self._request_action("start_jina"))
+        stop_btn = QPushButton("停止服务")
+        stop_btn.setObjectName("GhostButton")
+        stop_btn.clicked.connect(lambda: self._request_action("stop_jina"))
+        test_embed_btn = QPushButton("测试 Embedding")
+        test_embed_btn.setObjectName("GhostButton")
+        test_embed_btn.clicked.connect(lambda: self._request_action("test_embedding"))
+        self._action_buttons["start_jina"] = start_btn
+        self._action_buttons["stop_jina"] = stop_btn
+        self._action_buttons["test_embedding"] = test_embed_btn
+        jina_actions.addWidget(start_btn)
+        jina_actions.addWidget(stop_btn)
+        jina_actions.addWidget(test_embed_btn)
+        jina_actions.addStretch(1)
+        main_layout.addLayout(jina_actions)
+
+        llm_title = QLabel("大模型 API")
+        llm_title.setObjectName("SectionTitle")
+        main_layout.addWidget(llm_title)
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItem("智谱GLM官方", "zhipu_glm")
+        self.provider_combo.addItem("OpenAI兼容", "openai_compatible")
+        self.provider_combo.addItem("自定义", "custom")
+        self.provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        self.llm_url_edit = self._line_edit()
+        self.llm_key_edit = self._line_edit()
+        self.llm_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.llm_model_combo = QComboBox()
+        self.llm_model_combo.setEditable(True)
+        self.llm_model_combo.setMinimumWidth(260)
+        main_layout.addLayout(self._field_row("供应商", self.provider_combo))
+        main_layout.addLayout(self._field_row("API 地址", self.llm_url_edit))
+        main_layout.addLayout(self._field_row("API Key", self.llm_key_edit))
+        model_row = self._field_row("可用模型", self.llm_model_combo)
+        self.model_select_btn = QPushButton("选择模型")
+        self.model_select_btn.setObjectName("GhostButton")
+        self.model_select_btn.setFixedWidth(104)
+        self.model_select_btn.clicked.connect(self._show_model_menu)
+        model_row.addWidget(self.model_select_btn)
+        main_layout.addLayout(model_row)
+        llm_actions = QHBoxLayout()
+        llm_actions.setSpacing(10)
+        fetch_btn = QPushButton("获取模型")
+        fetch_btn.setObjectName("GhostButton")
+        fetch_btn.clicked.connect(lambda: self._request_action("fetch_models"))
+        test_llm_btn = QPushButton("测试 API")
+        test_llm_btn.setObjectName("GhostButton")
+        test_llm_btn.clicked.connect(lambda: self._request_action("test_llm"))
+        self._action_buttons["fetch_models"] = fetch_btn
+        self._action_buttons["test_llm"] = test_llm_btn
+        llm_actions.addWidget(fetch_btn)
+        llm_actions.addWidget(test_llm_btn)
+        llm_actions.addStretch(1)
+        main_layout.addLayout(llm_actions)
+
+        self.status_label = QLabel("AI 设置未测试")
+        self.status_label.setObjectName("SubtleText")
+        self.status_label.setWordWrap(True)
+        main_layout.addWidget(self.status_label)
+        outer.addWidget(main_card)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        save_btn = QPushButton("保存设置")
+        save_btn.setObjectName("PrimaryButton")
+        save_btn.clicked.connect(lambda: self._request_action("save"))
+        self._action_buttons["save"] = save_btn
+        close_btn = QPushButton("关闭")
+        close_btn.setObjectName("GhostButton")
+        close_btn.clicked.connect(self.accept)
+        footer.addWidget(save_btn)
+        footer.addWidget(close_btn)
+        outer.addLayout(footer)
+
+    def _load_config(self, config: dict[str, Any]) -> None:
+        self.enabled_box.setChecked(bool(config.get("enabled", True)))
+        self.embedding_box.setChecked(bool(config.get("embedding_enabled", True)))
+        self.llm_box.setChecked(bool(config.get("llm_enabled", False)))
+        self.server_path_edit.setText(str(config.get("llama_server_path", "upper_computer/runtime/llama-server.exe")))
+        self.model_path_edit.setText(str(config.get("jina_model_path", "upper_computer/models/v5-nano-retrieval-Q4_K_M.gguf")))
+        self.jina_url_edit.setText(str(config.get("jina_base_url", "http://127.0.0.1:18081")))
+        self.embedding_model_edit.setText(str(config.get("embedding_model", "jina-embeddings-v5-text-nano-retrieval")))
+        provider = str(config.get("llm_provider") or self._infer_provider(config))
+        provider_index = self.provider_combo.findData(provider)
+        self.provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
+        self.llm_url_edit.setText(str(config.get("llm_base_url", "")))
+        self.llm_key_edit.setText(str(config.get("llm_api_key", "")))
+        model = self._normalize_model_label(str(config.get("llm_model", "")), self.provider_combo.currentData())
+        if model:
+            self.llm_model_combo.addItem(model)
+            self.llm_model_combo.setCurrentText(model)
+        self._on_provider_changed()
+
+    def _collect_config(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled_box.isChecked(),
+            "embedding_enabled": self.embedding_box.isChecked(),
+            "llama_server_path": self.server_path_edit.text().strip(),
+            "jina_model_path": self.model_path_edit.text().strip(),
+            "jina_base_url": self.jina_url_edit.text().strip(),
+            "embedding_model": self.embedding_model_edit.text().strip(),
+            "llm_enabled": self.llm_box.isChecked(),
+            "llm_provider": str(self.provider_combo.currentData() or "zhipu_glm"),
+            "llm_base_url": self.llm_url_edit.text().strip(),
+            "llm_api_key": self.llm_key_edit.text().strip(),
+            "llm_model": self._normalize_model_label(
+                self.llm_model_combo.currentText().strip(),
+                self.provider_combo.currentData(),
+            ),
+            "save_api_key": True,
+        }
+
+    def _save_then_emit(self, signal: pyqtSignal | None) -> None:
+        self.save_requested.emit(self._collect_config())
+        if signal is not None:
+            signal.emit()
+
+    def _request_action(self, action: str) -> None:
+        self._last_operation_active = True
+        self._set_action_running(action, True)
+        self.set_status(self._action_label(action) + "执行中...", True)
+        payload = {"action": action, "config": self._collect_config()}
+        self.action_requested.emit(payload)
+
+    def _set_action_running(self, action: str, running: bool) -> None:
+        button = self._action_buttons.get(action)
+        if button is None:
+            return
+        button.setEnabled(not running)
+        label = self._action_label(action)
+        button.setText(f"{label}..." if running else label)
+
+    def _action_label(self, action: str) -> str:
+        return {
+            "save": "保存设置",
+            "start_jina": "启动本地 Jina",
+            "stop_jina": "停止服务",
+            "test_embedding": "测试 Embedding",
+            "fetch_models": "获取模型",
+            "test_llm": "测试 API",
+        }.get(action, "AI 操作")
+
+    def _show_model_menu(self) -> None:
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            f"QMenu {{ background: {THEME['card_alt']}; border: 1px solid {THEME['border']};"
+            f" border-radius: 8px; padding: 6px; }}"
+            f"QMenu::item {{ color: {THEME['text_soft']}; padding: 8px 22px 8px 12px; border-radius: 6px; }}"
+            f"QMenu::item:selected {{ background: {THEME['blue']}; color: #FFFFFF; }}"
+            f"QMenu::item:disabled {{ color: {THEME['muted_2']}; }}"
+        )
+        if not self._available_models:
+            empty = QAction("暂无模型，请先点击获取模型", menu)
+            empty.setEnabled(False)
+            menu.addAction(empty)
+        else:
+            for model in self._available_models:
+                action = QAction(model, menu)
+                action.triggered.connect(lambda _checked=False, value=model: self._select_model_value(value))
+                menu.addAction(action)
+        menu.exec(self.model_select_btn.mapToGlobal(self.model_select_btn.rect().bottomLeft()))
+
+    def _refresh_model_button(self, models: list[str], source: str = "") -> None:
+        self._available_models = list(models)
+        self._model_source = source
+        if not self._available_models:
+            self.model_select_btn.setText("选择模型")
+            return
+        self.model_select_btn.setText(f"选择模型 ({len(self._available_models)})")
+
+    def _select_model_value(self, model: str) -> None:
+        text = str(model or "").strip()
+        if not text:
+            return
+        self.llm_model_combo.setCurrentText(text)
+        self.set_status(f"已选择模型：{text}", True)
+
+    def _on_provider_changed(self) -> None:
+        provider = str(self.provider_combo.currentData() or "zhipu_glm")
+        if provider == "zhipu_glm":
+            self.llm_url_edit.setText("https://open.bigmodel.cn/api/paas/v4")
+            current = self._normalize_model_label(self.llm_model_combo.currentText(), provider)
+            presets = ("glm-5.1", "glm-5-turbo", "glm-4.5", "glm-4.5-air")
+            self.llm_model_combo.blockSignals(True)
+            self.llm_model_combo.clear()
+            self.llm_model_combo.addItems(presets)
+            self.llm_model_combo.setCurrentText(current if current in presets else "glm-5.1")
+            self.llm_model_combo.blockSignals(False)
+
+    def _infer_provider(self, config: dict[str, Any]) -> str:
+        model = str(config.get("llm_model") or "").lower().replace(" ", "")
+        base = str(config.get("llm_base_url") or "").lower()
+        if "glm" in model or "bigmodel.cn" in base:
+            return "zhipu_glm"
+        return "openai_compatible"
+
+    def _normalize_model_label(self, model: str, provider: object) -> str:
+        text = str(model or "").strip()
+        if str(provider) == "zhipu_glm":
+            compact = text.lower().replace(" ", "-").replace("_", "-")
+            aliases = {
+                "glm-5.1": "glm-5.1",
+                "glm5.1": "glm-5.1",
+                "glm-5-turbo": "glm-5-turbo",
+                "glm5-turbo": "glm-5-turbo",
+            }
+            return aliases.get(compact, compact or "glm-5.1")
+        return text
+
+    def _line_edit(self) -> QLineEdit:
+        edit = QLineEdit()
+        edit.setMinimumHeight(34)
+        return edit
+
+    def _field_row(self, label: str, widget: QWidget) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setSpacing(10)
+        caption = QLabel(label)
+        caption.setObjectName("SubtleText")
+        caption.setFixedWidth(112)
+        row.addWidget(caption)
+        row.addWidget(widget, 1)
+        return row
+
+    def _path_row(self, label: str, edit: QLineEdit, title: str, file_filter: str) -> QHBoxLayout:
+        row = self._field_row(label, edit)
+        browse = QPushButton("浏览")
+        browse.setObjectName("GhostButton")
+        browse.clicked.connect(lambda: self._browse_file(edit, title, file_filter))
+        row.addWidget(browse)
+        return row
+
+    def _browse_file(self, edit: QLineEdit, title: str, file_filter: str) -> None:
+        path, _filter = QFileDialog.getOpenFileName(self, title, edit.text(), file_filter)
+        if path:
+            edit.setText(path)
+
+    def set_status(self, text: str, ok: bool = True) -> None:
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(
+            f"color: {THEME['blue_soft'] if ok else THEME['red']}; font-size: 12px;"
+        )
+
+    def set_models(self, models: object) -> None:
+        current = self.llm_model_combo.currentText().strip()
+        self.llm_model_combo.blockSignals(True)
+        self.llm_model_combo.clear()
+        model_values: list[str] = []
+        if isinstance(models, list):
+            model_values = [str(model) for model in models]
+            self.llm_model_combo.addItems(model_values)
+        if current:
+            self.llm_model_combo.setCurrentText(current)
+        self.llm_model_combo.blockSignals(False)
+        self._refresh_model_button(model_values)
+
+    def set_operation_result(self, result: object) -> None:
+        if not isinstance(result, dict):
+            return
+        action = str(result.get("action") or "")
+        running = bool(result.get("running", False))
+        self._set_action_running(action, running)
+        if "models" in result:
+            self._apply_model_result(result)
+        message = str(result.get("message") or "")
+        if action == "fetch_models" and bool(result.get("ok", False)):
+            count = len(result.get("models") or [])
+            source = str(result.get("model_source") or "")
+            prefix = "已加载官方预设" if source == "preset" else "获取模型成功"
+            message = f"{prefix}：共 {count} 个模型"
+        elif action == "test_llm" and bool(result.get("ok", False)):
+            endpoint = str(result.get("endpoint") or "")
+            model = self.llm_model_combo.currentText().strip()
+            raw_message = message.replace("真实请求成功：", "")
+            message = f"测试成功：{raw_message or endpoint or model}"
+        elif message and not bool(result.get("ok", False)):
+            message = f"{self._action_label(action)}失败：{message}"
+        if message:
+            self._last_operation_active = True
+            self.set_status(message, bool(result.get("ok", False)))
+
+    def set_runtime_state(self, ai_state: dict[str, Any]) -> None:
+        if self._last_operation_active:
+            return
+        status = str(ai_state.get("status") or "")
+        error = str(ai_state.get("error") or "")
+        if error:
+            self.set_status(error, False)
+        elif status:
+            self.set_status(status, True)
+
+    def _apply_model_result(self, result: dict[str, Any]) -> None:
+        models = result.get("models")
+        model_values = [str(model) for model in models] if isinstance(models, list) else []
+        current = self.llm_model_combo.currentText().strip()
+        self.llm_model_combo.blockSignals(True)
+        self.llm_model_combo.clear()
+        self.llm_model_combo.addItems(model_values)
+        if current:
+            self.llm_model_combo.setCurrentText(current)
+        elif model_values:
+            self.llm_model_combo.setCurrentText(model_values[0])
+        self.llm_model_combo.blockSignals(False)
+        self._refresh_model_button(model_values, str(result.get("model_source") or ""))
+
+
 # ===========================================================================
 # 仪表盘页（图 2）
 # ===========================================================================
@@ -118,6 +514,13 @@ class DashboardPage(QWidget):
     active_node_changed = pyqtSignal(int)
     pause_toggled = pyqtSignal(bool)
     clear_events_requested = pyqtSignal()
+    ai_config_save_requested = pyqtSignal(object)
+    ai_jina_start_requested = pyqtSignal()
+    ai_jina_stop_requested = pyqtSignal()
+    ai_embedding_test_requested = pyqtSignal()
+    ai_models_requested = pyqtSignal()
+    ai_llm_test_requested = pyqtSignal()
+    ai_action_requested = pyqtSignal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -126,6 +529,8 @@ class DashboardPage(QWidget):
         self._last_event_count = -1
         self._paused = False
         self._last_verdict = ("等待数据", "尚未收到有效节点数据", THEME["muted"])
+        self._latest_ai_config: dict[str, Any] = {}
+        self._ai_dialog: AISettingsDialog | None = None
 
         body = QHBoxLayout(self)
         body.setContentsMargins(0, 0, 0, 0)
@@ -161,29 +566,60 @@ class DashboardPage(QWidget):
         controls.addWidget(self.pause_btn)
         controls.addWidget(self.detail_btn)
         controls.addStretch(1)
+        self.export_message = QLabel("")
+        self.export_message.setObjectName("SubtleText")
+        self.export_message.setMaximumWidth(230)
+        controls.addWidget(self.export_message)
+        csv_btn = QPushButton("CSV 导出")
+        csv_btn.setObjectName("PrimaryButton")
+        csv_btn.clicked.connect(self.export_csv_requested.emit)
+        csi_btn = QPushButton("CSI 曲线截图")
+        csi_btn.setObjectName("GhostButton")
+        csi_btn.clicked.connect(lambda: self.csi_shot_requested.emit(self.csi_plot))
+        shot_btn = QPushButton("整窗截图")
+        shot_btn.setObjectName("GhostButton")
+        shot_btn.clicked.connect(lambda: self.screenshot_requested.emit(self.window()))
+        controls.addWidget(csv_btn)
+        controls.addWidget(csi_btn)
+        controls.addWidget(shot_btn)
         layout.addLayout(controls)
 
         self.verdict_card = CardFrame()
+        self.verdict_card.setMinimumHeight(128)
         verdict_layout = QHBoxLayout(self.verdict_card)
-        verdict_layout.setContentsMargins(18, 12, 18, 12)
-        verdict_layout.setSpacing(18)
+        verdict_layout.setContentsMargins(18, 16, 18, 16)
+        verdict_layout.setSpacing(20)
         verdict_title_box = QVBoxLayout()
-        verdict_title_box.setSpacing(3)
+        verdict_title_box.setSpacing(6)
         verdict_title = QLabel("综合研判结果")
         verdict_title.setObjectName("SectionTitle")
         verdict_subtitle = QLabel("基于多节点最近数据的辅助判断")
         verdict_subtitle.setObjectName("SubtleText")
+        self.ai_settings_btn = QPushButton("AI设置")
+        self.ai_settings_btn.setObjectName("GhostButton")
+        self.ai_settings_btn.setFixedWidth(86)
+        self.ai_settings_btn.clicked.connect(self._show_ai_settings_dialog)
         verdict_title_box.addWidget(verdict_title)
         verdict_title_box.addWidget(verdict_subtitle)
+        verdict_title_box.addWidget(self.ai_settings_btn)
+        verdict_title_box.addStretch(1)
         self.verdict_status = QLabel("等待数据")
         self.verdict_status.setObjectName("MetricValue")
         self.verdict_status.setStyleSheet(f"font-size: 22px; color: {THEME['muted']};")
         self.verdict_detail = QLabel("尚未收到有效节点数据")
         self.verdict_detail.setObjectName("SubtleText")
         self.verdict_detail.setWordWrap(True)
+        self.ai_verdict = QLabel("AI辅助研判：暂无有效样本，建议连接 Gateway 后继续采集")
+        self.ai_verdict.setObjectName("SubtleText")
+        self.ai_verdict.setWordWrap(True)
+        self.ai_verdict.setStyleSheet(f"color: {THEME['blue_soft']}; font-size: 13px; font-weight: 600;")
+        verdict_result_box = QVBoxLayout()
+        verdict_result_box.setSpacing(8)
+        verdict_result_box.addWidget(self.verdict_detail)
+        verdict_result_box.addWidget(self.ai_verdict)
         verdict_layout.addLayout(verdict_title_box, 1)
         verdict_layout.addWidget(self.verdict_status)
-        verdict_layout.addWidget(self.verdict_detail, 2)
+        verdict_layout.addLayout(verdict_result_box, 2)
         layout.addWidget(self.verdict_card)
 
         self.csi_plot = CsiTrendPlot()
@@ -224,26 +660,6 @@ class DashboardPage(QWidget):
             1,
         )
         layout.addLayout(bottom_row)
-
-        export_row = QHBoxLayout()
-        export_row.setSpacing(10)
-        self.export_message = QLabel("")
-        self.export_message.setObjectName("SubtleText")
-        export_row.addWidget(self.export_message, 1)
-
-        csv_btn = QPushButton("CSV 导出")
-        csv_btn.setObjectName("PrimaryButton")
-        csv_btn.clicked.connect(self.export_csv_requested.emit)
-        csi_btn = QPushButton("CSI 曲线截图")
-        csi_btn.setObjectName("GhostButton")
-        csi_btn.clicked.connect(lambda: self.csi_shot_requested.emit(self.csi_plot))
-        shot_btn = QPushButton("整窗截图")
-        shot_btn.setObjectName("GhostButton")
-        shot_btn.clicked.connect(lambda: self.screenshot_requested.emit(self.window()))
-        export_row.addWidget(csv_btn)
-        export_row.addWidget(csi_btn)
-        export_row.addWidget(shot_btn)
-        layout.addLayout(export_row)
 
         return center
 
@@ -318,11 +734,15 @@ class DashboardPage(QWidget):
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         history: list[dict[str, Any]] = snapshot.get("history", [])
         events: list[dict[str, Any]] = snapshot.get("events", [])
+        ai_state: dict[str, Any] = snapshot.get("ai", {})
         requested_active = int(snapshot.get("active_node") or 0)
         active_node = self._refresh_focus_nodes(nodes, requested_active)
         active_state = nodes.get(active_node, {}) if active_node else {}
         self._latest_nodes = nodes
         self._latest_active_node = active_node
+        self._latest_ai_config = dict(ai_state.get("config") or {})
+        if self._ai_dialog is not None:
+            self._ai_dialog.set_runtime_state(ai_state)
 
         self._paused = bool(snapshot.get("paused"))
         self.pause_btn.setText("恢复刷新" if self._paused else "暂停刷新")
@@ -332,7 +752,7 @@ class DashboardPage(QWidget):
             return
 
         self.csi_plot.set_history(history, active_node, active_state)
-        self._update_verdict(nodes, history)
+        self._update_verdict(nodes, history, ai_state)
         self._update_metric_cards(active_state)
         self._update_group_cards(active_state)
 
@@ -401,12 +821,51 @@ class DashboardPage(QWidget):
             ),
         )
 
-    def _update_verdict(self, nodes: dict[int, dict[str, Any]], history: list[dict[str, Any]]) -> None:
-        status, detail, color = _multi_node_detection_state(nodes, history)
+    def _show_ai_settings_dialog(self) -> None:
+        dialog = AISettingsDialog(self._latest_ai_config, self)
+        self._ai_dialog = dialog
+        dialog.action_requested.connect(self.ai_action_requested.emit)
+        dialog.save_requested.connect(self.ai_config_save_requested.emit)
+        dialog.start_jina_requested.connect(self.ai_jina_start_requested.emit)
+        dialog.stop_jina_requested.connect(self.ai_jina_stop_requested.emit)
+        dialog.test_embedding_requested.connect(self.ai_embedding_test_requested.emit)
+        dialog.fetch_models_requested.connect(self.ai_models_requested.emit)
+        dialog.test_llm_requested.connect(self.ai_llm_test_requested.emit)
+        dialog.finished.connect(lambda _code: setattr(self, "_ai_dialog", None))
+        dialog.exec()
+
+    def set_ai_operation_message(self, text: str, ok: bool = True) -> None:
+        if self._ai_dialog is not None:
+            self._ai_dialog.set_status(text, ok)
+
+    def set_ai_models(self, models: object) -> None:
+        if self._ai_dialog is not None:
+            self._ai_dialog.set_models(models)
+
+    def set_ai_operation_result(self, result: object) -> None:
+        if self._ai_dialog is not None:
+            self._ai_dialog.set_operation_result(result)
+
+    def _update_verdict(
+        self,
+        nodes: dict[int, dict[str, Any]],
+        history: list[dict[str, Any]],
+        ai_state: dict[str, Any],
+    ) -> None:
+        summary = build_detection_summary(nodes, history)
+        status = summary.status
+        detail = summary.detail
+        color = THEME[verdict_color_key(status)]
         self._last_verdict = (status, detail, color)
         self.verdict_status.setText(status)
         self.verdict_status.setStyleSheet(f"font-size: 22px; color: {color};")
         self.verdict_detail.setText(detail)
+        ai_text = str(ai_state.get("text") or ai_fallback_text(status))
+        updated_at = _float(ai_state.get("updated_at"))
+        if updated_at > 0 and ai_state.get("source") != "rule_fallback":
+            age = max(0.0, time.time() - updated_at)
+            ai_text = f"{ai_text}（{age:.0f}s前）"
+        self.ai_verdict.setText(ai_text)
 
     def set_export_message(self, text: str, ok: bool = True) -> None:
         self.export_message.setText(text)
@@ -1388,77 +1847,6 @@ def _show_detail_dialog(parent: QWidget, title: str, rows: tuple[tuple[str, Any]
     footer.addWidget(close_btn)
     layout.addLayout(footer)
     dialog.exec()
-
-
-def _multi_node_detection_state(
-    nodes: dict[int, dict[str, Any]],
-    history: list[dict[str, Any]],
-    window_seconds: float = 5.0,
-) -> tuple[str, str, str]:
-    if not history:
-        return "等待数据", "参与节点：0；等待 Gateway 串口数据", THEME["muted"]
-
-    reference_ts = time.time()
-    recent = [
-        sample for sample in history
-        if reference_ts - _float(sample.get("timestamp"), reference_ts) <= window_seconds
-    ]
-    latest_by_node: dict[int, dict[str, Any]] = {}
-    for sample in recent:
-        node_id = int(sample.get("node_id") or 0)
-        if node_id <= 0:
-            continue
-        if _float(sample.get("timestamp")) >= _float(latest_by_node.get(node_id, {}).get("timestamp")):
-            latest_by_node[node_id] = sample
-
-    participants = sorted(latest_by_node)
-    if not participants:
-        return "等待数据", "参与节点：0；等待有效节点样本", THEME["muted"]
-
-    triggered: list[int] = []
-    for node_id, sample in latest_by_node.items():
-        node_state = nodes.get(node_id, {})
-        presence = _score(sample.get("presence_score", node_state.get("presence_score")))
-        confidence = _score(sample.get("confidence", node_state.get("confidence")))
-        if presence >= 0.5 and confidence >= 0.62:
-            triggered.append(node_id)
-
-    participant_text = f"参与节点：{len(participants)}"
-    trigger_text = "触发节点：" + (
-        ", ".join(_node_label(node_id, nodes.get(node_id, {})) for node_id in sorted(triggered))
-        if triggered
-        else "无"
-    )
-    window_text = f"时间窗口：最近 {window_seconds:.0f} 秒"
-    if len(participants) == 1:
-        if triggered:
-            return (
-                "疑似局部微动",
-                f"{participant_text}；{trigger_text}；{window_text}；建议继续采集，等待多节点支持",
-                THEME["orange"],
-            )
-        return (
-            "数据不足",
-            f"{participant_text}；{trigger_text}；{window_text}；建议等待更多节点上报",
-            THEME["orange"],
-        )
-    if len(triggered) >= 2:
-        return (
-            "多节点疑似生命微动",
-            f"{participant_text}；{trigger_text}；{window_text}；建议继续采集观察",
-            THEME["green"],
-        )
-    if len(triggered) == 1:
-        return (
-            "疑似局部微动",
-            f"{participant_text}；{trigger_text}；{window_text}；单节点触发，建议继续观察",
-            THEME["orange"],
-        )
-    return (
-        "未检测到稳定微动",
-        f"{participant_text}；{trigger_text}；{window_text}；多节点暂未达到稳定阈值",
-        THEME["blue_soft"],
-    )
 
 
 def _node_label(node_id: int, state: dict[str, Any] | None = None) -> str:

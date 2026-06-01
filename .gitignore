@@ -56,6 +56,12 @@ __pycache__/
 *.egg-info/
 dist/
 
+# Upper computer local AI runtime/model payloads
+upper_computer/models/
+upper_computer/runtime/
+upper_computer/exports/
+*.gguf
+
 # Virtual environment folders
 venv/
 .venv/
