@@ -133,4 +133,6 @@ python main.py
 ## 参考文档
 
 - `hardware/readme.md`：硬件接线、上电自检、常见硬件坑点、电源与天线布局建议。
+- `docs/interface_alignment.md`：上位机与固件接口一致性、节点自动发现、电池和气体字段说明。
+- `docs/ai_auxiliary_judgement.md`：AI 辅助研判异步链路和实时规则边界说明。
 - `docs/`：项目卡、阶段报告、答辩材料和实验记录模板。
