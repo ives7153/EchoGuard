@@ -4,10 +4,8 @@
 不直接解析 JSON、不直接跑报警规则，只接收这里发出的 Qt 信号并刷新控件。
 这样串口后台读取不会阻塞主线程，同时保持 serial_handler.py / data_parser.py 的兼容性。
 
-本层只驱动真实串口数据：
-* 生命体征感知节点（id 1..4）—— 仪表盘页使用，含 presence/motion/bpm/conf 等。
-* LoRa 节点矩阵（共 14 个）—— 传感器页使用，前若干个绑定真实固件节点，状态随真实
-  数据更新；未绑定真实节点的行保持离线，不再注入任何模拟数据。
+本层只驱动真实串口数据：收到 Gateway JSON 后按节点 id 自动创建节点状态与矩阵行；
+未收到真实数据前不预置节点、不注入演示样本。
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ try:
         CONTROL_ID,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
-        GAS_THRESHOLD_PPM,
+        GAS_THRESHOLD_RAW,
         GATEWAY_ID,
         HEALTH_CRITICAL,
         HEALTH_EXCELLENT,
@@ -35,7 +33,6 @@ try:
         HEALTH_INACTIVE,
         MAX_EVENT_ROWS,
         MAX_HISTORY_ROWS,
-        NODE_IDS,
         NODE_LABELS,
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
@@ -71,7 +68,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         CONTROL_ID,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
-        GAS_THRESHOLD_PPM,
+        GAS_THRESHOLD_RAW,
         GATEWAY_ID,
         HEALTH_CRITICAL,
         HEALTH_EXCELLENT,
@@ -79,7 +76,6 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         HEALTH_INACTIVE,
         MAX_EVENT_ROWS,
         MAX_HISTORY_ROWS,
-        NODE_IDS,
         NODE_LABELS,
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
@@ -112,7 +108,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
 
 @dataclass(slots=True)
 class NodeState:
-    """单个生命体征感知节点当前状态（id 1..4）。
+    """单个生命体征感知节点当前状态。
 
     中文注释：字段命名沿用 data_parser.py 的规范化结果，UI 与报警规则可直接消费。
     """
@@ -124,7 +120,7 @@ class NodeState:
     wifi_rssi: float = -42.0
     snr: float = 0.0
     packet_loss: float = 0.0
-    battery: float = 100.0
+    battery: float | None = None
     last_received: float | None = None
     created_at: float = field(default_factory=time.time)
     seq: int | None = None
@@ -265,20 +261,13 @@ class DataManager(QObject):
         # 报警引擎（阈值可被传感器页热更新）
         self.alarm_engine = AlarmEngine()
         self.presence_threshold = PRESENCE_THRESHOLD
-        self.gas_threshold = GAS_THRESHOLD_PPM
+        self.gas_threshold = GAS_THRESHOLD_RAW
         self.afh_enabled = DEFAULT_AFH_ENABLED
         self.mesh_enabled = DEFAULT_MESH_ENABLED
         self.last_sync_at: float | None = None
 
-        # 生命体征节点（id 1..4）
-        self.nodes: dict[int, NodeState] = {
-            node_id: NodeState(
-                node_id=node_id,
-                label=NODE_LABELS[node_id],
-                battery=max(72.0, 96.0 - node_id * 3.0),
-            )
-            for node_id in NODE_IDS
-        }
+        # 节点由 Gateway 串口帧自动发现；无真实数据时保持空状态。
+        self.nodes: dict[int, NodeState] = {}
 
         # LoRa 节点矩阵由 Gateway 串口帧自动发现；未收到真实数据前保持空表。
         self.matrix: dict[int, MatrixNodeState] = {}
@@ -290,14 +279,14 @@ class DataManager(QObject):
         self._serial_started_at = 0.0
         self._last_serial_sample_at = 0.0
         self._dirty = True
-        self._active_node = NODE_IDS[0]
+        self._active_node = 0
         self._paused = False
         self._matrix_filter = "ALL"
         self._diagnostics_report = ""
-        self._presence_flags = {node_id: False for node_id in NODE_IDS}
-        self._breath_lock_flags = {node_id: False for node_id in NODE_IDS}
-        self._offline_flags = {node_id: False for node_id in NODE_IDS}
-        self._gas_alert_flags = {node_id: False for node_id in NODE_IDS}
+        self._presence_flags: dict[int, bool] = {}
+        self._breath_lock_flags: dict[int, bool] = {}
+        self._offline_flags: dict[int, bool] = {}
+        self._gas_alert_flags: dict[int, bool] = {}
 
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(UI_REFRESH_MS)
@@ -705,7 +694,7 @@ class DataManager(QObject):
         report_lines = [
             f"诊断时间：{now}",
             f"串口链路：{'已连接 ' + self.selected_port if self._serial_connected else '未连接'}",
-            f"生命体征节点：在线 {len(online_nodes)} / {len(self.nodes)}，离线 {len(offline_nodes)}",
+            f"已发现节点：在线 {len(online_nodes)} / {len(self.nodes)}，离线 {len(offline_nodes)}",
             f"LoRa 矩阵：在线 {sum(1 for s in self.matrix.values() if s.online)} / {len(self.matrix)}，严重项 {len(critical_matrix)}",
             f"历史样本：{len(self.history)} 条；事件：{len(self.events)} 条",
             "建议：优先检查离线节点供电、天线连接与 Gateway 串口输出；本报告未向硬件下发任何指令。",
@@ -724,7 +713,7 @@ class DataManager(QObject):
 
     @pyqtSlot(float)
     def set_gas_threshold(self, value: float) -> None:
-        """传感器页气体检测阈值滑条回调。"""
+        """传感器页有害气体原始值阈值滑条回调。"""
 
         self.gas_threshold = max(0.0, float(value))
         self._dirty = True
@@ -756,11 +745,11 @@ class DataManager(QObject):
         self.last_sync_at = time.time()
         self.alarm_engine.update_thresholds(
             presence_threshold=self.presence_threshold,
-            gas_alarm_ppm=max(self.gas_threshold, self.alarm_engine.gas_alarm_ppm),
+            gas_alarm_raw=max(self.gas_threshold, self.alarm_engine.gas_alarm_raw),
         )
         self._append_event(
             "CONFIG SYNCED",
-            f"全局配置已下发：存在阈值 {self.presence_threshold * 100:.0f}% · 气体阈值 {self.gas_threshold:.0f} ppm",
+            f"本地配置已同步：存在阈值 {self.presence_threshold * 100:.0f}% · 气体原始值阈值 {self.gas_threshold:.0f}",
             level="OK",
             kind="config",
         )
@@ -900,7 +889,7 @@ class DataManager(QObject):
             self.nodes[node_id] = NodeState(
                 node_id=node_id,
                 label=NODE_LABELS.get(node_id, f"node{node_id}"),
-                battery=100.0,
+                battery=None,
             )
             self._presence_flags[node_id] = False
             self._breath_lock_flags[node_id] = False
@@ -1002,7 +991,8 @@ class DataManager(QObject):
         if len(self.history) > MAX_HISTORY_ROWS:
             del self.history[: len(self.history) - MAX_HISTORY_ROWS]
 
-        self._active_node = node_id
+        if self._active_node <= 0 or self._active_node not in self.nodes:
+            self._active_node = node_id
         self._offline_flags[node_id] = False
 
         if not was_online:

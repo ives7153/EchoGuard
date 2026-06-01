@@ -25,7 +25,7 @@ CONTROL_ID = "0xFF-AD-01"
 
 BAUDRATE = 115200
 
-# 中文注释：固件 id 字段范围 1..4，对应 4 个生命体征感知节点（仪表盘页使用）。
+# 中文注释：常见竞赛配置为 1..4，但上位机实际以 Gateway 串口帧中的 id 自动发现节点。
 NODE_IDS = (1, 2, 3, 4)
 GATEWAY_ID = "GW_01"
 
@@ -108,28 +108,11 @@ TOPOLOGY_NODE_POSITIONS = {
 
 # ---------------------------------------------------------------------------
 # 传感器页：活动节点矩阵（LoRa 节点）
-# 中文注释：matrix_id 是固件没有覆盖到的扩展节点，用于把表格填满成设计稿中的
-# “14 个连接的 LoRa 节点”观感；前 4 个绑定真实固件 id（1..4），其余由 Demo 注入。
-# 每个节点的 RSSI / 电池 / 健康度 / 运行模式都来自数据管线 NodeState，而不是写死的常量。
+# 中文注释：节点矩阵由真实 Gateway 串口帧自动发现，本常量保留为空元组仅作历史兼容。
 # ---------------------------------------------------------------------------
 OPERATING_MODES = ("POWER_SAVE", "HIGH_PERF", "SLEEP", "DEBUG_MODE", "NORMAL")
 
-NODE_MATRIX = (
-    {"matrix_id": 1, "code": "node1", "mode": "POWER_SAVE", "bound_node": 1, "battery": 82},
-    {"matrix_id": 2, "code": "node2", "mode": "HIGH_PERF", "bound_node": 2, "battery": 31},
-    {"matrix_id": 3, "code": "node3", "mode": "SLEEP", "bound_node": 3, "battery": 100},
-    {"matrix_id": 4, "code": "node4", "mode": "DEBUG_MODE", "bound_node": None, "battery": 56},
-    {"matrix_id": 5, "code": "node5", "mode": "POWER_SAVE", "bound_node": 4, "battery": 75},
-    {"matrix_id": 6, "code": "node6", "mode": "HIGH_PERF", "bound_node": None, "battery": 64},
-    {"matrix_id": 7, "code": "node7", "mode": "NORMAL", "bound_node": None, "battery": 88},
-    {"matrix_id": 8, "code": "node8", "mode": "POWER_SAVE", "bound_node": None, "battery": 47},
-    {"matrix_id": 9, "code": "node9", "mode": "NORMAL", "bound_node": None, "battery": 72},
-    {"matrix_id": 10, "code": "node10", "mode": "NORMAL", "bound_node": None, "battery": 90},
-    {"matrix_id": 11, "code": "node11", "mode": "SLEEP", "bound_node": None, "battery": 100},
-    {"matrix_id": 12, "code": "node12", "mode": "HIGH_PERF", "bound_node": None, "battery": 53},
-    {"matrix_id": 13, "code": "node13", "mode": "POWER_SAVE", "bound_node": None, "battery": 79},
-    {"matrix_id": 14, "code": "node14", "mode": "NORMAL", "bound_node": None, "battery": 68},
-)
+NODE_MATRIX: tuple[dict[str, object], ...] = ()
 
 # 运行健康度等级（设计稿：极佳 / 良好 / 未激活 / 严重错误）
 HEALTH_EXCELLENT = "极佳"
@@ -149,8 +132,10 @@ HEALTH_COLORS = {
 # 阈值默认值（传感器页右侧配置 + 报警规则共享）
 # ---------------------------------------------------------------------------
 PRESENCE_THRESHOLD = 0.42       # 存在感应阈值（0~1，对应设计稿 42%）
-GAS_THRESHOLD_PPM = 280.0       # 气体检测阈值（ppm，设计稿 280 ppm）
-GAS_ALARM_PPM = 550.0           # 触发系统警告的气体上限
+GAS_THRESHOLD_RAW = 280.0       # MQ-135 原始值 / 有害气体指数阈值，未做 ppm 标定
+GAS_ALARM_RAW = 550.0           # 触发系统警告的气体原始值上限
+GAS_THRESHOLD_PPM = GAS_THRESHOLD_RAW  # 兼容旧导入名；UI 不再按 ppm 展示
+GAS_ALARM_PPM = GAS_ALARM_RAW          # 兼容旧导入名；规则仍比较原始值
 CONFIDENCE_THRESHOLD = 0.75     # 生命微动报警的置信度门限
 ALARM_DEDUP_SECONDS = 5.0       # 同类报警去重窗口
 

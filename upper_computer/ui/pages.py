@@ -48,10 +48,9 @@ try:
         CONTROL_ID,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
-        GAS_THRESHOLD_PPM,
+        GAS_THRESHOLD_RAW,
         GATEWAY_ID,
         HEALTH_CRITICAL,
-        NODE_IDS,
         NODE_LABELS,
         PRESENCE_THRESHOLD,
         THEME,
@@ -75,10 +74,9 @@ except ImportError:
         CONTROL_ID,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
-        GAS_THRESHOLD_PPM,
+        GAS_THRESHOLD_RAW,
         GATEWAY_ID,
         HEALTH_CRITICAL,
-        NODE_IDS,
         NODE_LABELS,
         PRESENCE_THRESHOLD,
         THEME,
@@ -104,7 +102,7 @@ _MATRIX_COLUMNS = (
     ("节点 ID", 0),       # 0 = 拉伸
     ("运行模式", 150),
     ("LORA RSSI", 110),
-    ("电池电量", 185),
+    ("电池状态", 185),
     ("运行健康度", 130),
     ("建议动作", 140),
     ("操作", 56),
@@ -806,7 +804,7 @@ class DashboardPage(QWidget):
 
     def _show_active_node_detail(self) -> None:
         nodes = getattr(self, "_latest_nodes", {})
-        node_id = int(getattr(self, "_latest_active_node", NODE_IDS[0]))
+        node_id = int(getattr(self, "_latest_active_node", 0))
         state = nodes.get(node_id, {})
         _show_detail_dialog(
             self,
@@ -1157,13 +1155,13 @@ class SensorMatrixPage(QWidget):
         layout.addWidget(self.presence_slider)
 
         self.gas_slider = ThresholdSlider(
-            "有害气体阈值",
+            "有害气体原始值阈值",
             minimum=0.0,
             maximum=1000.0,
-            value=GAS_THRESHOLD_PPM,
-            value_fmt=lambda v: f"{v:.0f} ppm",
-            min_label="0 ppm",
-            max_label="1000 ppm",
+            value=GAS_THRESHOLD_RAW,
+            value_fmt=lambda v: f"{v:.0f}",
+            min_label="0",
+            max_label="1000",
         )
         self.gas_slider.valueChanged.connect(self.gas_threshold_changed.emit)
         layout.addWidget(self.gas_slider)
@@ -1345,6 +1343,7 @@ class AnalysisPage(QWidget):
         self._metric_key = "motion_score"
         self._window_seconds = 60
         self._selected_node = 0
+        self._known_nodes: list[tuple[int, str]] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -1362,8 +1361,6 @@ class AnalysisPage(QWidget):
         controls.setSpacing(10)
         self.analysis_node_combo = QComboBox()
         self.analysis_node_combo.addItem("全部节点", 0)
-        for node_id in NODE_IDS:
-            self.analysis_node_combo.addItem(NODE_LABELS[node_id], node_id)
         self.analysis_node_combo.currentIndexChanged.connect(self._on_analysis_control_changed)
         self.metric_combo = QComboBox()
         for label, key in (
@@ -1398,7 +1395,7 @@ class AnalysisPage(QWidget):
             "samples": MetricCard("累计样本\n(SAMPLES)", "0", "历史缓存"),
             "avg_motion": MetricCard("平均运动\n(AVG MOTION)", "--", "全部节点"),
             "max_gas": MetricCard("有害气体峰值\n(GAS INDEX)", "--", "全部节点"),
-            "online": MetricCard("在线节点\n(ONLINE)", "0 / 4", "生命体征节点"),
+            "online": MetricCard("在线节点\n(ONLINE)", "0 / 0", "已发现节点"),
         }
         for index, card in enumerate(self.stat_cards.values()):
             stats.addWidget(card, 0, index)
@@ -1423,15 +1420,10 @@ class AnalysisPage(QWidget):
             axis = self.plot.getAxis(axis_name)
             axis.setPen(pg.mkPen("#3A3D45"))
             axis.setTextPen(pg.mkPen("#6C7280"))
-        self.plot.setLabel("left", "BPM")
+        self.plot.setLabel("left", "Value")
         self.plot.setLabel("bottom", "Last 60s")
         self._curves = {}
-        palette = [THEME["blue_bright"], THEME["green"], THEME["orange"], THEME["cyan"]]
-        for index, node_id in enumerate(NODE_IDS):
-            self._curves[node_id] = self.plot.plot(
-                [], [], pen=pg.mkPen(palette[index % len(palette)], width=2.0),
-                name=NODE_LABELS[node_id],
-            )
+        self._palette = [THEME["blue_bright"], THEME["green"], THEME["orange"], THEME["cyan"]]
         self.analysis_empty_label = QLabel("暂无可分析样本")
         self.analysis_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.analysis_empty_label.setObjectName("SubtleText")
@@ -1443,8 +1435,9 @@ class AnalysisPage(QWidget):
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         history: list[dict[str, Any]] = snapshot.get("history", [])
+        self._refresh_analysis_nodes(nodes)
         self._selected_node = int(self.analysis_node_combo.currentData() or 0)
-        self._metric_key = str(self.metric_combo.currentData() or "breath_bpm")
+        self._metric_key = str(self.metric_combo.currentData() or "motion_score")
         self._window_seconds = int(self.window_combo.currentData() or 0)
         filtered_history = self._analysis_history(history)
         self.analysis_empty_label.setVisible(not bool(filtered_history))
@@ -1460,7 +1453,7 @@ class AnalysisPage(QWidget):
         )
         online = sum(1 for n in nodes.values() if n.get("online"))
         self.stat_cards["online"].set_value(
-            f"{online} / {len(nodes) or len(NODE_IDS)}", "生命体征节点",
+            f"{online} / {len(nodes)}", "已发现节点",
             THEME["green"] if online else None,
         )
 
@@ -1471,6 +1464,8 @@ class AnalysisPage(QWidget):
             return
         self._last_plot_at = now
 
+        for node_id in sorted(nodes):
+            self._ensure_analysis_curve(node_id, _node_label(node_id, nodes.get(node_id)))
         for node_id, curve in self._curves.items():
             if self._selected_node and node_id != self._selected_node:
                 curve.setData([], [])
@@ -1482,6 +1477,38 @@ class AnalysisPage(QWidget):
         seconds = self._window_seconds or max(60, int(now - min((_float(s.get("timestamp"), now) for s in filtered_history), default=now)))
         self.plot.setXRange(-float(seconds), 0.0, padding=0)
         self.plot_title.setText(f"{self.metric_combo.currentText()} 趋势")
+
+    def _refresh_analysis_nodes(self, nodes: dict[int, dict[str, Any]]) -> None:
+        discovered = [
+            (node_id, _node_label(node_id, state))
+            for node_id, state in sorted(nodes.items())
+            if state.get("last_received") is not None
+        ]
+        discovered_ids = [node_id for node_id, _label in discovered]
+        if discovered == self._known_nodes:
+            return
+        current = int(self.analysis_node_combo.currentData() or 0)
+        self.analysis_node_combo.blockSignals(True)
+        self.analysis_node_combo.clear()
+        self.analysis_node_combo.addItem("全部节点", 0)
+        for node_id, label in discovered:
+            self.analysis_node_combo.addItem(label, node_id)
+        if current in discovered_ids:
+            self.analysis_node_combo.setCurrentIndex(discovered_ids.index(current) + 1)
+        else:
+            self.analysis_node_combo.setCurrentIndex(0)
+        self.analysis_node_combo.blockSignals(False)
+        self._known_nodes = discovered
+
+    def _ensure_analysis_curve(self, node_id: int, label: str) -> None:
+        if node_id in self._curves:
+            return
+        index = len(self._curves)
+        self._curves[node_id] = self.plot.plot(
+            [], [],
+            pen=pg.mkPen(self._palette[index % len(self._palette)], width=2.0),
+            name=label,
+        )
 
     def _on_analysis_control_changed(self) -> None:
         node_id = int(self.analysis_node_combo.currentData() or 0)
@@ -1520,7 +1547,7 @@ class DiagnosticsPage(QWidget):
         title = QLabel("技术诊断")
         title.setObjectName("SectionTitle")
         title.setStyleSheet("font-size: 19px; font-weight: 700;")
-        subtitle = QLabel("生命体征节点链路质量与网关状态")
+        subtitle = QLabel("已发现节点链路质量与网关状态")
         subtitle.setObjectName("SectionSub")
         layout.addWidget(title)
         layout.addWidget(subtitle)
@@ -1548,27 +1575,19 @@ class DiagnosticsPage(QWidget):
         link_layout.addWidget(link_title)
         link_layout.addSpacing(8)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(18)
-        grid.setVerticalSpacing(10)
+        self._link_grid = QGridLayout()
+        self._link_grid.setHorizontalSpacing(18)
+        self._link_grid.setVerticalSpacing(10)
         headers = ("节点", "状态", "RSSI", "SNR", "丢包率", "电池")
         for col, name in enumerate(headers):
             head = QLabel(name)
             head.setObjectName("ColHeader")
-            grid.addWidget(head, 0, col)
-
-        for row_index, node_id in enumerate(NODE_IDS, start=1):
-            cells: dict[str, QLabel] = {}
-            name = QLabel(NODE_LABELS[node_id])
-            name.setObjectName("NodeCode")
-            grid.addWidget(name, row_index, 0)
-            for col, key in enumerate(("status", "rssi", "snr", "loss", "battery"), start=1):
-                lbl = QLabel("--")
-                lbl.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px;")
-                grid.addWidget(lbl, row_index, col)
-                cells[key] = lbl
-            self._link_labels[node_id] = cells
-        link_layout.addLayout(grid)
+            self._link_grid.addWidget(head, 0, col)
+        self._link_empty = QLabel("等待 Gateway 节点接入")
+        self._link_empty.setObjectName("SubtleText")
+        self._link_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._link_grid.addWidget(self._link_empty, 1, 0, 1, len(headers))
+        link_layout.addLayout(self._link_grid)
         layout.addWidget(link_card)
 
         info_card = CardFrame()
@@ -1587,7 +1606,7 @@ class DiagnosticsPage(QWidget):
             ("afh", "自动频率跳变 (AFH)"),
             ("mesh", "多级网格中继"),
             ("presence", "存在感应阈值"),
-            ("gas", "气体检测阈值"),
+            ("gas", "气体原始值阈值"),
         ):
             row = QHBoxLayout()
             caption = QLabel(label)
@@ -1625,9 +1644,18 @@ class DiagnosticsPage(QWidget):
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         config: dict[str, Any] = snapshot.get("config", {})
 
-        for node_id, cells in self._link_labels.items():
+        discovered = [
+            (node_id, state)
+            for node_id, state in sorted(nodes.items())
+            if state.get("last_received") is not None
+        ]
+        self._link_empty.setVisible(not bool(discovered))
+
+        for node_id, state in discovered:
+            cells = self._ensure_link_row(node_id, _node_label(node_id, state))
             state = nodes.get(node_id, {})
             online = bool(state.get("online"))
+            cells["name"].setText(_node_label(node_id, state))
             cells["status"].setText("在线" if online else "离线")
             cells["status"].setStyleSheet(
                 f"color: {THEME['green'] if online else THEME['red']}; font-size: 14px; font-weight: 600;"
@@ -1639,7 +1667,10 @@ class DiagnosticsPage(QWidget):
             cells["loss"].setStyleSheet(
                 f"color: {THEME['red'] if loss >= 8 else THEME['text_soft']}; font-size: 14px;"
             )
-            cells["battery"].setText(f"{_float(state.get('battery')):.0f}%")
+            if state.get("battery") is None:
+                cells["battery"].setText("未上报")
+            else:
+                cells["battery"].setText(f"{_float(state.get('battery')):.0f}%")
 
         self.info_labels["gateway"].setText(GATEWAY_ID)
         self.info_labels["control"].setText(str(config.get("control_id", CONTROL_ID)))
@@ -1649,10 +1680,28 @@ class DiagnosticsPage(QWidget):
         self.info_labels["afh"].setText("开启" if config.get("afh_enabled") else "关闭")
         self.info_labels["mesh"].setText("开启" if config.get("mesh_enabled") else "关闭")
         self.info_labels["presence"].setText(f"{_float(config.get('presence_threshold')) * 100:.0f}%")
-        self.info_labels["gas"].setText(f"{_float(config.get('gas_threshold')):.0f} ppm")
+        self.info_labels["gas"].setText(f"{_float(config.get('gas_threshold')):.0f}")
         report = str(snapshot.get("diagnostics_report") or "")
         if report:
             self.report_box.setText(report)
+
+    def _ensure_link_row(self, node_id: int, label: str) -> dict[str, QLabel]:
+        cells = self._link_labels.get(node_id)
+        if cells is not None:
+            return cells
+        row_index = len(self._link_labels) + 2
+        cells = {}
+        name = QLabel(label)
+        name.setObjectName("NodeCode")
+        self._link_grid.addWidget(name, row_index, 0)
+        cells["name"] = name
+        for col, key in enumerate(("status", "rssi", "snr", "loss", "battery"), start=1):
+            lbl = QLabel("--")
+            lbl.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px;")
+            self._link_grid.addWidget(lbl, row_index, col)
+            cells[key] = lbl
+        self._link_labels[node_id] = cells
+        return cells
 
     def _copy_report(self) -> None:
         QApplication.clipboard().setText(self.report_box.toPlainText())
@@ -1674,6 +1723,7 @@ class HistoryPage(QWidget):
         super().__init__()
         self._last_refresh_at = 0.0
         self._latest_filtered: list[dict[str, Any]] = []
+        self._known_nodes: list[tuple[int, str]] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -1693,8 +1743,6 @@ class HistoryPage(QWidget):
         header.addStretch(1)
         self.history_node_combo = QComboBox()
         self.history_node_combo.addItem("全部节点", 0)
-        for node_id in NODE_IDS:
-            self.history_node_combo.addItem(NODE_LABELS[node_id], node_id)
         self.history_node_combo.currentIndexChanged.connect(lambda: setattr(self, "_last_refresh_at", 0.0))
         self.history_limit_combo = QComboBox()
         for label, limit in (("最新 200", 200), ("最新 500", 500), ("全部", 0)):
@@ -1738,7 +1786,9 @@ class HistoryPage(QWidget):
         layout.addWidget(self.table, 1)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
+        nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         history: list[dict[str, Any]] = snapshot.get("history", [])
+        self._refresh_history_nodes(nodes)
         filtered = self._filter_history(history)
         self._latest_filtered = filtered
         self.subtitle.setText(f"最近 {len(history)} 条样本（当前筛选 {len(filtered)} 条）")
@@ -1778,6 +1828,29 @@ class HistoryPage(QWidget):
         if not node_id:
             return list(history)
         return [sample for sample in history if int(sample.get("node_id") or 0) == node_id]
+
+    def _refresh_history_nodes(self, nodes: dict[int, dict[str, Any]]) -> None:
+        discovered = [
+            (node_id, _node_label(node_id, state))
+            for node_id, state in sorted(nodes.items())
+            if state.get("last_received") is not None
+        ]
+        discovered_ids = [node_id for node_id, _label in discovered]
+        if discovered == self._known_nodes:
+            return
+        current = int(self.history_node_combo.currentData() or 0)
+        self.history_node_combo.blockSignals(True)
+        self.history_node_combo.clear()
+        self.history_node_combo.addItem("全部节点", 0)
+        for node_id, label in discovered:
+            self.history_node_combo.addItem(label, node_id)
+        if current in discovered_ids:
+            self.history_node_combo.setCurrentIndex(discovered_ids.index(current) + 1)
+        else:
+            self.history_node_combo.setCurrentIndex(0)
+        self.history_node_combo.blockSignals(False)
+        self._known_nodes = discovered
+        self._last_refresh_at = 0.0
 
     def _show_sample_detail(self, row: int, _col: int) -> None:
         limit = int(self.history_limit_combo.currentData() or 0)

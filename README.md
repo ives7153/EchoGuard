@@ -95,11 +95,15 @@ idf.py -p COMx flash monitor
 ```powershell
 cd firmware\node
 idf.py set-target esp32s3
+idf.py menuconfig
 idf.py build
 idf.py -p COMx flash monitor
 ```
 
-其中 `COMx` 替换为节点开发板实际串口号，例如 `COM6`。
+其中 `COMx` 替换为节点开发板实际串口号，例如 `COM6`。每个实体节点烧录前，需要在
+`menuconfig -> Rescue Node Configuration -> Rescue node ID` 中设置唯一编号，
+例如 4 个节点分别设置为 `1 / 2 / 3 / 4`。Gateway 串口输出中的 `id` 会直接作为
+上位机的 `node{id}` 显示和多节点交叉研判依据。
 
 ### 上位机运行命令
 
