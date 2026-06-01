@@ -12,7 +12,7 @@ import time
 from typing import Any, Callable
 
 import pyqtgraph as pg
-from PyQt6.QtCore import QPropertyAnimation, QRectF, Qt, pyqtProperty, pyqtSignal
+from PyQt6.QtCore import QPointF, QPropertyAnimation, QRectF, Qt, QTimer, pyqtProperty, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractButton,
@@ -165,7 +165,7 @@ class CsiTrendPlot(CardFrame):
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
 
-        self.node_badge = QLabel("node1")
+        self.node_badge = QLabel("等待节点")
         self.node_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.rssi_badge = QLabel("RSSI: -- dBm")
         self.rssi_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -257,11 +257,17 @@ class CsiTrendPlot(CardFrame):
         self.plot.setXRange(-60.0, 0.0, padding=0)
         self.plot.setYRange(0.0, 1.0, padding=0)
 
-        self.node_badge.setText(NODE_LABELS.get(active_node, f"node{active_node}"))
+        label = str(node_state.get("label") or "").strip()
+        if not label:
+            label = NODE_LABELS.get(active_node, f"node{active_node}") if active_node > 0 else "等待节点"
+        self.node_badge.setText(label)
         # 中文注释：CSI 徽标显示 WiFi RSSI（较强），缺失时回退到 LoRa rssi。
         wifi_rssi = node_state.get("wifi_rssi")
-        rssi_value = _float(wifi_rssi if wifi_rssi is not None else node_state.get("rssi"))
-        self.rssi_badge.setText(f"RSSI: {rssi_value:.0f}dBm")
+        if active_node <= 0 or not node_state:
+            self.rssi_badge.setText("RSSI: -- dBm")
+        else:
+            rssi_value = _float(wifi_rssi if wifi_rssi is not None else node_state.get("rssi"))
+            self.rssi_badge.setText(f"RSSI: {rssi_value:.0f}dBm")
 
 
 # ---------------------------------------------------------------------------
@@ -343,12 +349,17 @@ class EventLogPanel(CardFrame):
 # 拓扑图
 # ---------------------------------------------------------------------------
 class TopologyWidget(QWidget):
-    """系统拓扑圆形图。"""
+    """Gateway 雷达式节点接入态势图。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.nodes: dict[int, dict[str, Any]] = {}
         self.setMinimumHeight(220)
+        self._anim_started_at = time.time()
+        self._timer = QTimer(self)
+        self._timer.setInterval(50)
+        self._timer.timeout.connect(self.update)
+        self._timer.start()
 
     def set_nodes(self, nodes: dict[int, dict[str, Any]]) -> None:
         self.nodes = nodes
@@ -364,13 +375,24 @@ class TopologyWidget(QWidget):
         painter.setBrush(QColor("#0C0D11"))
         painter.drawRoundedRect(rect, 10, 10)
 
-        center = rect.center()
-        radius = min(rect.width(), rect.height()) * 0.30
+        center = QPointF(rect.center())
+        outer_radius = min(rect.width(), rect.height()) * 0.36
 
         painter.setPen(QPen(QColor("#2A3445"), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        for scale in (0.55, 1.1, 1.65):
-            painter.drawEllipse(center, int(radius * scale), int(radius * scale))
+        for scale in (0.34, 0.67, 1.0):
+            ring = int(outer_radius * scale)
+            painter.drawEllipse(center, ring, ring)
+
+        painter.setPen(QPen(QColor("#172236"), 1))
+        painter.drawLine(int(center.x() - outer_radius), int(center.y()), int(center.x() + outer_radius), int(center.y()))
+        painter.drawLine(int(center.x()), int(center.y() - outer_radius), int(center.x()), int(center.y() + outer_radius))
+
+        sweep_angle = (time.time() - self._anim_started_at) * 1.35
+        sweep_end = self._point_at(center, outer_radius, sweep_angle)
+        sweep_pen = QPen(QColor(92, 173, 255, 120), 2)
+        painter.setPen(sweep_pen)
+        painter.drawLine(center, sweep_end)
 
         painter.setPen(QPen(QColor("#8DA8D8"), 1))
         painter.setBrush(QColor("#0F1118"))
@@ -380,32 +402,107 @@ class TopologyWidget(QWidget):
         painter.setBrush(QColor("#0C0D11"))
         painter.drawEllipse(center, 3, 3)
         painter.setPen(QPen(QColor("#E7EEFF"), 1))
-        painter.drawText(center.x() - 18, center.y() + 52, GATEWAY_ID)
+        painter.setFont(QFont("Microsoft YaHei", 8))
+        painter.drawText(int(center.x()) - 20, int(center.y()) + 52, GATEWAY_ID)
 
-        for node_id, pos in TOPOLOGY_NODE_POSITIONS.items():
-            state = self.nodes.get(node_id, {})
-            x = center.x() + pos[0] * radius * 1.7
-            y = center.y() + pos[1] * radius * 1.7
-            color = _rssi_color(_float(state.get("rssi")), bool(state.get("online")))
+        discovered_nodes = self._discovered_nodes()
+        if not discovered_nodes:
+            painter.setPen(QPen(QColor(THEME["muted"]), 1))
+            painter.setFont(QFont("Microsoft YaHei", 9))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom, "等待 Gateway 节点接入")
+            painter.end()
+            return
+
+        for node_id, state in discovered_nodes:
+            angle = self._node_angle(node_id)
+            distance = self._node_distance(_float(state.get("rssi")), outer_radius)
+            point = self._point_at(center, distance, angle)
+            online = bool(state.get("online"))
+            active = self._is_active_node(state)
+            color = self._node_color(state)
+            alpha = 130 if online else 55
 
             line_color = QColor(color)
-            line_color.setAlpha(110)
+            line_color.setAlpha(alpha)
             painter.setPen(QPen(line_color, 1))
-            painter.drawLine(center.x(), center.y(), int(x), int(y))
+            painter.drawLine(center, point)
+
+            pulse = self._pulse(node_id, online)
+            glow_radius = 15 + int(7 * pulse)
+            if active:
+                glow_radius += 8
 
             glow = QColor(color)
-            glow.setAlpha(55)
+            glow.setAlpha(82 if online else 28)
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(glow)
-            painter.drawEllipse(int(x) - 13, int(y) - 13, 26, 26)
+            painter.drawEllipse(point, glow_radius, glow_radius)
+            if active:
+                outer_glow = QColor(color)
+                outer_glow.setAlpha(42 + int(35 * pulse))
+                painter.setBrush(outer_glow)
+                painter.drawEllipse(point, glow_radius + 12, glow_radius + 12)
+
             painter.setBrush(QColor(color))
-            painter.drawEllipse(int(x) - 6, int(y) - 6, 12, 12)
+            node_radius = 6 + int(2 * pulse) if online else 5
+            painter.drawEllipse(point, node_radius, node_radius)
 
             painter.setPen(QPen(QColor("#E8ECF5"), 1))
             painter.setFont(QFont("Microsoft YaHei", 8))
-            painter.drawText(int(x) - 24, int(y) + 26, NODE_LABELS.get(node_id, f"SENS_{node_id:02d}"))
+            label = str(state.get("label") or "").strip() or NODE_LABELS.get(node_id, f"node{node_id}")
+            painter.drawText(int(point.x()) - 24, int(point.y()) + 28, label)
 
         painter.end()
+
+    def _discovered_nodes(self) -> list[tuple[int, dict[str, Any]]]:
+        discovered: list[tuple[int, dict[str, Any]]] = []
+        for raw_id, state in self.nodes.items():
+            try:
+                node_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if state.get("last_received") is None:
+                continue
+            discovered.append((node_id, state))
+        return sorted(discovered, key=lambda item: item[0])
+
+    def _node_angle(self, node_id: int) -> float:
+        fixed_angles = {
+            1: -35.0,
+            2: -145.0,
+            3: 145.0,
+            4: 35.0,
+        }
+        return math.radians(fixed_angles.get(node_id, (node_id * 137.5 - 90.0) % 360.0))
+
+    def _node_distance(self, rssi: float, outer_radius: float) -> float:
+        if rssi >= -1.0:
+            return outer_radius * 0.78
+        clamped = max(-115.0, min(-45.0, rssi))
+        strength = (clamped + 115.0) / 70.0
+        return outer_radius * (0.96 - strength * 0.44)
+
+    def _point_at(self, center: QPointF, distance: float, angle: float) -> QPointF:
+        return QPointF(center.x() + math.cos(angle) * distance, center.y() + math.sin(angle) * distance)
+
+    def _pulse(self, node_id: int, online: bool) -> float:
+        if not online:
+            return 0.0
+        phase = (time.time() - self._anim_started_at) * 3.2 + node_id * 0.7
+        return (math.sin(phase) + 1.0) * 0.5
+
+    def _node_color(self, state: dict[str, Any]) -> str:
+        if not bool(state.get("online")):
+            return THEME["muted"]
+        if self._is_active_node(state):
+            return THEME["orange"]
+        return _rssi_color(_float(state.get("rssi")), True)
+
+    def _is_active_node(self, state: dict[str, Any]) -> bool:
+        presence = _score(state.get("presence_score"))
+        confidence = _score(state.get("confidence"))
+        motion = _score(state.get("motion_score"))
+        return (presence >= 0.5 and confidence >= 0.62) or motion >= 0.65
 
 
 # ---------------------------------------------------------------------------

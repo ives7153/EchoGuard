@@ -42,6 +42,7 @@ def parse_gateway_frame(line: str) -> dict[str, Any]:
         "rssi": 0.0,
         "timestamp": received_at,
         "source_ts_ms": None,
+        "node_label": "",
     }
 
     if not raw:
@@ -77,6 +78,7 @@ def parse_gateway_frame(line: str) -> dict[str, Any]:
             "humidity": _number(_first(payload, "hum", "humidity"), 0.0),
             "rssi": _number(_first(payload, "rssi"), 0.0),
             "source_ts_ms": _optional_int(_first(payload, "ts", "timestamp_ms")),
+            "node_label": _text(_first(payload, "name", "label", "node_name", "node_label")),
         }
     )
     return result
@@ -105,6 +107,13 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value).strip()
+    return text
 
 
 def _normalize_score(value: Any) -> float:

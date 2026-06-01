@@ -29,7 +29,6 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
-    QLineEdit,
     QMenu,
     QPushButton,
     QScrollArea,
@@ -147,21 +146,20 @@ class DashboardPage(QWidget):
         controls.setSpacing(10)
         self.node_combo = QComboBox()
         self.node_combo.setFixedWidth(140)
-        for node_id in NODE_IDS:
-            self.node_combo.addItem(NODE_LABELS[node_id], node_id)
-        self.node_combo.currentIndexChanged.connect(
-            lambda: self.active_node_changed.emit(int(self.node_combo.currentData() or NODE_IDS[0]))
-        )
+        self.node_combo.addItem("等待节点接入", 0)
+        self.node_combo.setEnabled(False)
+        self.node_combo.currentIndexChanged.connect(self._on_focus_node_changed)
         self.pause_btn = QPushButton("暂停刷新")
         self.pause_btn.setObjectName("GhostButton")
         self.pause_btn.clicked.connect(self._toggle_pause)
-        detail_btn = QPushButton("节点详情")
-        detail_btn.setObjectName("GhostButton")
-        detail_btn.clicked.connect(self._show_active_node_detail)
+        self.detail_btn = QPushButton("节点详情")
+        self.detail_btn.setObjectName("GhostButton")
+        self.detail_btn.setEnabled(False)
+        self.detail_btn.clicked.connect(self._show_active_node_detail)
         controls.addWidget(QLabel("关注节点"))
         controls.addWidget(self.node_combo)
         controls.addWidget(self.pause_btn)
-        controls.addWidget(detail_btn)
+        controls.addWidget(self.detail_btn)
         controls.addStretch(1)
         layout.addLayout(controls)
 
@@ -173,7 +171,7 @@ class DashboardPage(QWidget):
         verdict_title_box.setSpacing(3)
         verdict_title = QLabel("综合研判结果")
         verdict_title.setObjectName("SectionTitle")
-        verdict_subtitle = QLabel("基于当前节点数据的辅助判断")
+        verdict_subtitle = QLabel("基于多节点最近数据的辅助判断")
         verdict_subtitle.setObjectName("SubtleText")
         verdict_title_box.addWidget(verdict_title)
         verdict_title_box.addWidget(verdict_subtitle)
@@ -194,9 +192,9 @@ class DashboardPage(QWidget):
         metrics = QGridLayout()
         metrics.setHorizontalSpacing(16)
         metrics.setVerticalSpacing(16)
-        self.metric_cards["motion"] = MetricCard("运动分值\n(MOTION SCORE)", "0.00", "等待数据")
-        self.metric_cards["presence"] = MetricCard("存在感应\n(PRESENCE)", "CLEAR", "未检测")
-        self.metric_cards["confidence"] = MetricCard("置信度\n(CONFIDENCE)", "-- %", "模型输出")
+        self.metric_cards["motion"] = MetricCard("当前节点运动\n(MOTION)", "0.00", "等待数据")
+        self.metric_cards["presence"] = MetricCard("当前节点存在\n(PRESENCE)", "CLEAR", "未检测")
+        self.metric_cards["confidence"] = MetricCard("当前节点置信度\n(CONFIDENCE)", "-- %", "模型输出")
         for index, card in enumerate(self.metric_cards.values()):
             metrics.addWidget(card, 0, index)
         layout.addLayout(metrics)
@@ -278,7 +276,7 @@ class DashboardPage(QWidget):
         topology_layout = QVBoxLayout(topology_card)
         topology_layout.setContentsMargins(18, 16, 18, 18)
         topology_layout.setSpacing(12)
-        title = QLabel("系统拓扑 (TOPOLOGY)")
+        title = QLabel("Gateway 雷达视图 (RADAR)")
         title.setObjectName("SectionTitle")
         topology_layout.addWidget(title)
         self.topology_widget = TopologyWidget()
@@ -320,17 +318,12 @@ class DashboardPage(QWidget):
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         history: list[dict[str, Any]] = snapshot.get("history", [])
         events: list[dict[str, Any]] = snapshot.get("events", [])
-        active_node = int(snapshot.get("active_node") or NODE_IDS[0])
-        active_state = nodes.get(active_node) or nodes.get(NODE_IDS[0], {})
+        requested_active = int(snapshot.get("active_node") or 0)
+        active_node = self._refresh_focus_nodes(nodes, requested_active)
+        active_state = nodes.get(active_node, {}) if active_node else {}
         self._latest_nodes = nodes
         self._latest_active_node = active_node
 
-        self.node_combo.blockSignals(True)
-        for index in range(self.node_combo.count()):
-            if int(self.node_combo.itemData(index) or 0) == active_node:
-                self.node_combo.setCurrentIndex(index)
-                break
-        self.node_combo.blockSignals(False)
         self._paused = bool(snapshot.get("paused"))
         self.pause_btn.setText("恢复刷新" if self._paused else "暂停刷新")
 
@@ -339,7 +332,7 @@ class DashboardPage(QWidget):
             return
 
         self.csi_plot.set_history(history, active_node, active_state)
-        self._update_verdict(active_node, active_state, history)
+        self._update_verdict(nodes, history)
         self._update_metric_cards(active_state)
         self._update_group_cards(active_state)
 
@@ -355,6 +348,36 @@ class DashboardPage(QWidget):
         self._paused = not self._paused
         self.pause_toggled.emit(self._paused)
 
+    def _on_focus_node_changed(self) -> None:
+        node_id = int(self.node_combo.currentData() or 0)
+        if node_id > 0:
+            self.active_node_changed.emit(node_id)
+
+    def _refresh_focus_nodes(self, nodes: dict[int, dict[str, Any]], active_node: int) -> int:
+        discovered = [
+            (node_id, _node_label(node_id, state))
+            for node_id, state in sorted(nodes.items())
+            if state.get("last_received") is not None
+        ]
+        self.node_combo.blockSignals(True)
+        self.node_combo.clear()
+        if not discovered:
+            self.node_combo.addItem("等待节点接入", 0)
+            self.node_combo.setEnabled(False)
+            self.detail_btn.setEnabled(False)
+            self.node_combo.blockSignals(False)
+            return 0
+
+        discovered_ids = [node_id for node_id, _label in discovered]
+        selected = active_node if active_node in discovered_ids else discovered_ids[0]
+        for node_id, label in discovered:
+            self.node_combo.addItem(label, node_id)
+        self.node_combo.setEnabled(True)
+        self.detail_btn.setEnabled(True)
+        self.node_combo.setCurrentIndex(discovered_ids.index(selected))
+        self.node_combo.blockSignals(False)
+        return selected
+
     def _filter_events(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         level = self.event_filter.currentText()
         if level == "全部事件":
@@ -367,7 +390,7 @@ class DashboardPage(QWidget):
         state = nodes.get(node_id, {})
         _show_detail_dialog(
             self,
-            f"{NODE_LABELS.get(node_id, f'SENS_{node_id:02d}')} 节点详情",
+            f"{_node_label(node_id, state)} 节点详情",
             (
                 ("在线状态", "在线" if state.get("online") else "离线"),
                 ("Presence", f"{_score(state.get('presence_score')):.2f}"),
@@ -378,8 +401,8 @@ class DashboardPage(QWidget):
             ),
         )
 
-    def _update_verdict(self, active_node: int, state: dict[str, Any], history: list[dict[str, Any]]) -> None:
-        status, detail, color = _detection_state(active_node, state, history)
+    def _update_verdict(self, nodes: dict[int, dict[str, Any]], history: list[dict[str, Any]]) -> None:
+        status, detail, color = _multi_node_detection_state(nodes, history)
         self._last_verdict = (status, detail, color)
         self.verdict_status.setText(status)
         self.verdict_status.setStyleSheet(f"font-size: 22px; color: {color};")
@@ -539,9 +562,7 @@ class SensorMatrixPage(QWidget):
     afh_toggled = pyqtSignal(bool)
     mesh_toggled = pyqtSignal(bool)
     sync_requested = pyqtSignal()
-    add_node_requested = pyqtSignal(object)
     matrix_filter_changed = pyqtSignal(str)
-    matrix_remove_requested = pyqtSignal(int)
     matrix_maintenance_requested = pyqtSignal(int)
 
     def __init__(self) -> None:
@@ -578,7 +599,7 @@ class SensorMatrixPage(QWidget):
         title = QLabel("活动节点矩阵")
         title.setObjectName("SectionTitle")
         title.setStyleSheet("font-size: 19px; font-weight: 700;")
-        self.subtitle = QLabel("实时监控 0 个连接的 LoRa 节点状态")
+        self.subtitle = QLabel("已发现 0 个节点（在线 0）")
         self.subtitle.setObjectName("SectionSub")
         title_box.addWidget(title)
         title_box.addWidget(self.subtitle)
@@ -588,15 +609,7 @@ class SensorMatrixPage(QWidget):
         self.filter_btn = QPushButton("≡  筛选：全部")
         self.filter_btn.setObjectName("GhostButton")
         self.filter_btn.clicked.connect(self._open_filter_menu)
-        delete_btn = QPushButton("删除节点")
-        delete_btn.setObjectName("DangerButton")
-        delete_btn.clicked.connect(self._open_delete_node_dialog)
-        add_btn = QPushButton("+  新增节点")
-        add_btn.setObjectName("PrimaryButton")
-        add_btn.clicked.connect(self._open_add_node_dialog)
         header.addWidget(self.filter_btn)
-        header.addWidget(delete_btn)
-        header.addWidget(add_btn)
         layout.addLayout(header)
 
         # 表格卡片
@@ -614,6 +627,11 @@ class SensorMatrixPage(QWidget):
         self.rows_layout = QVBoxLayout(self.rows_host)
         self.rows_layout.setContentsMargins(0, 0, 0, 0)
         self.rows_layout.setSpacing(0)
+        self.empty_matrix_label = QLabel("等待 Gateway 节点接入")
+        self.empty_matrix_label.setObjectName("SubtleText")
+        self.empty_matrix_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_matrix_label.setStyleSheet(f"color: {THEME['muted']}; padding: 24px;")
+        self.rows_layout.addWidget(self.empty_matrix_label)
         self.rows_layout.addStretch(1)
         self.scroll.setWidget(self.rows_host)
         table_layout.addWidget(self.scroll, 1)
@@ -730,7 +748,7 @@ class SensorMatrixPage(QWidget):
 
         online = config.get("online_matrix", sum(1 for m in matrix if m.get("online")))
         total = config.get("total_matrix", len(matrix))
-        self.subtitle.setText(f"实时监控 {total} 个连接的 LoRa 节点状态（在线 {online}）")
+        self.subtitle.setText(f"已发现 {total} 个节点（在线 {online}）")
 
         # 原地构建/更新行
         visible_ids: set[int] = set()
@@ -749,6 +767,14 @@ class SensorMatrixPage(QWidget):
         for matrix_id, row in self._rows.items():
             if matrix_id not in visible_ids:
                 row.hide()
+        if not matrix:
+            self.empty_matrix_label.setText("等待 Gateway 节点接入")
+            self.empty_matrix_label.show()
+        elif not visible_ids:
+            self.empty_matrix_label.setText("当前筛选无匹配节点")
+            self.empty_matrix_label.show()
+        else:
+            self.empty_matrix_label.hide()
 
         last_sync = config.get("last_sync_at")
         if last_sync:
@@ -785,173 +811,21 @@ class SensorMatrixPage(QWidget):
         self._matrix_filter = key
         self.filter_btn.setText(f"≡  筛选：{label}")
         self.matrix_filter_changed.emit(key)
+        visible_count = 0
         for matrix_id, row in self._rows.items():
             state = self._latest_matrix.get(matrix_id, {})
-            row.setVisible(self._matrix_matches(state))
-
-    def _open_add_node_dialog(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("新增节点")
-        dialog.setMinimumWidth(430)
-        dialog.setStyleSheet(
-            f"QDialog {{ background: {THEME['bg']}; }}"
-            f"QLabel {{ color: {THEME['text_soft']}; }}"
-            f"QLineEdit {{ background: {THEME['card_alt']};"
-            f" border: 1px solid {THEME['border']}; border-radius: 8px;"
-            f" padding: 7px 10px; color: {THEME['text']}; }}"
-            f"QLineEdit:focus {{ border-color: {THEME['blue']}; }}"
-        )
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(14)
-
-        title = QLabel("添加观察节点")
-        title.setObjectName("SectionTitle")
-        title.setStyleSheet("font-size: 17px; font-weight: 700;")
-        layout.addWidget(title)
-
-        card = CardFrame()
-        form = QGridLayout(card)
-        form.setContentsMargins(16, 14, 16, 14)
-        form.setHorizontalSpacing(14)
-        form.setVerticalSpacing(12)
-
-        code_edit = QLineEdit(self._next_local_node_code())
-        bound_combo = QComboBox()
-        bound_combo.addItem("未绑定", None)
-        for node_id in NODE_IDS:
-            bound_combo.addItem(f"硬件 ID {node_id}", node_id)
-
-        fields = (
-            ("节点编号", code_edit),
-            ("绑定硬件 ID", bound_combo),
-        )
-        for row, (label_text, widget) in enumerate(fields):
-            label = QLabel(label_text)
-            label.setObjectName("SubtleText")
-            form.addWidget(label, row, 0)
-            form.addWidget(widget, row, 1)
-        layout.addWidget(card)
-
-        message = QLabel("仅添加到当前上位机列表，不写入硬件配置。当前固件未上报电池电量。")
-        message.setObjectName("SubtleText")
-        message.setWordWrap(True)
-        layout.addWidget(message)
-
-        footer = QHBoxLayout()
-        footer.addStretch(1)
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setObjectName("GhostButton")
-        confirm_btn = QPushButton("确认添加")
-        confirm_btn.setObjectName("PrimaryButton")
-        footer.addWidget(cancel_btn)
-        footer.addWidget(confirm_btn)
-        layout.addLayout(footer)
-
-        def submit() -> None:
-            code = code_edit.text().strip()
-            if not code:
-                message.setText("节点编号不能为空。")
-                message.setStyleSheet(f"color: {THEME['red_soft']};")
-                return
-            existing = {str(entry.get("code", "")).lower() for entry in self._latest_matrix.values()}
-            if code.lower() in existing:
-                message.setText("节点编号已存在，请换一个编号。")
-                message.setStyleSheet(f"color: {THEME['red_soft']};")
-                return
-            bound_node = bound_combo.currentData()
-            if bound_node is not None and any(
-                int(entry.get("bound_node") or 0) == int(bound_node)
-                for entry in self._latest_matrix.values()
-            ):
-                message.setText("该硬件 ID 已在当前列表中。")
-                message.setStyleSheet(f"color: {THEME['red_soft']};")
-                return
-            self.add_node_requested.emit(
-                {
-                    "code": code,
-                    "bound_node": bound_node,
-                }
-            )
-            dialog.accept()
-
-        cancel_btn.clicked.connect(dialog.reject)
-        confirm_btn.clicked.connect(submit)
-        dialog.exec()
-
-    def _open_delete_node_dialog(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("从列表移除节点")
-        dialog.setMinimumWidth(430)
-        dialog.setStyleSheet(
-            f"QDialog {{ background: {THEME['bg']}; }}"
-            f"QLabel {{ color: {THEME['text_soft']}; }}"
-        )
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(14)
-
-        title = QLabel("从列表移除节点")
-        title.setObjectName("SectionTitle")
-        title.setStyleSheet("font-size: 17px; font-weight: 700;")
-        layout.addWidget(title)
-
-        card = CardFrame()
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(16, 14, 16, 14)
-        card_layout.setSpacing(10)
-
-        matrix_nodes = list(self._latest_matrix.values())
-        node_combo = QComboBox()
-        for entry in sorted(matrix_nodes, key=lambda item: int(item.get("matrix_id") or 0)):
-            matrix_id = int(entry.get("matrix_id") or 0)
-            node_combo.addItem(f"{entry.get('code', f'node{matrix_id}')}  ·  ID {matrix_id}", matrix_id)
-
-        if matrix_nodes:
-            label = QLabel("选择要从当前列表移除的节点")
-            label.setObjectName("SubtleText")
-            card_layout.addWidget(label)
-            card_layout.addWidget(node_combo)
-            message_text = "仅影响本次运行内的上位机列表，不会向硬件下发删除命令。绑定节点再次上报后会自动恢复显示。"
+            visible = self._matrix_matches(state)
+            row.setVisible(visible)
+            if visible:
+                visible_count += 1
+        if not self._latest_matrix:
+            self.empty_matrix_label.setText("等待 Gateway 节点接入")
+            self.empty_matrix_label.show()
+        elif visible_count == 0:
+            self.empty_matrix_label.setText("当前筛选无匹配节点")
+            self.empty_matrix_label.show()
         else:
-            empty = QLabel("当前列表暂无可移除节点")
-            empty.setStyleSheet(f"color: {THEME['text']}; font-size: 14px; font-weight: 600;")
-            card_layout.addWidget(empty)
-            message_text = "请连接网关或先添加观察节点。"
-        layout.addWidget(card)
-
-        message = QLabel(message_text)
-        message.setObjectName("SubtleText")
-        message.setWordWrap(True)
-        layout.addWidget(message)
-
-        footer = QHBoxLayout()
-        footer.addStretch(1)
-        cancel_btn = QPushButton("取消")
-        cancel_btn.setObjectName("GhostButton")
-        confirm_btn = QPushButton("确认移除")
-        confirm_btn.setObjectName("DangerButton")
-        confirm_btn.setEnabled(bool(matrix_nodes))
-        footer.addWidget(cancel_btn)
-        footer.addWidget(confirm_btn)
-        layout.addLayout(footer)
-
-        def submit() -> None:
-            matrix_id = node_combo.currentData()
-            if matrix_id is not None:
-                self.matrix_remove_requested.emit(int(matrix_id))
-            dialog.accept()
-
-        cancel_btn.clicked.connect(dialog.reject)
-        confirm_btn.clicked.connect(submit)
-        dialog.exec()
-
-    def _next_local_node_code(self) -> str:
-        matrix_ids = [int(entry.get("matrix_id") or 0) for entry in self._latest_matrix.values()]
-        matrix_ids.extend(self._rows.keys())
-        return f"node{max(matrix_ids, default=0) + 1}"
+            self.empty_matrix_label.hide()
 
     def _visible_matrix(self, matrix: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [entry for entry in matrix if self._matrix_matches(entry)]
@@ -974,11 +848,8 @@ class SensorMatrixPage(QWidget):
         detail_action.triggered.connect(lambda: self._show_matrix_detail(state))
         maintenance_action = QAction("取消维护标记" if state.get("maintenance") else "标记维护", self)
         maintenance_action.triggered.connect(lambda: self.matrix_maintenance_requested.emit(int(matrix_id)))
-        remove_action = QAction("从列表移除", self)
-        remove_action.triggered.connect(lambda: self.matrix_remove_requested.emit(int(matrix_id)))
         menu.addAction(detail_action)
         menu.addAction(maintenance_action)
-        menu.addAction(remove_action)
         row = self._rows.get(int(matrix_id))
         anchor = row.menu_btn if row else self
         menu.exec(anchor.mapToGlobal(anchor.rect().bottomLeft()))
@@ -1519,23 +1390,84 @@ def _show_detail_dialog(parent: QWidget, title: str, rows: tuple[tuple[str, Any]
     dialog.exec()
 
 
-def _detection_state(
-    active_node: int,
-    state: dict[str, Any],
+def _multi_node_detection_state(
+    nodes: dict[int, dict[str, Any]],
     history: list[dict[str, Any]],
+    window_seconds: float = 5.0,
 ) -> tuple[str, str, str]:
-    label = NODE_LABELS.get(active_node, f"node{active_node}")
-    if not history or state.get("last_received") is None:
-        return "等待数据", f"{label} 尚未收到有效帧", THEME["muted"]
-    if not state.get("online"):
-        return "节点离线", f"{label} 最近未更新，请检查节点或网关链路", THEME["orange"]
+    if not history:
+        return "等待数据", "参与节点：0；等待 Gateway 串口数据", THEME["muted"]
 
-    presence = _score(state.get("presence_score"))
-    confidence = _score(state.get("confidence"))
-    if presence >= 0.5 and confidence >= 0.62:
-        hint = f"{label} 存在分值 {presence * 100:.0f}%，置信度 {confidence * 100:.0f}%"
-        return "疑似生命微动", hint, THEME["green"]
-    return "未检测到稳定微动", f"{label} 有数据输入，但暂未达到稳定微动阈值", THEME["blue_soft"]
+    reference_ts = time.time()
+    recent = [
+        sample for sample in history
+        if reference_ts - _float(sample.get("timestamp"), reference_ts) <= window_seconds
+    ]
+    latest_by_node: dict[int, dict[str, Any]] = {}
+    for sample in recent:
+        node_id = int(sample.get("node_id") or 0)
+        if node_id <= 0:
+            continue
+        if _float(sample.get("timestamp")) >= _float(latest_by_node.get(node_id, {}).get("timestamp")):
+            latest_by_node[node_id] = sample
+
+    participants = sorted(latest_by_node)
+    if not participants:
+        return "等待数据", "参与节点：0；等待有效节点样本", THEME["muted"]
+
+    triggered: list[int] = []
+    for node_id, sample in latest_by_node.items():
+        node_state = nodes.get(node_id, {})
+        presence = _score(sample.get("presence_score", node_state.get("presence_score")))
+        confidence = _score(sample.get("confidence", node_state.get("confidence")))
+        if presence >= 0.5 and confidence >= 0.62:
+            triggered.append(node_id)
+
+    participant_text = f"参与节点：{len(participants)}"
+    trigger_text = "触发节点：" + (
+        ", ".join(_node_label(node_id, nodes.get(node_id, {})) for node_id in sorted(triggered))
+        if triggered
+        else "无"
+    )
+    window_text = f"时间窗口：最近 {window_seconds:.0f} 秒"
+    if len(participants) == 1:
+        if triggered:
+            return (
+                "疑似局部微动",
+                f"{participant_text}；{trigger_text}；{window_text}；建议继续采集，等待多节点支持",
+                THEME["orange"],
+            )
+        return (
+            "数据不足",
+            f"{participant_text}；{trigger_text}；{window_text}；建议等待更多节点上报",
+            THEME["orange"],
+        )
+    if len(triggered) >= 2:
+        return (
+            "多节点疑似生命微动",
+            f"{participant_text}；{trigger_text}；{window_text}；建议继续采集观察",
+            THEME["green"],
+        )
+    if len(triggered) == 1:
+        return (
+            "疑似局部微动",
+            f"{participant_text}；{trigger_text}；{window_text}；单节点触发，建议继续观察",
+            THEME["orange"],
+        )
+    return (
+        "未检测到稳定微动",
+        f"{participant_text}；{trigger_text}；{window_text}；多节点暂未达到稳定阈值",
+        THEME["blue_soft"],
+    )
+
+
+def _node_label(node_id: int, state: dict[str, Any] | None = None) -> str:
+    label = str((state or {}).get("label") or "").strip()
+    if label:
+        return label
+    if node_id <= 0:
+        return "等待节点接入"
+    return NODE_LABELS.get(node_id, f"node{node_id}")
 
 
 def _matrix_advice(state: dict[str, Any]) -> tuple[str, str]:
