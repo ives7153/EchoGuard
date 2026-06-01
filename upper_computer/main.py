@@ -54,8 +54,6 @@ def main() -> int:
     window.mesh_toggled.connect(manager.set_mesh_enabled)
     window.sync_requested.connect(manager.sync_global_config)
     window.matrix_filter_changed.connect(manager.set_matrix_filter)
-    window.add_node_requested.connect(manager.add_local_matrix_node)
-    window.matrix_remove_requested.connect(manager.remove_local_matrix_node)
     window.matrix_maintenance_requested.connect(manager.toggle_matrix_maintenance)
     window.diagnostics_requested.connect(manager.generate_diagnostics_report)
 

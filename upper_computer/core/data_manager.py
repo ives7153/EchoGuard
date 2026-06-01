@@ -36,7 +36,6 @@ try:
         MAX_HISTORY_ROWS,
         NODE_IDS,
         NODE_LABELS,
-        NODE_MATRIX,
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
         UI_REFRESH_MS,
@@ -66,7 +65,6 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         MAX_HISTORY_ROWS,
         NODE_IDS,
         NODE_LABELS,
-        NODE_MATRIX,
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
         UI_REFRESH_MS,
@@ -225,19 +223,8 @@ class DataManager(QObject):
             for node_id in NODE_IDS
         }
 
-        # LoRa 节点矩阵（14 个）
-        # 中文注释：矩阵结构来自配置常量，初始全部离线/未激活；只有绑定真实固件
-        # 节点的行才会随真实串口数据上线，未绑定的行保持离线占位，不再注入模拟数据。
+        # LoRa 节点矩阵由 Gateway 串口帧自动发现；未收到真实数据前保持空表。
         self.matrix: dict[int, MatrixNodeState] = {}
-        for entry in NODE_MATRIX:
-            self.matrix[entry["matrix_id"]] = MatrixNodeState(
-                matrix_id=entry["matrix_id"],
-                code=entry["code"],
-                mode=entry["mode"],
-                bound_node=entry.get("bound_node"),
-                battery=None,
-            )
-        self._removed_matrix_nodes: dict[int, MatrixNodeState] = {}
 
         self._thread: QThread | None = None
         self._worker: SerialWorker | None = None
@@ -250,7 +237,6 @@ class DataManager(QObject):
         self._paused = False
         self._matrix_filter = "ALL"
         self._diagnostics_report = ""
-        self._local_matrix_next_id = max(self.matrix) + 1 if self.matrix else 1
         self._presence_flags = {node_id: False for node_id in NODE_IDS}
         self._breath_lock_flags = {node_id: False for node_id in NODE_IDS}
         self._offline_flags = {node_id: False for node_id in NODE_IDS}
@@ -426,50 +412,6 @@ class DataManager(QObject):
     @pyqtSlot(str)
     def set_matrix_filter(self, value: str) -> None:
         self._matrix_filter = str(value or "ALL")
-        self._dirty = True
-
-    @pyqtSlot(object)
-    def add_local_matrix_node(self, options: object | None = None) -> None:
-        """添加一个本次运行内的观察节点，不写入硬件配置。"""
-
-        payload = options if isinstance(options, dict) else {}
-        matrix_id = self._local_matrix_next_id
-        self._local_matrix_next_id += 1
-        code = str(payload.get("code") or f"node{matrix_id}").strip() or f"node{matrix_id}"
-        existing_codes = {state.code.lower() for state in self.matrix.values()}
-        if code.lower() in existing_codes:
-            code = f"node{matrix_id}"
-        bound_node = _optional_int(payload.get("bound_node"))
-        active_bound_nodes = {state.bound_node for state in self.matrix.values() if state.bound_node is not None}
-        if bound_node in active_bound_nodes:
-            bound_node = None
-        self.matrix[matrix_id] = MatrixNodeState(
-            matrix_id=matrix_id,
-            code=code,
-            mode="NORMAL",
-            bound_node=bound_node if bound_node in self.nodes else None,
-            online=False,
-            rssi=-110.0,
-            battery=None,
-            local=True,
-        )
-        bind_text = f"，绑定硬件 ID {bound_node}" if bound_node in self.nodes else ""
-        self._append_event("NODE WATCH ADDED", f"已添加观察节点 {code}{bind_text}", level="OK", kind="matrix")
-        self._dirty = True
-
-    @pyqtSlot(int)
-    def remove_local_matrix_node(self, matrix_id: int) -> None:
-        """从当前列表移除节点；不向硬件下发删除命令。"""
-
-        matrix_id = int(matrix_id)
-        state = self.matrix.get(matrix_id)
-        if state is None:
-            return
-        del self.matrix[matrix_id]
-        if state.bound_node is not None:
-            state.online = False
-            self._removed_matrix_nodes[matrix_id] = state
-        self._append_event("NODE REMOVED", f"已从当前列表移除 {state.code}", level="WARN", kind="matrix")
         self._dirty = True
 
     @pyqtSlot(int)
@@ -683,35 +625,55 @@ class DataManager(QObject):
         self.latest_frame_changed.emit(f"最新帧：{parsed.get('raw', raw_line)}")
         if self._paused:
             return
-        self._restore_matrix_for_node(int(parsed.get("node_id") or 0))
         self._apply_sample(parsed)
 
     # ------------------------------------------------------------------ LoRa 矩阵
+    def _ensure_node_state(self, node_id: int) -> NodeState | None:
+        """确保真实上报的节点 ID 可以进入上位机状态表。"""
+
+        if node_id <= 0:
+            return None
+        if node_id not in self.nodes:
+            self.nodes[node_id] = NodeState(
+                node_id=node_id,
+                label=NODE_LABELS.get(node_id, f"node{node_id}"),
+                battery=100.0,
+            )
+            self._presence_flags[node_id] = False
+            self._breath_lock_flags[node_id] = False
+            self._offline_flags[node_id] = False
+            self._gas_alert_flags[node_id] = False
+        return self.nodes[node_id]
+
+    def _ensure_matrix_node(self, node_id: int) -> MatrixNodeState | None:
+        """按真实 Gateway 帧自动创建节点管理表行。"""
+
+        if node_id <= 0:
+            return None
+        state = self.matrix.get(node_id)
+        if state is None:
+            state = MatrixNodeState(
+                matrix_id=node_id,
+                code=NODE_LABELS.get(node_id, f"node{node_id}"),
+                mode="NORMAL",
+                bound_node=node_id,
+                battery=None,
+            )
+            self.matrix[node_id] = state
+            self._append_event("NODE DISCOVERED", f"已发现节点 {state.code}", node_id=node_id, level="OK", kind="matrix")
+        return state
+
     def _refresh_matrix_node(self, state: MatrixNodeState, now: float) -> None:
-        """根据绑定的真实节点刷新一行矩阵状态；未绑定真实节点的行保持离线占位。"""
+        """根据绑定的真实节点刷新一行矩阵状态。"""
 
         if state.bound_node is not None and state.bound_node in self.nodes:
-            # 绑定真实固件节点：RSSI 与在线状态来自真实数据管线。
             src = self.nodes[state.bound_node]
             state.online = src.online and state.mode != "SLEEP"
-            if src.rssi:
-                state.rssi = src.rssi
-            if src.last_received is not None:
-                state.last_received = src.last_received
+            state.rssi = src.rssi
+            state.last_received = src.last_received
         else:
-            # 未绑定真实节点：没有真实数据来源，保持离线占位。
             state.online = False
-
         state.health = self._derive_health(state)
-
-    def _restore_matrix_for_node(self, node_id: int) -> None:
-        if node_id <= 0:
-            return
-        for matrix_id, state in list(self._removed_matrix_nodes.items()):
-            if state.bound_node == node_id:
-                self.matrix[matrix_id] = state
-                del self._removed_matrix_nodes[matrix_id]
-                self._append_event("NODE RESTORED", f"{state.code} 收到串口数据，已恢复到列表", level="OK", kind="matrix")
 
     def _derive_health(self, state: MatrixNodeState) -> str:
         """从运行模式 / RSSI 推导运行健康度；当前固件未上报电池。"""
@@ -729,12 +691,18 @@ class DataManager(QObject):
     # ------------------------------------------------------------------ 样本应用
     def _apply_sample(self, sample: dict[str, Any]) -> None:
         node_id = int(sample.get("node_id") or 0)
-        if node_id not in self.nodes:
+        node = self._ensure_node_state(node_id)
+        matrix_state = self._ensure_matrix_node(node_id)
+        if node is None:
             return
 
         now = float(sample.get("timestamp") or time.time())
-        node = self.nodes[node_id]
         was_online = node.online
+        label = str(sample.get("node_label") or "").strip()
+        if label:
+            node.label = label
+            if matrix_state is not None:
+                matrix_state.code = label
 
         node.online = True
         node.rssi = _float(sample.get("rssi"))
@@ -751,13 +719,15 @@ class DataManager(QObject):
         node.temperature = _float(sample.get("temperature", sample.get("temp")))
         node.humidity = _float(sample.get("humidity", sample.get("hum")))
         node.source = str(sample.get("source", "serial"))
+        if matrix_state is not None:
+            self._refresh_matrix_node(matrix_state, now)
 
         enriched = dict(sample)
         enriched.update(
             {
                 "timestamp": now,
                 "node_id": node_id,
-                "node_code": NODE_LABELS.get(node_id, f"SENS_{node_id:02d}"),
+                "node_code": node.label,
                 "wifi_rssi": node.wifi_rssi,
                 "snr": node.snr,
                 "packet_loss": node.packet_loss,
@@ -786,7 +756,7 @@ class DataManager(QObject):
             alarm_node = int(alarm.get("node_id") or node_id)
             self._append_event(
                 str(alarm.get("title", "SYSTEM ALARM")),
-                f"{NODE_LABELS.get(alarm_node, f'node{alarm_node}')} {alarm.get('message', '规则报警')}",
+                f"{self._node_label(alarm_node)} {alarm.get('message', '规则报警')}",
                 node_id=alarm_node,
                 level=str(alarm.get("level", "ALARM")),
                 kind=str(alarm.get("kind", "alarm")),
@@ -826,6 +796,8 @@ class DataManager(QObject):
         if self._serial_connected:
             for node in self.nodes.values():
                 last = node.last_received
+                if last is None:
+                    continue
                 is_online = bool(last is not None and now - float(last) <= OFFLINE_SECONDS)
                 if node.online and not is_online:
                     node.online = False
@@ -840,11 +812,16 @@ class DataManager(QObject):
                         kind="offline",
                     )
 
-            for alarm in self.alarm_engine.evaluate(None, self._node_dicts(), now):
+            discovered_nodes = {
+                node_id: state
+                for node_id, state in self._node_dicts().items()
+                if state.get("last_received") is not None
+            }
+            for alarm in self.alarm_engine.evaluate(None, discovered_nodes, now):
                 alarm_node = int(alarm.get("node_id") or 0)
                 self._append_event(
                     str(alarm.get("title", "节点离线")),
-                    f"{NODE_LABELS.get(alarm_node, f'node{alarm_node}')} {alarm.get('message', '节点离线')}",
+                    f"{self._node_label(alarm_node)} {alarm.get('message', '节点离线')}",
                     node_id=alarm_node,
                     level=str(alarm.get("level", "ALARM")),
                     kind=str(alarm.get("kind", "offline")),
@@ -912,6 +889,12 @@ class DataManager(QObject):
 
     def _node_dicts(self) -> dict[int, dict[str, Any]]:
         return {node_id: node.to_dict() for node_id, node in self.nodes.items()}
+
+    def _node_label(self, node_id: int) -> str:
+        node = self.nodes.get(node_id)
+        if node is not None and node.label:
+            return node.label
+        return NODE_LABELS.get(node_id, f"node{node_id}")
 
 
 def _float(value: Any, default: float = 0.0) -> float:

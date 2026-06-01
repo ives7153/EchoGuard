@@ -119,8 +119,6 @@ class MainWindow(QMainWindow):
     mesh_toggled = pyqtSignal(bool)
     sync_requested = pyqtSignal()
     matrix_filter_changed = pyqtSignal(str)
-    add_node_requested = pyqtSignal(object)
-    matrix_remove_requested = pyqtSignal(int)
     matrix_maintenance_requested = pyqtSignal(int)
     diagnostics_requested = pyqtSignal()
 
@@ -293,8 +291,6 @@ class MainWindow(QMainWindow):
         self.sensor_page.mesh_toggled.connect(self.mesh_toggled.emit)
         self.sensor_page.sync_requested.connect(self.sync_requested.emit)
         self.sensor_page.matrix_filter_changed.connect(self.matrix_filter_changed.emit)
-        self.sensor_page.add_node_requested.connect(self.add_node_requested.emit)
-        self.sensor_page.matrix_remove_requested.connect(self.matrix_remove_requested.emit)
         self.sensor_page.matrix_maintenance_requested.connect(self.matrix_maintenance_requested.emit)
 
         # 分析 / 诊断页动作
