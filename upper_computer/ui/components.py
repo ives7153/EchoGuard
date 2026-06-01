@@ -529,7 +529,7 @@ class ModeTag(QLabel):
 
 
 class BatteryBar(QWidget):
-    """电池电量条 + 百分比文本。"""
+    """电池状态条；固件未上报时显示“未上报”。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)

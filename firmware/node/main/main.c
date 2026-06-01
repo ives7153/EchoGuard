@@ -23,7 +23,10 @@
 #include "nvs_flash.h"
 
 /* 节点基本信息：STA 连接 Gateway 开放 SoftAP，用于获得稳定的 WiFi 包流并触发 CSI 回调。 */
-#define NODE_ID                         1
+#ifndef CONFIG_RESCUE_NODE_ID
+#define CONFIG_RESCUE_NODE_ID           1
+#endif
+#define NODE_ID                         CONFIG_RESCUE_NODE_ID
 #define WIFI_STA_SSID                   "RuView-Rescue-GW-01"
 #define WIFI_STA_CHANNEL_HINT           6
 

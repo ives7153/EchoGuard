@@ -15,7 +15,7 @@ try:
     from ..config import (
         ALARM_DEDUP_SECONDS,
         CONFIDENCE_THRESHOLD,
-        GAS_ALARM_PPM,
+        GAS_ALARM_RAW,
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
     )
@@ -23,7 +23,7 @@ except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
     from config import (
         ALARM_DEDUP_SECONDS,
         CONFIDENCE_THRESHOLD,
-        GAS_ALARM_PPM,
+        GAS_ALARM_RAW,
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
     )
@@ -48,13 +48,13 @@ class AlarmEngine:
         self,
         presence_threshold: float = PRESENCE_THRESHOLD,
         confidence_threshold: float = CONFIDENCE_THRESHOLD,
-        gas_alarm_ppm: float = GAS_ALARM_PPM,
+        gas_alarm_raw: float = GAS_ALARM_RAW,
         offline_seconds: float = OFFLINE_SECONDS,
         dedup_seconds: float = ALARM_DEDUP_SECONDS,
     ) -> None:
         self.presence_threshold = presence_threshold
         self.confidence_threshold = confidence_threshold
-        self.gas_alarm_ppm = gas_alarm_ppm
+        self.gas_alarm_raw = gas_alarm_raw
         self.offline_seconds = offline_seconds
         self.dedup_seconds = dedup_seconds
         self._last_alarm_at: dict[tuple[int, str], float] = {}
@@ -63,14 +63,17 @@ class AlarmEngine:
         self,
         presence_threshold: float | None = None,
         gas_alarm_ppm: float | None = None,
+        gas_alarm_raw: float | None = None,
         confidence_threshold: float | None = None,
     ) -> None:
         """从传感器页配置面板热更新阈值。"""
 
         if presence_threshold is not None:
             self.presence_threshold = float(presence_threshold)
-        if gas_alarm_ppm is not None:
-            self.gas_alarm_ppm = float(gas_alarm_ppm)
+        if gas_alarm_raw is not None:
+            self.gas_alarm_raw = float(gas_alarm_raw)
+        elif gas_alarm_ppm is not None:
+            self.gas_alarm_raw = float(gas_alarm_ppm)
         if confidence_threshold is not None:
             self.confidence_threshold = float(confidence_threshold)
 
@@ -92,7 +95,7 @@ class AlarmEngine:
 
         events: list[dict[str, Any]] = []
 
-        # ----- 单样本规则：生命微动 / 气体异常 -----
+        # ----- 单样本规则：生命微动 / 气体原始值异常 -----
         if sample and sample.get("valid", True):
             node_id = int(sample.get("node_id") or 0)
             presence = _score(sample, "presence_score", "presence")
@@ -105,8 +108,8 @@ class AlarmEngine:
                 and confidence > self.confidence_threshold
             ):
                 self._append(events, now, node_id, "life_motion", "疑似生命微动", level="ALARM")
-            if node_id > 0 and gas > self.gas_alarm_ppm:
-                self._append(events, now, node_id, "gas", "气体浓度超限", level="ALARM")
+            if node_id > 0 and gas > self.gas_alarm_raw:
+                self._append(events, now, node_id, "gas", "气体原始值异常", level="ALARM")
 
         # ----- 全局规则：节点离线（依赖 node_states 才判断，避免误报） -----
         if node_states is not None:

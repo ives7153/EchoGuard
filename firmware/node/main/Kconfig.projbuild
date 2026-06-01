@@ -1,0 +1,11 @@
+menu "Rescue Node Configuration"
+
+    config RESCUE_NODE_ID
+        int "Rescue node ID"
+        range 1 255
+        default 1
+        help
+            Unique node ID sent in the LoRa payload and Gateway JSON frame.
+            Set a different ID before flashing each physical rescue node.
+
+endmenu
