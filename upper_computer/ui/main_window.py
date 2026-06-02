@@ -186,7 +186,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(20, 0, 20, 0)
         layout.setSpacing(14)
 
-        brand = QLabel(f"{BRAND_NAME} {BRAND_VERSION}")
+        brand_text = f"{BRAND_NAME} {BRAND_VERSION}".strip()
+        brand = QLabel(brand_text)
         brand.setObjectName("AppTitle")
         layout.addWidget(brand)
 

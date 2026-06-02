@@ -13,14 +13,15 @@ from __future__ import annotations
 
 import sys
 
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 try:
-    from .config import APP_TITLE, WINDOW_TITLE, build_qss, load_ui_settings, set_theme_mode
+    from .config import APP_ICON_PATH, APP_TITLE, WINDOW_TITLE, build_qss, load_ui_settings, set_theme_mode
     from .core import DataManager
     from .ui import MainWindow
 except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
-    from config import APP_TITLE, WINDOW_TITLE, build_qss, load_ui_settings, set_theme_mode
+    from config import APP_ICON_PATH, APP_TITLE, WINDOW_TITLE, build_qss, load_ui_settings, set_theme_mode
     from core import DataManager
     from ui import MainWindow
 
@@ -29,12 +30,17 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setApplicationDisplayName(APP_TITLE)
+    app_icon = QIcon(str(APP_ICON_PATH))
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
     set_theme_mode(str(load_ui_settings().get("theme_mode", "dark")))
     app.setStyleSheet(build_qss())
 
     manager = DataManager()
     window = MainWindow()
     window.setWindowTitle(WINDOW_TITLE)
+    if not app_icon.isNull():
+        window.setWindowIcon(app_icon)
 
     # ---------------- UI -> DataManager ----------------
     window.refresh_ports_requested.connect(manager.refresh_ports)
