@@ -20,7 +20,10 @@ try:
     from .config import APP_ICON_PATH, APP_TITLE, WINDOW_TITLE, build_qss, load_ui_settings, set_theme_mode
     from .core import DataManager
     from .ui import MainWindow
-except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
+except ImportError:
+    if __package__:
+        raise
+    # 兼容 cd upper_computer 后直接 python main.py
     from config import APP_ICON_PATH, APP_TITLE, WINDOW_TITLE, build_qss, load_ui_settings, set_theme_mode
     from core import DataManager
     from ui import MainWindow

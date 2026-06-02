@@ -20,6 +20,8 @@ try:
         PRESENCE_THRESHOLD,
     )
 except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
     from config import (
         ALARM_DEDUP_SECONDS,
         CONFIDENCE_THRESHOLD,
