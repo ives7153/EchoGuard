@@ -42,9 +42,13 @@ try:
     from ..ai import (
         AISettings,
         LocalJinaRuntime,
+        create_jina_offline_package,
+        deploy_jina_package,
         fetch_llm_models,
         fetch_llm_models_result,
+        jina_deployment_status,
         load_ai_settings,
+        online_deploy_jina,
         run_ai_judgement,
         save_ai_settings,
         settings_from_dict,
@@ -85,9 +89,13 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
     from ai import (  # type: ignore
         AISettings,
         LocalJinaRuntime,
+        create_jina_offline_package,
+        deploy_jina_package,
         fetch_llm_models,
         fetch_llm_models_result,
+        jina_deployment_status,
         load_ai_settings,
+        online_deploy_jina,
         run_ai_judgement,
         save_ai_settings,
         settings_from_dict,
@@ -522,8 +530,75 @@ class DataManager(QObject):
             return
 
         settings = self.ai_settings.copy()
+        package_path = str(payload.get("package_path") or "").strip()
+
+        def emit_progress(progress: dict[str, Any]) -> None:
+            progress_message = str(progress.get("message") or "AI 操作执行中...")
+            progress_payload = {
+                "action": action,
+                "ok": True,
+                "running": True,
+                "message": progress_message,
+            }
+            progress_payload.update(progress)
+            self._ai_operation_result_ready.emit(progress_payload)
 
         def worker() -> dict[str, Any]:
+            if action == "check_jina_deployment":
+                status = jina_deployment_status(settings)
+                return {
+                    "action": action,
+                    "ok": True,
+                    "message": status["message"],
+                    "deployed": status["deployed"],
+                    "port_open": status.get("port_open", False),
+                    "server_path": status["server_path"],
+                    "model_path": status["model_path"],
+                    "endpoint": status["endpoint"],
+                    "provider": "local_jina",
+                    "real_request": False,
+                }
+            if action == "deploy_jina_package":
+                status = deploy_jina_package(settings, package_path, overwrite=True)
+                return {
+                    "action": action,
+                    "ok": True,
+                    "message": status["message"],
+                    "deployed": status["deployed"],
+                    "port_open": status.get("port_open", False),
+                    "server_path": status["server_path"],
+                    "model_path": status["model_path"],
+                    "endpoint": status["endpoint"],
+                    "provider": "local_jina",
+                    "real_request": False,
+                }
+            if action == "online_deploy_jina":
+                status = online_deploy_jina(settings, progress=emit_progress, overwrite=False)
+                return {
+                    "action": action,
+                    "ok": True,
+                    "message": status["message"],
+                    "deployed": status["deployed"],
+                    "port_open": status.get("port_open", False),
+                    "server_path": status["server_path"],
+                    "model_path": status["model_path"],
+                    "endpoint": status["endpoint"],
+                    "provider": "local_jina",
+                    "real_request": True,
+                }
+            if action == "create_jina_offline_package":
+                result = create_jina_offline_package(settings, package_path)
+                return {
+                    "action": action,
+                    "ok": True,
+                    "message": result["message"],
+                    "deployed": result["deployed"],
+                    "package_path": result["package_path"],
+                    "server_path": result["server_path"],
+                    "model_path": result["model_path"],
+                    "provider": "local_jina",
+                    "real_request": False,
+                }
             if action == "start_jina":
                 start_message = self.ai_runtime.start(settings)
                 ready = wait_for_embedding_ready(settings)
@@ -534,6 +609,22 @@ class DataManager(QObject):
                     "message": f"{start_message}；真实请求成功：POST {endpoint} · {ready['dimension']} 维",
                     "dimension": ready["dimension"],
                     "endpoint": endpoint,
+                    "provider": "local_jina",
+                    "real_request": True,
+                }
+            if action == "start_and_test_jina":
+                self.ai_runtime.start(settings)
+                ready = wait_for_embedding_ready(settings)
+                endpoint = f"{settings.jina_base_url.rstrip('/')}/v1/embeddings"
+                return {
+                    "action": action,
+                    "ok": True,
+                    "message": f"本地 Jina 可用：POST {endpoint} · {ready['dimension']} 维",
+                    "deployed": True,
+                    "dimension": ready["dimension"],
+                    "endpoint": endpoint,
+                    "server_path": settings.llama_server_path,
+                    "model_path": settings.jina_model_path,
                     "provider": "local_jina",
                     "real_request": True,
                 }
@@ -1227,6 +1318,15 @@ class DataManager(QObject):
         message = str(result.get("message") or "")
         action = str(result.get("action") or "")
         running = bool(result.get("running", False))
+        if ok and action in {"deploy_jina_package", "online_deploy_jina"}:
+            server_path = str(result.get("server_path") or "")
+            model_path = str(result.get("model_path") or "")
+            if server_path:
+                self.ai_settings.llama_server_path = server_path
+            if model_path:
+                self.ai_settings.jina_model_path = model_path
+            save_ai_settings(self.ai_settings)
+            result["config"] = asdict(self.ai_settings)
         self.ai_operation_result_changed.emit(result)
         self.ai_operation_message_changed.emit(message, ok)
         if "models" in result:
@@ -1238,7 +1338,7 @@ class DataManager(QObject):
         self.ai_state["config"] = asdict(self.ai_settings)
         if action == "stop_jina":
             self.ai_state["jina_running"] = False
-        if ok and action in {"test_embedding", "start_jina"}:
+        if ok and action in {"test_embedding", "start_jina", "start_and_test_jina"}:
             self.ai_state["source"] = "local_jina"
         self._dirty = True
 

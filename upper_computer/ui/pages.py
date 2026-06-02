@@ -190,10 +190,26 @@ class AISettingsDialog(QDialog):
         )
         main_layout.addLayout(self._field_row("服务地址", self.jina_url_edit))
         main_layout.addLayout(self._field_row("Embedding 模型名", self.embedding_model_edit))
+        self.jina_status_label = QLabel("部署状态：未检查")
+        self.jina_status_label.setObjectName("SubtleText")
+        self.jina_status_label.setWordWrap(True)
+        main_layout.addWidget(self.jina_status_label)
         jina_actions = QHBoxLayout()
         jina_actions.setSpacing(10)
+        online_deploy_btn = QPushButton("在线部署")
+        online_deploy_btn.setObjectName("PrimaryButton")
+        online_deploy_btn.clicked.connect(lambda: self._request_action("online_deploy_jina"))
+        deploy_btn = QPushButton("导入离线包")
+        deploy_btn.setObjectName("GhostButton")
+        deploy_btn.clicked.connect(self._deploy_jina_package)
+        package_btn = QPushButton("生成离线包")
+        package_btn.setObjectName("GhostButton")
+        package_btn.clicked.connect(self._create_jina_package)
+        one_key_start_btn = QPushButton("一键启动")
+        one_key_start_btn.setObjectName("PrimaryButton")
+        one_key_start_btn.clicked.connect(lambda: self._request_action("start_and_test_jina"))
         start_btn = QPushButton("启动本地 Jina")
-        start_btn.setObjectName("PrimaryButton")
+        start_btn.setObjectName("GhostButton")
         start_btn.clicked.connect(lambda: self._request_action("start_jina"))
         stop_btn = QPushButton("停止服务")
         stop_btn.setObjectName("GhostButton")
@@ -201,9 +217,17 @@ class AISettingsDialog(QDialog):
         test_embed_btn = QPushButton("测试 Embedding")
         test_embed_btn.setObjectName("GhostButton")
         test_embed_btn.clicked.connect(lambda: self._request_action("test_embedding"))
+        self._action_buttons["online_deploy_jina"] = online_deploy_btn
+        self._action_buttons["deploy_jina_package"] = deploy_btn
+        self._action_buttons["create_jina_offline_package"] = package_btn
+        self._action_buttons["start_and_test_jina"] = one_key_start_btn
         self._action_buttons["start_jina"] = start_btn
         self._action_buttons["stop_jina"] = stop_btn
         self._action_buttons["test_embedding"] = test_embed_btn
+        jina_actions.addWidget(online_deploy_btn)
+        jina_actions.addWidget(deploy_btn)
+        jina_actions.addWidget(package_btn)
+        jina_actions.addWidget(one_key_start_btn)
         jina_actions.addWidget(start_btn)
         jina_actions.addWidget(stop_btn)
         jina_actions.addWidget(test_embed_btn)
@@ -311,11 +335,20 @@ class AISettingsDialog(QDialog):
         if signal is not None:
             signal.emit()
 
-    def _request_action(self, action: str) -> None:
+    def request_deployment_check(self) -> None:
+        self._request_action("check_jina_deployment")
+
+    def _request_action(self, action: str, extra: dict[str, Any] | None = None) -> None:
         self._last_operation_active = True
         self._set_action_running(action, True)
         self.set_status(self._action_label(action) + "执行中...", True)
+        if action in {"check_jina_deployment", "deploy_jina_package", "online_deploy_jina", "create_jina_offline_package"}:
+            self.set_jina_status(self._action_label(action) + "执行中...", True)
+        elif action in {"start_jina", "start_and_test_jina"}:
+            self.set_jina_status("部署状态：服务启动中", True)
         payload = {"action": action, "config": self._collect_config()}
+        if extra:
+            payload.update(extra)
         self.action_requested.emit(payload)
 
     def _set_action_running(self, action: str, running: bool) -> None:
@@ -329,6 +362,11 @@ class AISettingsDialog(QDialog):
     def _action_label(self, action: str) -> str:
         return {
             "save": "保存设置",
+            "check_jina_deployment": "检查部署",
+            "online_deploy_jina": "在线部署",
+            "deploy_jina_package": "导入离线包",
+            "create_jina_offline_package": "生成离线包",
+            "start_and_test_jina": "一键启动",
             "start_jina": "启动本地 Jina",
             "stop_jina": "停止服务",
             "test_embedding": "测试 Embedding",
@@ -431,9 +469,39 @@ class AISettingsDialog(QDialog):
         if path:
             edit.setText(path)
 
+    def _deploy_jina_package(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "选择 EchoGuard-AI-Runtime.zip",
+            "",
+            "Zip Package (*.zip);;All Files (*)",
+        )
+        if not path:
+            self.set_jina_status("部署状态：已取消选择离线包", False)
+            return
+        self._request_action("deploy_jina_package", {"package_path": path})
+
+    def _create_jina_package(self) -> None:
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            "保存 EchoGuard-AI-Runtime.zip",
+            "EchoGuard-AI-Runtime.zip",
+            "Zip Package (*.zip);;All Files (*)",
+        )
+        if not path:
+            self.set_jina_status("部署状态：已取消生成离线包", False)
+            return
+        self._request_action("create_jina_offline_package", {"package_path": path})
+
     def set_status(self, text: str, ok: bool = True) -> None:
         self.status_label.setText(text)
         self.status_label.setStyleSheet(
+            f"color: {THEME['blue_soft'] if ok else THEME['red']}; font-size: 12px;"
+        )
+
+    def set_jina_status(self, text: str, ok: bool = True) -> None:
+        self.jina_status_label.setText(text)
+        self.jina_status_label.setStyleSheet(
             f"color: {THEME['blue_soft'] if ok else THEME['red']}; font-size: 12px;"
         )
 
@@ -458,6 +526,17 @@ class AISettingsDialog(QDialog):
         self._set_action_running(action, running)
         if "models" in result:
             self._apply_model_result(result)
+        if action in {
+            "check_jina_deployment",
+            "online_deploy_jina",
+            "deploy_jina_package",
+            "create_jina_offline_package",
+            "start_and_test_jina",
+            "start_jina",
+            "stop_jina",
+            "test_embedding",
+        }:
+            self._apply_jina_result(result)
         message = str(result.get("message") or "")
         if action == "fetch_models" and bool(result.get("ok", False)):
             count = len(result.get("models") or [])
@@ -498,6 +577,51 @@ class AISettingsDialog(QDialog):
             self.llm_model_combo.setCurrentText(model_values[0])
         self.llm_model_combo.blockSignals(False)
         self._refresh_model_button(model_values, str(result.get("model_source") or ""))
+
+    def _apply_jina_result(self, result: dict[str, Any]) -> None:
+        action = str(result.get("action") or "")
+        running = bool(result.get("running", False))
+        if running:
+            running_messages = {
+                "check_jina_deployment": "部署状态：检查中",
+                "online_deploy_jina": "部署状态：在线部署中",
+                "deploy_jina_package": "部署状态：部署中",
+                "create_jina_offline_package": "部署状态：正在生成离线包",
+                "start_jina": "部署状态：服务启动中",
+                "start_and_test_jina": "部署状态：服务启动中",
+                "test_embedding": "部署状态：测试中",
+            }
+            message = str(result.get("message") or "")
+            self.set_jina_status(message or running_messages.get(action, "部署状态：处理中"), True)
+            return
+
+        server_path = str(result.get("server_path") or "")
+        model_path = str(result.get("model_path") or "")
+        if server_path:
+            self.server_path_edit.setText(server_path)
+        if model_path:
+            self.model_path_edit.setText(model_path)
+
+        ok = bool(result.get("ok", False))
+        message = str(result.get("message") or "")
+        if ok and action in {"check_jina_deployment", "deploy_jina_package", "online_deploy_jina"}:
+            deployed = bool(result.get("deployed", False))
+            prefix = "部署状态：已部署" if deployed else "部署状态：未部署"
+            self.set_jina_status(f"{prefix} · {message}", deployed)
+        elif ok and action == "create_jina_offline_package":
+            package_path = str(result.get("package_path") or "")
+            self.set_jina_status(f"部署状态：离线包已生成 · {package_path or message}", True)
+        elif ok and action in {"start_jina", "start_and_test_jina", "test_embedding"}:
+            dimension = result.get("dimension")
+            endpoint = str(result.get("endpoint") or "")
+            if dimension:
+                self.set_jina_status(f"部署状态：本地 Jina 可用 · POST {endpoint} · {dimension} 维", True)
+            else:
+                self.set_jina_status(f"部署状态：{message or '本地 Jina 可用'}", True)
+        elif ok and action == "stop_jina":
+            self.set_jina_status("部署状态：服务已停止", True)
+        elif message:
+            self.set_jina_status(f"部署状态：{self._action_label(action)}失败 · {message}", False)
 
 
 # ===========================================================================
@@ -830,6 +954,7 @@ class DashboardPage(QWidget):
         dialog.fetch_models_requested.connect(self.ai_models_requested.emit)
         dialog.test_llm_requested.connect(self.ai_llm_test_requested.emit)
         dialog.finished.connect(lambda _code: setattr(self, "_ai_dialog", None))
+        dialog.request_deployment_check()
         dialog.exec()
 
     def set_ai_operation_message(self, text: str, ok: bool = True) -> None:
