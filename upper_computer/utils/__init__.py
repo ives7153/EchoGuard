@@ -1,5 +1,8 @@
-"""通用工具模块。"""
+"""Legacy utility namespace.
 
-from .export import export_samples_to_csv, take_screenshot
+The active PyQt upper computer uses :mod:`upper_computer.core.exporter` for
+CSV export and screenshots. This package stays importable for compatibility
+without pulling in the removed DearPyGui-based helpers during packaging.
+"""
 
-__all__ = ["export_samples_to_csv", "take_screenshot"]
+__all__: list[str] = []

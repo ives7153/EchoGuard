@@ -1239,7 +1239,7 @@ class SensorMatrixPage(QWidget):
         header.addLayout(title_box)
         header.addStretch(1)
 
-        self.filter_btn = QPushButton("≡  筛选：全部")
+        self.filter_btn = QPushButton("筛选：全部")
         self.filter_btn.setObjectName("GhostButton")
         self.filter_btn.clicked.connect(self._open_filter_menu)
         header.addWidget(self.filter_btn)
@@ -1354,7 +1354,7 @@ class SensorMatrixPage(QWidget):
 
         layout.addStretch(1)
 
-        sync_btn = QPushButton("↻  同步全局配置")
+        sync_btn = QPushButton("同步全局配置")
         sync_btn.setObjectName("SyncButton")
         sync_btn.clicked.connect(self.sync_requested.emit)
         layout.addWidget(sync_btn)
@@ -1439,7 +1439,7 @@ class SensorMatrixPage(QWidget):
 
     def _set_filter(self, key: str, label: str) -> None:
         self._matrix_filter = key
-        self.filter_btn.setText(f"≡  筛选：{label}")
+        self.filter_btn.setText(f"筛选：{label}")
         self.matrix_filter_changed.emit(key)
         visible_count = 0
         for matrix_id, row in self._rows.items():

@@ -1,5 +1,8 @@
-"""Dear PyGui 可视化模块。"""
+"""Legacy visualization namespace.
 
-from .dashboard import RescueDashboard
+The current upper computer is implemented with PyQt. This package is kept as
+an empty compatibility namespace so packaging does not import old DearPyGui
+code paths.
+"""
 
-__all__ = ["RescueDashboard"]
+__all__: list[str] = []

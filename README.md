@@ -137,4 +137,5 @@ python main.py
 - `docs/ai_auxiliary_judgement.md`：AI 辅助研判异步链路和实时规则边界说明。
 - `docs/ai_auxiliary_feature.md`：AI 辅助功能构造、原理、链路和回退策略说明。
 - `docs/local_jina_deployment.md`：本地 Jina GGUF 离线包一键部署和启动说明。
+- `docs/upper_computer_packaging.md`：Windows 上位机 PyInstaller 打包流程和验收说明。
 - `docs/`：项目卡、阶段报告、答辩材料和实验记录模板。
