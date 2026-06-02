@@ -99,14 +99,21 @@ class StatusPill(QLabel):
         super().__init__(text)
         self.setObjectName("StatusPill")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._text = text
+        self._ok = ok
         self.set_state(text, ok)
 
     def set_state(self, text: str, ok: bool) -> None:
+        self._text = text
+        self._ok = ok
         color = THEME["green"] if ok else THEME["orange"]
         self.setText(text)
         self.setStyleSheet(
             f"QLabel#StatusPill {{ color: {color}; font-size: 14px; font-weight: 700; }}"
         )
+
+    def refresh_theme(self) -> None:
+        self.set_state(self._text, self._ok)
 
 
 class MetricCard(CardFrame):
@@ -115,6 +122,7 @@ class MetricCard(CardFrame):
     def __init__(self, title: str, value: str = "-", hint: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent=parent)
         self.setMinimumHeight(108)
+        self._accent: str | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 14)
@@ -134,9 +142,13 @@ class MetricCard(CardFrame):
         layout.addWidget(self.hint_label)
 
     def set_value(self, value: str, hint: str = "", accent: str | None = None) -> None:
+        self._accent = accent
         self.value_label.setText(value)
         self.hint_label.setText(hint)
         self.value_label.setStyleSheet(f"color: {accent};" if accent else "")
+
+    def refresh_theme(self) -> None:
+        self.value_label.setStyleSheet(f"color: {self._accent};" if self._accent else "")
 
 
 # ---------------------------------------------------------------------------
@@ -169,11 +181,6 @@ class CsiTrendPlot(CardFrame):
         self.node_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.rssi_badge = QLabel("RSSI: -- dBm")
         self.rssi_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        for badge in (self.node_badge, self.rssi_badge):
-            badge.setStyleSheet(
-                "background: #23252C; color: #DCE8FF; border: 1px solid #34373F;"
-                " border-radius: 8px; padding: 6px 12px; font-weight: 600;"
-            )
 
         header.addLayout(title_box)
         header.addStretch(1)
@@ -191,8 +198,8 @@ class CsiTrendPlot(CardFrame):
         self.plot.hideButtons()
         for axis_name in ("bottom", "left"):
             axis = self.plot.getAxis(axis_name)
-            axis.setPen(pg.mkPen("#3A3D45"))
-            axis.setTextPen(pg.mkPen("#6C7280"))
+            axis.setPen(pg.mkPen(THEME["plot_axis"]))
+            axis.setTextPen(pg.mkPen(THEME["plot_axis_text"]))
         self.plot.getPlotItem().setContentsMargins(4, 4, 4, 4)
         self.plot.setMinimumHeight(220)
         self.empty_label = QLabel("等待 Gateway 串口数据")
@@ -206,14 +213,16 @@ class CsiTrendPlot(CardFrame):
         self.noise_curve = self.plot.plot(
             [],
             [],
-            pen=pg.mkPen("#8E8E93", width=1.4, style=Qt.PenStyle.DashLine),
+            pen=pg.mkPen(THEME["plot_noise"], width=1.4, style=Qt.PenStyle.DashLine),
             name="基准噪声",
         )
 
         legend = QHBoxLayout()
         legend.setSpacing(16)
-        legend.addWidget(_legend_label("● 载波 A-14", THEME["blue_bright"]))
-        legend.addWidget(_legend_label("○ 基准噪声", "#B8BCC6"))
+        self.amplitude_legend = _legend_label("● 载波 A-14", THEME["blue_bright"])
+        self.noise_legend = _legend_label("○ 基准噪声", THEME["plot_noise_legend"])
+        legend.addWidget(self.amplitude_legend)
+        legend.addWidget(self.noise_legend)
         legend.addStretch(1)
         self.sample_rate_label = QLabel("采样率: 1000Hz")
         self.sample_rate_label.setObjectName("SubtleText")
@@ -222,6 +231,7 @@ class CsiTrendPlot(CardFrame):
         layout.addWidget(self.plot)
         layout.addWidget(self.empty_label)
         layout.addLayout(legend)
+        self.refresh_theme()
 
     def set_history(self, history: list[dict[str, Any]], active_node: int, node_state: dict[str, Any]) -> None:
         now = time.time()
@@ -269,6 +279,25 @@ class CsiTrendPlot(CardFrame):
             rssi_value = _float(wifi_rssi if wifi_rssi is not None else node_state.get("rssi"))
             self.rssi_badge.setText(f"RSSI: {rssi_value:.0f}dBm")
 
+    def refresh_theme(self) -> None:
+        badge_style = (
+            f"background: {THEME['tag_bg']}; color: {THEME['text_soft']};"
+            f" border: 1px solid {THEME['tag_border']};"
+            " border-radius: 8px; padding: 6px 12px; font-weight: 600;"
+        )
+        for badge in (self.node_badge, self.rssi_badge):
+            badge.setStyleSheet(badge_style)
+        self.plot.setBackground(THEME["card"])
+        for axis_name in ("bottom", "left"):
+            axis = self.plot.getAxis(axis_name)
+            axis.setPen(pg.mkPen(THEME["plot_axis"]))
+            axis.setTextPen(pg.mkPen(THEME["plot_axis_text"]))
+        self.empty_label.setStyleSheet(f"color: {THEME['muted']}; font-size: 13px;")
+        self.amplitude_curve.setPen(pg.mkPen(THEME["blue_bright"], width=2.4))
+        self.noise_curve.setPen(pg.mkPen(THEME["plot_noise"], width=1.4, style=Qt.PenStyle.DashLine))
+        self.amplitude_legend.setStyleSheet(f"color: {THEME['blue_bright']};")
+        self.noise_legend.setStyleSheet(f"color: {THEME['plot_noise_legend']};")
+
 
 # ---------------------------------------------------------------------------
 # 事件日志面板
@@ -301,8 +330,10 @@ class EventLogPanel(CardFrame):
         self.content_layout.addStretch(1)
         self.scroll.setWidget(self.content)
         layout.addWidget(self.scroll, 1)
+        self._events: list[dict[str, Any]] = []
 
     def set_events(self, events: list[dict[str, Any]]) -> None:
+        self._events = list(events)
         clear_layout(self.content_layout)
 
         if not events:
@@ -344,6 +375,9 @@ class EventLogPanel(CardFrame):
         layout.addLayout(text_box, 1)
         return row
 
+    def refresh_theme(self) -> None:
+        self.set_events(self._events)
+
 
 # ---------------------------------------------------------------------------
 # 拓扑图
@@ -372,19 +406,19 @@ class TopologyWidget(QWidget):
 
         rect = self.rect().adjusted(8, 6, -8, -6)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#0C0D11"))
+        painter.setBrush(QColor(THEME["topology_bg"]))
         painter.drawRoundedRect(rect, 10, 10)
 
         center = QPointF(rect.center())
         outer_radius = min(rect.width(), rect.height()) * 0.36
 
-        painter.setPen(QPen(QColor("#2A3445"), 1))
+        painter.setPen(QPen(QColor(THEME["topology_ring"]), 1))
         painter.setBrush(Qt.BrushStyle.NoBrush)
         for scale in (0.34, 0.67, 1.0):
             ring = int(outer_radius * scale)
             painter.drawEllipse(center, ring, ring)
 
-        painter.setPen(QPen(QColor("#172236"), 1))
+        painter.setPen(QPen(QColor(THEME["topology_cross"]), 1))
         painter.drawLine(int(center.x() - outer_radius), int(center.y()), int(center.x() + outer_radius), int(center.y()))
         painter.drawLine(int(center.x()), int(center.y() - outer_radius), int(center.x()), int(center.y() + outer_radius))
 
@@ -395,13 +429,13 @@ class TopologyWidget(QWidget):
         painter.drawLine(center, sweep_end)
 
         painter.setPen(QPen(QColor("#8DA8D8"), 1))
-        painter.setBrush(QColor("#0F1118"))
+        painter.setBrush(QColor(THEME["topology_gateway"]))
         painter.drawEllipse(center, 30, 30)
-        painter.setBrush(QColor("#FFFFFF"))
+        painter.setBrush(QColor(THEME["selection_text"]))
         painter.drawEllipse(center, 8, 8)
-        painter.setBrush(QColor("#0C0D11"))
+        painter.setBrush(QColor(THEME["topology_bg"]))
         painter.drawEllipse(center, 3, 3)
-        painter.setPen(QPen(QColor("#E7EEFF"), 1))
+        painter.setPen(QPen(QColor(THEME["topology_gateway_text"]), 1))
         painter.setFont(QFont("Microsoft YaHei", 8))
         painter.drawText(int(center.x()) - 20, int(center.y()) + 52, GATEWAY_ID)
 
@@ -447,7 +481,7 @@ class TopologyWidget(QWidget):
             node_radius = 6 + int(2 * pulse) if online else 5
             painter.drawEllipse(point, node_radius, node_radius)
 
-            painter.setPen(QPen(QColor("#E8ECF5"), 1))
+            painter.setPen(QPen(QColor(THEME["topology_node_text"]), 1))
             painter.setFont(QFont("Microsoft YaHei", 8))
             label = str(state.get("label") or "").strip() or NODE_LABELS.get(node_id, f"node{node_id}")
             painter.drawText(int(point.x()) - 24, int(point.y()) + 28, label)
@@ -514,9 +548,11 @@ class ModeTag(QLabel):
     def __init__(self, mode: str = "NORMAL", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._mode = mode
         self.set_mode(mode)
 
     def set_mode(self, mode: str) -> None:
+        self._mode = mode
         self.setText(mode)
         self.setStyleSheet(
             "QLabel {"
@@ -526,6 +562,9 @@ class ModeTag(QLabel):
             " border-radius: 6px; padding: 3px 8px;"
             " font-size: 11px; font-weight: 700; letter-spacing: 0.5px; }"
         )
+
+    def refresh_theme(self) -> None:
+        self.set_mode(self._mode)
 
 
 class BatteryBar(QWidget):
@@ -549,18 +588,21 @@ class BatteryBar(QWidget):
         layout.addWidget(self.bar)
         layout.addWidget(self.percent)
         layout.addStretch(1)
+        self._unknown = True
 
     def set_unknown(self) -> None:
+        self._unknown = True
         self._value = 0.0
         self.bar.setValue(0)
         self.percent.setText("未上报")
         self.percent.setStyleSheet(f"color: {THEME['muted']}; font-size: 13px;")
         self.bar.setStyleSheet(
-            "QProgressBar { background: #2B2D34; border: 0; border-radius: 4px; }"
+            f"QProgressBar {{ background: {THEME['progress_bg']}; border: 0; border-radius: 4px; }}"
             f" QProgressBar::chunk {{ background: {THEME['muted_2']}; border-radius: 4px; }}"
         )
 
     def set_value(self, value: float) -> None:
+        self._unknown = False
         value = max(0.0, min(100.0, float(value)))
         self._value = value
         self.bar.setValue(int(value))
@@ -573,9 +615,15 @@ class BatteryBar(QWidget):
         else:
             chunk = THEME["blue_soft"]
         self.bar.setStyleSheet(
-            "QProgressBar { background: #2B2D34; border: 0; border-radius: 4px; }"
+            f"QProgressBar {{ background: {THEME['progress_bg']}; border: 0; border-radius: 4px; }}"
             f" QProgressBar::chunk {{ background: {chunk}; border-radius: 4px; }}"
         )
+
+    def refresh_theme(self) -> None:
+        if self._unknown:
+            self.set_unknown()
+        else:
+            self.set_value(self._value)
 
 
 class HealthBadge(QWidget):
@@ -583,6 +631,7 @@ class HealthBadge(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._health = HEALTH_INACTIVE
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
@@ -594,6 +643,7 @@ class HealthBadge(QWidget):
         layout.addStretch(1)
 
     def set_health(self, health: str) -> None:
+        self._health = health
         color = HEALTH_COLORS.get(health, THEME["muted"])
         self.dot.setStyleSheet(f"color: {color}; font-size: 12px;")
         self.text.setText(health)
@@ -605,6 +655,9 @@ class HealthBadge(QWidget):
         if is_critical:
             style += " font-weight: 700;"
         self.text.setStyleSheet(style)
+
+    def refresh_theme(self) -> None:
+        self.set_health(self._health)
 
 
 class ToggleSwitch(QAbstractButton):
@@ -643,7 +696,7 @@ class ToggleSwitch(QAbstractButton):
         painter.setPen(Qt.PenStyle.NoPen)
 
         track_on = QColor(THEME["green"])
-        track_off = QColor("#3A3D45")
+        track_off = QColor(THEME["scroll_handle"])
         track = _blend(track_off, track_on, self._offset)
         painter.setBrush(track)
         painter.drawRoundedRect(QRectF(0, 0, self.width(), self.height()), 13, 13)
@@ -651,7 +704,7 @@ class ToggleSwitch(QAbstractButton):
         margin = 3.0
         diameter = self.height() - margin * 2
         x = margin + self._offset * (self.width() - diameter - margin * 2)
-        painter.setBrush(QColor("#FFFFFF"))
+        painter.setBrush(QColor(THEME["selection_text"]))
         painter.drawEllipse(QRectF(x, margin, diameter, diameter))
         painter.end()
 
@@ -683,8 +736,8 @@ class ThresholdSlider(QWidget):
         layout.setSpacing(10)
 
         head = QHBoxLayout()
-        title_label = QLabel(title)
-        title_label.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px; font-weight: 600;")
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px; font-weight: 600;")
         self.value_pill = QLabel(value_fmt(value))
         self.value_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.value_pill.setStyleSheet(
@@ -693,7 +746,7 @@ class ThresholdSlider(QWidget):
             f" border: 1px solid {THEME['tag_border']}; border-radius: 6px;"
             " padding: 2px 10px; font-size: 13px; font-weight: 700; }"
         )
-        head.addWidget(title_label)
+        head.addWidget(self.title_label)
         head.addStretch(1)
         head.addWidget(self.value_pill)
         layout.addLayout(head)
@@ -728,6 +781,15 @@ class ThresholdSlider(QWidget):
         self.value_pill.setText(self._fmt(value))
         self.valueChanged.emit(value)
 
+    def refresh_theme(self) -> None:
+        self.title_label.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px; font-weight: 600;")
+        self.value_pill.setStyleSheet(
+            "QLabel {"
+            f" background: {THEME['tag_bg']}; color: {THEME['blue_soft']};"
+            f" border: 1px solid {THEME['tag_border']}; border-radius: 6px;"
+            " padding: 2px 10px; font-size: 13px; font-weight: 700; }"
+        )
+
 
 class SettingRow(QWidget):
     """配置行：左侧文案 + 右侧开关。"""
@@ -739,13 +801,17 @@ class SettingRow(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
-        title_label = QLabel(title)
-        title_label.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px; font-weight: 600;")
+        self.title_label = QLabel(title)
+        self.title_label.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px; font-weight: 600;")
         self.switch = ToggleSwitch(checked)
         self.switch.toggled.connect(self.toggled.emit)
-        layout.addWidget(title_label)
+        layout.addWidget(self.title_label)
         layout.addStretch(1)
         layout.addWidget(self.switch)
+
+    def refresh_theme(self) -> None:
+        self.title_label.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px; font-weight: 600;")
+        self.switch.update()
 
 
 class SystemWarningBar(QFrame):
@@ -772,7 +838,7 @@ class SystemWarningBar(QFrame):
         self.icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.icon.setStyleSheet(
             "QLabel {"
-            f" background: #36181A; color: {THEME['red']};"
+            f" background: {THEME['warning_bg']}; color: {THEME['red']};"
             " border-radius: 10px; font-size: 20px; }"
         )
         layout.addWidget(self.icon)
@@ -784,7 +850,7 @@ class SystemWarningBar(QFrame):
         self.tag = QLabel("系统警告")
         self.tag.setStyleSheet(
             "QLabel {"
-            f" background: #36181A; color: {THEME['red']};"
+            f" background: {THEME['warning_bg']}; color: {THEME['red']};"
             " border-radius: 5px; padding: 2px 8px; font-size: 12px; font-weight: 700; }"
         )
         self.time_label = QLabel("--:--:--")
@@ -827,6 +893,26 @@ class SystemWarningBar(QFrame):
     def set_metrics(self, latency_ms: float, memory_gb: float) -> None:
         self.latency["value"].setText(f"{latency_ms:.0f}ms")
         self.memory["value"].setText(f"{memory_gb:.1f} GB")
+
+    def refresh_theme(self) -> None:
+        self.setStyleSheet(
+            "QFrame#WarningBar {"
+            f" background: {THEME['panel']};"
+            f" border-top: 1px solid {THEME['border_soft']}; }}"
+        )
+        self.icon.setStyleSheet(
+            "QLabel {"
+            f" background: {THEME['warning_bg']}; color: {THEME['red']};"
+            " border-radius: 10px; font-size: 20px; }"
+        )
+        self.tag.setStyleSheet(
+            "QLabel {"
+            f" background: {THEME['warning_bg']}; color: {THEME['red']};"
+            " border-radius: 5px; padding: 2px 8px; font-size: 12px; font-weight: 700; }"
+        )
+        self.message.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 13px;")
+        self.latency["value"].setStyleSheet(f"color: {THEME['text_soft']}; font-size: 16px; font-weight: 700;")
+        self.memory["value"].setStyleSheet(f"color: {THEME['text_soft']}; font-size: 16px; font-weight: 700;")
 
 
 # ---------------------------------------------------------------------------
@@ -875,7 +961,7 @@ def _event_color(event: dict[str, Any]) -> str:
 
 def _rssi_color(rssi: float, online: bool) -> str:
     if not online:
-        return "#5A5F69"
+        return THEME["muted_2"]
     if rssi >= -60:
         return THEME["blue_soft"]
     if rssi >= -75:

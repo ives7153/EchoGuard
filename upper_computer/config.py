@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 
@@ -39,9 +41,9 @@ EXPORT_DIR = Path(__file__).resolve().parent / "exports"
 
 
 # ---------------------------------------------------------------------------
-# 主题色：贴近设计稿的近黑工业风，蓝色为主强调色
+# 主题色：深色保留现有工业风，浅色只改变颜色，不改变任何布局。
 # ---------------------------------------------------------------------------
-THEME = {
+DARK_THEME = {
     "bg": "#0E0F12",
     "bg_deep": "#08090B",
     "topbar": "#0B0C0F",
@@ -71,19 +73,156 @@ THEME = {
     "cyan": "#64D2FF",
     "tag_bg": "#23252C",
     "tag_border": "#34373F",
+    "nav_selected_bg": "#102A4D",
+    "nav_selected_border": "#1C406F",
+    "button_hover_border": "#3C3F48",
+    "button_pressed": "#16171C",
+    "danger_bg": "#36181A",
+    "danger_border": "#5A2A2C",
+    "progress_bg": "#2B2D34",
+    "scroll_handle": "#3A3D45",
+    "scroll_handle_hover": "#4A4D56",
+    "plot_axis": "#3A3D45",
+    "plot_axis_text": "#6C7280",
+    "plot_noise": "#8E8E93",
+    "plot_noise_legend": "#B8BCC6",
+    "topology_bg": "#0C0D11",
+    "topology_cross": "#172236",
+    "topology_ring": "#2A3445",
+    "topology_gateway": "#0F1118",
+    "topology_gateway_text": "#E7EEFF",
+    "topology_node_text": "#E8ECF5",
+    "warning_bg": "#36181A",
+    "selection_text": "#FFFFFF",
 }
+
+LIGHT_THEME = {
+    "bg": "#F7F9FC",
+    "bg_deep": "#EEF2F7",
+    "topbar": "#FFFFFF",
+    "panel": "#FFFFFF",
+    "rail": "#F3F6FA",
+    "card": "#FFFFFF",
+    "card_alt": "#F3F6FA",
+    "card_hover": "#EAF0F7",
+    "row_hover": "#F0F4F9",
+    "border": "#D7DEE8",
+    "border_soft": "#E4E9F0",
+    "divider": "#DCE3EB",
+    "text": "#17202A",
+    "text_soft": "#344050",
+    "muted": "#6B7280",
+    "muted_2": "#8A94A3",
+    "muted_3": "#A3ACB8",
+    "blue": "#1E6BFF",
+    "blue_bright": "#2F80FF",
+    "blue_soft": "#2B6CBF",
+    "green": "#1D9A45",
+    "green_soft": "#25B657",
+    "yellow": "#B98500",
+    "orange": "#D97706",
+    "red": "#D92D20",
+    "red_soft": "#B42318",
+    "cyan": "#0891B2",
+    "tag_bg": "#EAF1FF",
+    "tag_border": "#C9D8F0",
+    "nav_selected_bg": "#E7F0FF",
+    "nav_selected_border": "#B8D1FF",
+    "button_hover_border": "#B8C4D4",
+    "button_pressed": "#E1E7EF",
+    "danger_bg": "#FFF1F0",
+    "danger_border": "#FFCDC7",
+    "progress_bg": "#E3E8EF",
+    "scroll_handle": "#C7D0DD",
+    "scroll_handle_hover": "#AEB9C8",
+    "plot_axis": "#C4CBD6",
+    "plot_axis_text": "#697586",
+    "plot_noise": "#98A2B3",
+    "plot_noise_legend": "#667085",
+    "topology_bg": "#F4F7FB",
+    "topology_cross": "#D8E3F0",
+    "topology_ring": "#C8D6E6",
+    "topology_gateway": "#FFFFFF",
+    "topology_gateway_text": "#2D4059",
+    "topology_node_text": "#263242",
+    "warning_bg": "#FFF1F0",
+    "selection_text": "#FFFFFF",
+}
+
+_THEME_MODE = "dark"
+THEME = DARK_THEME.copy()
+
+
+def ui_settings_path() -> Path:
+    """返回上位机 UI 本机配置路径。"""
+
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "EchoGuard" / "ui_settings.json"
+    return Path.home() / ".echoguard" / "ui_settings.json"
+
+
+def load_ui_settings() -> dict[str, object]:
+    """读取本机 UI 设置；失败时回退默认值。"""
+
+    path = ui_settings_path()
+    if not path.exists():
+        return {"theme_mode": "dark"}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"theme_mode": "dark"}
+    if not isinstance(payload, dict):
+        return {"theme_mode": "dark"}
+    mode = str(payload.get("theme_mode") or "dark").lower()
+    payload["theme_mode"] = mode if mode in {"dark", "light"} else "dark"
+    return payload
+
+
+def save_ui_settings(settings: dict[str, object]) -> Path:
+    """保存本机 UI 设置。"""
+
+    path = ui_settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current = load_ui_settings()
+    current.update(settings)
+    mode = str(current.get("theme_mode") or "dark").lower()
+    current["theme_mode"] = mode if mode in {"dark", "light"} else "dark"
+    path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def theme_mode() -> str:
+    """返回当前生效主题模式。"""
+
+    return _THEME_MODE
+
+
+def set_theme_mode(mode: str) -> str:
+    """切换当前主题；THEME 原地更新，保证已导入引用同步生效。"""
+
+    global _THEME_MODE
+    normalized = str(mode or "dark").lower()
+    if normalized not in {"dark", "light"}:
+        normalized = "dark"
+    source = LIGHT_THEME if normalized == "light" else DARK_THEME
+    THEME.clear()
+    THEME.update(source)
+    _THEME_MODE = normalized
+    _sync_derived_theme()
+    return _THEME_MODE
 
 
 # ---------------------------------------------------------------------------
 # 左侧导航：five 页面（含占位 / 功能页）
-# 中文注释：key 用于 QStackedWidget 路由，icon 为简单字形避免外部资源依赖。
+# 中文注释：key 用于 QStackedWidget 路由，icon 为本地 SVG 图标注册表名称。
 # ---------------------------------------------------------------------------
 NAV_ITEMS = (
-    {"key": "dashboard", "text": "仪表盘", "icon": "▥"},
-    {"key": "sensors", "text": "节点管理", "icon": "◎"},
-    {"key": "analysis", "text": "数据分析", "icon": "⌁"},
-    {"key": "diagnostics", "text": "技术诊断", "icon": "＋"},
-    {"key": "history", "text": "历史记录", "icon": "↺"},
+    {"key": "dashboard", "text": "仪表盘", "icon": "layout-dashboard"},
+    {"key": "sensors", "text": "节点管理", "icon": "radio"},
+    {"key": "analysis", "text": "数据分析", "icon": "chart-line"},
+    {"key": "diagnostics", "text": "技术诊断", "icon": "wrench"},
+    {"key": "history", "text": "历史记录", "icon": "history"},
 )
 
 
@@ -128,6 +267,21 @@ HEALTH_COLORS = {
 }
 
 
+def _sync_derived_theme() -> None:
+    """同步依赖 THEME 的派生颜色表。"""
+
+    health_colors = globals().get("HEALTH_COLORS")
+    if isinstance(health_colors, dict):
+        health_colors.update(
+            {
+                HEALTH_EXCELLENT: THEME["blue_soft"],
+                HEALTH_GOOD: THEME["blue_soft"],
+                HEALTH_INACTIVE: THEME["muted_2"],
+                HEALTH_CRITICAL: THEME["red"],
+            }
+        )
+
+
 # ---------------------------------------------------------------------------
 # 阈值默认值（传感器页右侧配置 + 报警规则共享）
 # ---------------------------------------------------------------------------
@@ -170,21 +324,25 @@ CSV_FIELDS = [
 ]
 
 
-def build_qss() -> str:
+def build_qss(mode: str | None = None) -> str:
     """返回全局 QSS。
 
     中文注释：卡片、按钮、导航、状态胶囊、滑条、开关轨道和滚动条都在这里统一
     定义。阴影由 QGraphicsDropShadowEffect 负责，QSS 只管边框、圆角和配色。
     """
 
-    t = THEME
+    if mode is not None:
+        source = LIGHT_THEME if str(mode).lower() == "light" else DARK_THEME
+        t = source
+    else:
+        t = THEME
     return f"""
     * {{
         font-family: "Microsoft YaHei", "Segoe UI", "PingFang SC", Arial, sans-serif;
         font-size: 14px;
         color: {t["text"]};
         selection-background-color: {t["blue"]};
-        selection-color: #FFFFFF;
+        selection-color: {t["selection_text"]};
     }}
 
     QMainWindow, QWidget#Root {{
@@ -235,17 +393,17 @@ def build_qss() -> str:
 
     QFrame#NavItem {{
         background: transparent;
-        border-radius: 10px;
+        border-radius: 12px;
         border: 1px solid transparent;
     }}
 
     QFrame#NavItem:hover {{
-        background: {t["card"]};
+        background: {t["card_hover"]};
     }}
 
     QFrame#NavItem[selected="true"] {{
-        background: #102A4D;
-        border: 1px solid #1C406F;
+        background: {t["nav_selected_bg"]};
+        border: 1px solid {t["nav_selected_border"]};
         border-left: 3px solid {t["blue_bright"]};
     }}
 
@@ -265,7 +423,7 @@ def build_qss() -> str:
     }}
 
     QLabel#NavText[selected="true"] {{
-        color: #FFFFFF;
+        color: {t["text"]};
         font-weight: 700;
     }}
 
@@ -279,7 +437,7 @@ def build_qss() -> str:
     QFrame[card="true"] {{
         background: {t["card"]};
         border: 1px solid {t["border"]};
-        border-radius: 12px;
+        border-radius: 13px;
     }}
 
     QFrame[cardAlt="true"] {{
@@ -344,7 +502,7 @@ def build_qss() -> str:
     QPushButton {{
         background: {t["card_alt"]};
         border: 1px solid {t["border"]};
-        border-radius: 9px;
+        border-radius: 10px;
         padding: 8px 14px;
         font-weight: 600;
         color: {t["text_soft"]};
@@ -352,17 +510,17 @@ def build_qss() -> str:
 
     QPushButton:hover {{
         background: {t["card_hover"]};
-        border-color: #3C3F48;
+        border-color: {t["button_hover_border"]};
     }}
 
     QPushButton:pressed {{
-        background: #16171C;
+        background: {t["button_pressed"]};
     }}
 
     QPushButton#PrimaryButton {{
         background: {t["blue"]};
         border: 1px solid {t["blue"]};
-        color: #FFFFFF;
+        color: {t["selection_text"]};
     }}
 
     QPushButton#PrimaryButton:hover {{
@@ -377,12 +535,12 @@ def build_qss() -> str:
     }}
 
     QPushButton#GhostButton:hover {{
-        background: {t["card"]};
+        background: {t["card_hover"]};
     }}
 
     QPushButton#DangerButton {{
-        background: #36181A;
-        border: 1px solid #5A2A2C;
+        background: {t["danger_bg"]};
+        border: 1px solid {t["danger_border"]};
         color: {t["red_soft"]};
     }}
 
@@ -427,14 +585,14 @@ def build_qss() -> str:
     QComboBox {{
         background: {t["card_alt"]};
         border: 1px solid {t["border"]};
-        border-radius: 8px;
+        border-radius: 10px;
         padding: 6px 10px;
         min-width: 120px;
         color: {t["text_soft"]};
     }}
 
     QComboBox:hover {{
-        border-color: #3C3F48;
+        border-color: {t["button_hover_border"]};
     }}
 
     QComboBox::drop-down {{
@@ -453,7 +611,7 @@ def build_qss() -> str:
     QMenu {{
         background: {t["card_alt"]};
         border: 1px solid {t["border"]};
-        border-radius: 8px;
+        border-radius: 10px;
         padding: 6px;
     }}
 
@@ -465,7 +623,7 @@ def build_qss() -> str:
 
     QMenu::item:selected {{
         background: {t["blue"]};
-        color: #FFFFFF;
+        color: {t["selection_text"]};
     }}
 
     QMenu::item:disabled {{
@@ -475,13 +633,13 @@ def build_qss() -> str:
     QLineEdit {{
         background: {t["card_alt"]};
         border: 1px solid {t["border"]};
-        border-radius: 8px;
+        border-radius: 10px;
         padding: 7px 10px;
         color: {t["text_soft"]};
     }}
 
     QLineEdit:hover {{
-        border-color: #3C3F48;
+        border-color: {t["button_hover_border"]};
     }}
 
     QLineEdit:focus {{
@@ -509,7 +667,7 @@ def build_qss() -> str:
 
     /* ---------------- 进度/电量条 ---------------- */
     QProgressBar {{
-        background: #2B2D34;
+        background: {t["progress_bg"]};
         border: 0;
         border-radius: 4px;
         height: 7px;
@@ -524,7 +682,7 @@ def build_qss() -> str:
     /* ---------------- 滑条 ---------------- */
     QSlider::groove:horizontal {{
         height: 5px;
-        background: #2B2D34;
+        background: {t["progress_bg"]};
         border-radius: 3px;
     }}
 
@@ -538,7 +696,7 @@ def build_qss() -> str:
         height: 16px;
         margin: -6px 0;
         border-radius: 8px;
-        background: #FFFFFF;
+        background: {t["selection_text"]};
         border: 2px solid {t["blue"]};
     }}
 
@@ -559,13 +717,13 @@ def build_qss() -> str:
     }}
 
     QScrollBar::handle:vertical {{
-        background: #3A3D45;
+        background: {t["scroll_handle"]};
         border-radius: 5px;
         min-height: 30px;
     }}
 
     QScrollBar::handle:vertical:hover {{
-        background: #4A4D56;
+        background: {t["scroll_handle_hover"]};
     }}
 
     QScrollBar::add-line:vertical,
@@ -580,7 +738,7 @@ def build_qss() -> str:
     }}
 
     QScrollBar::handle:horizontal {{
-        background: #3A3D45;
+        background: {t["scroll_handle"]};
         border-radius: 5px;
         min-width: 30px;
     }}

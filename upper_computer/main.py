@@ -16,11 +16,11 @@ import sys
 from PyQt6.QtWidgets import QApplication
 
 try:
-    from .config import APP_TITLE, WINDOW_TITLE, build_qss
+    from .config import APP_TITLE, WINDOW_TITLE, build_qss, load_ui_settings, set_theme_mode
     from .core import DataManager
     from .ui import MainWindow
 except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
-    from config import APP_TITLE, WINDOW_TITLE, build_qss
+    from config import APP_TITLE, WINDOW_TITLE, build_qss, load_ui_settings, set_theme_mode
     from core import DataManager
     from ui import MainWindow
 
@@ -29,6 +29,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setApplicationDisplayName(APP_TITLE)
+    set_theme_mode(str(load_ui_settings().get("theme_mode", "dark")))
     app.setStyleSheet(build_qss())
 
     manager = DataManager()
