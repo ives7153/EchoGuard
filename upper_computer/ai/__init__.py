@@ -21,6 +21,8 @@ try:
         wait_for_embedding_ready,
     )
 except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
     from judgement import (  # type: ignore
         AISettings,
         LocalJinaRuntime,

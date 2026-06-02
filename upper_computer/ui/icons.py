@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import QLabel, QPushButton, QWidget
 try:
     from ..config import THEME
 except ImportError:
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
     from config import THEME
 
 

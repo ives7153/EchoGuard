@@ -66,6 +66,8 @@ try:
         save_widget_screenshot,
     )
 except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
     from config import (
         AUTO_PORT_REFRESH_MS,
         BAUDRATE,
@@ -259,7 +261,7 @@ class DataManager(QObject):
             "updated_at": 0.0,
             "top_matches": [],
             "error": "",
-            "config": asdict(self.ai_settings),
+            "config": self._public_ai_config(),
         }
         self._ai_busy = False
         self._ai_request_id = 0
@@ -488,7 +490,7 @@ class DataManager(QObject):
             self.ai_operation_message_changed.emit(f"AI 设置保存失败：{exc}", False)
             return
         self.ai_state["enabled"] = self.ai_settings.enabled
-        self.ai_state["config"] = asdict(self.ai_settings)
+        self.ai_state["config"] = self._public_ai_config()
         self.ai_state["status"] = "AI 设置已保存"
         self._ai_last_state_key = ""
         self.ai_operation_message_changed.emit(f"AI 设置已保存：{path}", True)
@@ -505,8 +507,13 @@ class DataManager(QObject):
             )
             return
         action = str(payload.get("action") or "").strip()
-        config = payload.get("config")
-        if isinstance(config, dict):
+        if action == "save":
+            config = payload.get("config")
+            if not isinstance(config, dict):
+                self._ai_operation_result_ready.emit(
+                    {"action": action, "ok": False, "message": "AI 设置格式无效"}
+                )
+                return
             try:
                 self._apply_ai_settings(config)
             except Exception as exc:  # noqa: BLE001
@@ -514,10 +521,8 @@ class DataManager(QObject):
                     {"action": action, "ok": False, "message": f"AI 设置保存失败：{exc}"}
                 )
                 return
-
-        if action == "save":
             self._ai_operation_result_ready.emit(
-                {"action": action, "ok": True, "message": "AI 设置已保存", "config": asdict(self.ai_settings)}
+                {"action": action, "ok": True, "message": "AI 设置已保存", "config": self._public_ai_config()}
             )
             return
         if action == "stop_jina":
@@ -530,6 +535,15 @@ class DataManager(QObject):
             return
 
         settings = self.ai_settings.copy()
+        config = payload.get("config")
+        if isinstance(config, dict):
+            try:
+                settings = settings_from_dict(config)
+            except Exception as exc:  # noqa: BLE001
+                self._ai_operation_result_ready.emit(
+                    {"action": action, "ok": False, "message": f"AI 设置格式无效：{exc}"}
+                )
+                return
         package_path = str(payload.get("package_path") or "").strip()
 
         def emit_progress(progress: dict[str, Any]) -> None:
@@ -1179,11 +1193,18 @@ class DataManager(QObject):
         self._auto_service()
 
     # ------------------------------------------------------------------ AI 辅助研判
+    def _public_ai_config(self, settings: AISettings | None = None) -> dict[str, Any]:
+        """返回可发给 UI 的 AI 配置，避免 API Key 进入快照或弹窗预填。"""
+
+        payload = asdict(settings or self.ai_settings)
+        payload["llm_api_key"] = ""
+        return payload
+
     def _apply_ai_settings(self, payload: dict[str, Any]) -> object:
         self.ai_settings = settings_from_dict(payload)
         path = save_ai_settings(self.ai_settings)
         self.ai_state["enabled"] = self.ai_settings.enabled
-        self.ai_state["config"] = asdict(self.ai_settings)
+        self.ai_state["config"] = self._public_ai_config()
         self._ai_last_state_key = ""
         self._dirty = True
         return path
@@ -1259,7 +1280,7 @@ class DataManager(QObject):
                 "state_key": summary.state_key,
                 "window_start": summary.window_start,
                 "window_end": summary.window_end,
-                "config": asdict(self.ai_settings),
+                "config": self._public_ai_config(),
             }
         )
         self._dirty = True
@@ -1291,12 +1312,12 @@ class DataManager(QObject):
                     "top_matches": [],
                     "error": "",
                     "state_key": current_summary.state_key,
-                    "config": asdict(self.ai_settings),
+                    "config": self._public_ai_config(),
                 }
             )
         else:
             result["running"] = False
-            result["config"] = asdict(self.ai_settings)
+            result["config"] = self._public_ai_config()
             result["jina_running"] = self.ai_runtime.is_running()
             self.ai_state.update(result)
 
@@ -1307,7 +1328,7 @@ class DataManager(QObject):
         self.ai_operation_message_changed.emit(message, ok)
         self.ai_state["status"] = message
         self.ai_state["error"] = "" if ok else message
-        self.ai_state["config"] = asdict(self.ai_settings)
+        self.ai_state["config"] = self._public_ai_config()
         self._dirty = True
 
     @pyqtSlot(object)
@@ -1318,15 +1339,6 @@ class DataManager(QObject):
         message = str(result.get("message") or "")
         action = str(result.get("action") or "")
         running = bool(result.get("running", False))
-        if ok and action in {"deploy_jina_package", "online_deploy_jina"}:
-            server_path = str(result.get("server_path") or "")
-            model_path = str(result.get("model_path") or "")
-            if server_path:
-                self.ai_settings.llama_server_path = server_path
-            if model_path:
-                self.ai_settings.jina_model_path = model_path
-            save_ai_settings(self.ai_settings)
-            result["config"] = asdict(self.ai_settings)
         self.ai_operation_result_changed.emit(result)
         self.ai_operation_message_changed.emit(message, ok)
         if "models" in result:
@@ -1335,7 +1347,7 @@ class DataManager(QObject):
         self.ai_state["status"] = message
         self.ai_state["error"] = "" if ok else message
         self.ai_state["jina_running"] = self.ai_runtime.is_running()
-        self.ai_state["config"] = asdict(self.ai_settings)
+        self.ai_state["config"] = self._public_ai_config()
         if action == "stop_jina":
             self.ai_state["jina_running"] = False
         if ok and action in {"test_embedding", "start_jina", "start_and_test_jina"}:
@@ -1372,7 +1384,7 @@ class DataManager(QObject):
                 "error": "",
                 "state_key": current_key,
                 "jina_running": self.ai_runtime.is_running(),
-                "config": asdict(self.ai_settings),
+                "config": self._public_ai_config(),
             }
         )
 
@@ -1386,7 +1398,7 @@ class DataManager(QObject):
         self._refresh_ai_fallback(summary)
         self.ai_state["running"] = self._ai_busy
         self.ai_state["jina_running"] = self.ai_runtime.is_running()
-        self.ai_state["config"] = asdict(self.ai_settings)
+        self.ai_state["config"] = self._public_ai_config()
         self.snapshot_changed.emit(
             {
                 "nodes": self._node_dicts(),

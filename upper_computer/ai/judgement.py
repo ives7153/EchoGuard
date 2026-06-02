@@ -25,6 +25,8 @@ from typing import Any, Callable
 try:
     from ..rules.detection_fusion import DetectionSummary, ai_fallback_text
 except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
     from rules.detection_fusion import DetectionSummary, ai_fallback_text  # type: ignore
 
 
@@ -60,7 +62,7 @@ class AISettings:
     llm_base_url: str = ""
     llm_api_key: str = ""
     llm_model: str = ""
-    save_api_key: bool = True
+    save_api_key: bool = False
 
     def copy(self) -> "AISettings":
         return replace(self)

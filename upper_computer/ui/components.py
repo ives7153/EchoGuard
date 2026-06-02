@@ -40,6 +40,8 @@ try:
         TOPOLOGY_NODE_POSITIONS,
     )
 except ImportError:
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
     from config import (
         GATEWAY_ID,
         HEALTH_COLORS,

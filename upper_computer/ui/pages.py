@@ -71,6 +71,8 @@ try:
     from .icons import refresh_widget_icons
     from ..rules.detection_fusion import ai_fallback_text, build_detection_summary, verdict_color_key
 except ImportError:
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
     from config import (
         CONTROL_ID,
         DEFAULT_AFH_ENABLED,
@@ -250,12 +252,19 @@ class AISettingsDialog(QDialog):
         self.llm_url_edit = self._line_edit()
         self.llm_key_edit = self._line_edit()
         self.llm_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.save_key_box = QCheckBox("保存 API Key 到本机")
+        self.save_key_box.setToolTip("默认不保存；测试 API 时只临时使用当前输入。")
         self.llm_model_combo = QComboBox()
         self.llm_model_combo.setEditable(True)
         self.llm_model_combo.setMinimumWidth(260)
         main_layout.addLayout(self._field_row("供应商", self.provider_combo))
         main_layout.addLayout(self._field_row("API 地址", self.llm_url_edit))
         main_layout.addLayout(self._field_row("API Key", self.llm_key_edit))
+        save_key_row = QHBoxLayout()
+        save_key_row.setContentsMargins(122, 0, 0, 0)
+        save_key_row.addWidget(self.save_key_box)
+        save_key_row.addStretch(1)
+        main_layout.addLayout(save_key_row)
         model_row = self._field_row("可用模型", self.llm_model_combo)
         self.model_select_btn = QPushButton("选择模型")
         self.model_select_btn.setObjectName("GhostButton")
@@ -309,7 +318,9 @@ class AISettingsDialog(QDialog):
         provider_index = self.provider_combo.findData(provider)
         self.provider_combo.setCurrentIndex(provider_index if provider_index >= 0 else 0)
         self.llm_url_edit.setText(str(config.get("llm_base_url", "")))
-        self.llm_key_edit.setText(str(config.get("llm_api_key", "")))
+        self.llm_key_edit.setText("")
+        self.llm_key_edit.setPlaceholderText("默认不保存；测试时临时输入")
+        self.save_key_box.setChecked(bool(config.get("save_api_key", False)))
         model = self._normalize_model_label(str(config.get("llm_model", "")), self.provider_combo.currentData())
         if model:
             self.llm_model_combo.addItem(model)
@@ -332,7 +343,7 @@ class AISettingsDialog(QDialog):
                 self.llm_model_combo.currentText().strip(),
                 self.provider_combo.currentData(),
             ),
-            "save_api_key": True,
+            "save_api_key": self.save_key_box.isChecked(),
         }
 
     def _save_then_emit(self, signal: pyqtSignal | None) -> None:

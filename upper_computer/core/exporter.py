@@ -18,6 +18,8 @@ from PyQt6.QtWidgets import QWidget
 try:
     from ..config import CSV_FIELDS, EXPORT_DIR
 except ImportError:
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
     from config import CSV_FIELDS, EXPORT_DIR
 
 

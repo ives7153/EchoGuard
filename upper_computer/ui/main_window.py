@@ -45,6 +45,8 @@ try:
         SensorMatrixPage,
     )
 except ImportError:
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
     from config import (
         APP_TITLE,
         BRAND_NAME,

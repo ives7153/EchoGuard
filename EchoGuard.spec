@@ -3,6 +3,8 @@
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
 
 project_root = Path(SPECPATH)
 assets_dir = project_root / "upper_computer" / "assets"
@@ -17,11 +19,15 @@ excluded_modules = [
     "dearpygui",
     "OpenGL",
     "pyqtgraph.opengl",
-    "pyqtgraph.multiprocess",
     "psutil",
     "scipy",
     "upper_computer.utils.export",
     "upper_computer.viz.dashboard",
+]
+
+hiddenimports = [
+    "PyQt6.QtSvg",
+    *collect_submodules("pyqtgraph.multiprocess"),
 ]
 
 a = Analysis(
@@ -29,7 +35,7 @@ a = Analysis(
     pathex=[str(project_root)],
     binaries=[],
     datas=datas,
-    hiddenimports=["PyQt6.QtSvg"],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
