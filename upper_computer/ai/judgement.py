@@ -9,14 +9,18 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
+import socket
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from ..rules.detection_fusion import DetectionSummary, ai_fallback_text
@@ -30,8 +34,17 @@ DEFAULT_MODEL_PATH = _APP_DIR / "models" / "v5-nano-retrieval-Q4_K_M.gguf"
 DEFAULT_JINA_URL = "http://127.0.0.1:18081"
 DEFAULT_EMBEDDING_MODEL = "jina-embeddings-v5-text-nano-retrieval"
 DEFAULT_TIMEOUT = 12.0
+DOWNLOAD_TIMEOUT = 60.0
 ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 ZHIPU_MODEL_PRESETS = ("glm-5.1", "glm-5-turbo", "glm-4.5", "glm-4.5-air")
+_PACKAGE_SERVER_MEMBER = "runtime/llama-server.exe"
+_PACKAGE_MODEL_MEMBER = "models/v5-nano-retrieval-Q4_K_M.gguf"
+LLAMA_RELEASE_API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+JINA_GGUF_DOWNLOAD_URL = (
+    "https://huggingface.co/jinaai/jina-embeddings-v5-text-nano-retrieval-GGUF/resolve/main/"
+    "v5-nano-retrieval-Q4_K_M.gguf"
+)
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass(slots=True)
@@ -207,6 +220,221 @@ def wait_for_embedding_ready(settings: AISettings, timeout: float = 24.0) -> dic
             last_error = str(exc)
             time.sleep(0.7)
     raise RuntimeError(f"本地 Jina 服务未就绪：{last_error or '等待超时'}")
+
+
+def jina_deployment_status(settings: AISettings) -> dict[str, Any]:
+    """检查本地 Jina 运行时与 GGUF 模型是否已经部署到当前配置路径。"""
+
+    server_path = Path(settings.llama_server_path or DEFAULT_SERVER_PATH).expanduser()
+    model_path = Path(settings.jina_model_path or DEFAULT_MODEL_PATH).expanduser()
+    server_exists = server_path.exists()
+    model_exists = model_path.exists()
+    host, port = _host_port(settings.jina_base_url)
+    port_open = _is_tcp_port_open(host, port)
+    deployed = server_exists and model_exists
+    missing: list[str] = []
+    if not server_exists:
+        missing.append("llama-server.exe")
+    if not model_exists:
+        missing.append("Jina GGUF 模型")
+    if deployed:
+        service_text = "服务端口可连接" if port_open else "服务端口未启动"
+        message = f"已部署：本地 Jina 运行时和 GGUF 模型均存在；{service_text}"
+    else:
+        message = f"未部署：缺少{'、'.join(missing)}"
+    return {
+        "deployed": deployed,
+        "port_open": port_open,
+        "server_path": str(server_path),
+        "model_path": str(model_path),
+        "endpoint": f"{settings.jina_base_url.rstrip('/')}/v1/embeddings",
+        "message": message,
+    }
+
+
+def deploy_jina_package(
+    settings: AISettings,
+    package_path: str,
+    overwrite: bool = True,
+) -> dict[str, Any]:
+    """从 EchoGuard-AI-Runtime.zip 离线包部署 llama-server 与 Jina GGUF。"""
+
+    if not str(package_path or "").strip():
+        raise RuntimeError("请先选择 EchoGuard-AI-Runtime.zip 离线包")
+    source = Path(package_path).expanduser()
+    if not source.exists():
+        raise FileNotFoundError(f"未找到离线包：{source}")
+    if not source.is_file() or not zipfile.is_zipfile(source):
+        raise RuntimeError("请选择有效的 EchoGuard-AI-Runtime.zip 离线包")
+
+    server_target = Path(settings.llama_server_path or DEFAULT_SERVER_PATH).expanduser()
+    model_target = Path(settings.jina_model_path or DEFAULT_MODEL_PATH).expanduser()
+    if server_target == Path(DEFAULT_SERVER_PATH) and model_target == Path(DEFAULT_MODEL_PATH):
+        server_target = DEFAULT_SERVER_PATH
+        model_target = DEFAULT_MODEL_PATH
+
+    with zipfile.ZipFile(source) as archive:
+        server_member = _find_package_member(archive, _PACKAGE_SERVER_MEMBER)
+        model_member = _find_package_member(archive, _PACKAGE_MODEL_MEMBER)
+        missing: list[str] = []
+        if server_member is None:
+            missing.append(_PACKAGE_SERVER_MEMBER)
+        if model_member is None:
+            missing.append(_PACKAGE_MODEL_MEMBER)
+        if missing:
+            raise RuntimeError(f"离线包结构不完整，缺少：{', '.join(missing)}")
+
+        copied: list[str] = []
+        for member, target in ((server_member, server_target), (model_member, model_target)):
+            if target.exists() and not overwrite:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as src, target.open("wb") as dst:
+                while True:
+                    chunk = src.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+            copied.append(target.name)
+
+    status_settings = settings.copy()
+    status_settings.llama_server_path = str(server_target)
+    status_settings.jina_model_path = str(model_target)
+    status = jina_deployment_status(status_settings)
+    if not status["deployed"]:
+        raise RuntimeError("部署完成后仍未检测到关键文件，请检查目标目录权限")
+    status.update(
+        {
+            "copied": copied,
+            "message": "已部署：本地 Jina 运行时和 GGUF 模型已就绪",
+        }
+    )
+    return status
+
+
+def online_deploy_jina(
+    settings: AISettings,
+    progress: ProgressCallback | None = None,
+    overwrite: bool = False,
+    llama_release_api_url: str = LLAMA_RELEASE_API_URL,
+    jina_model_url: str = JINA_GGUF_DOWNLOAD_URL,
+) -> dict[str, Any]:
+    """在线下载 Windows CPU x64 llama-server 与 Jina GGUF，并部署到当前配置路径。"""
+
+    server_target = Path(settings.llama_server_path or DEFAULT_SERVER_PATH).expanduser()
+    model_target = Path(settings.jina_model_path or DEFAULT_MODEL_PATH).expanduser()
+    copied: list[str] = []
+    skipped: list[str] = []
+
+    with tempfile.TemporaryDirectory(prefix="echoguard-ai-") as tmp:
+        temp_root = Path(tmp)
+
+        if server_target.exists() and not overwrite:
+            skipped.append("llama-server.exe")
+            _emit_progress(
+                progress,
+                phase="skip",
+                current_file="llama-server.exe",
+                message="llama-server.exe 已存在，跳过下载",
+                server_path=str(server_target),
+                model_path=str(model_target),
+            )
+        else:
+            _emit_progress(progress, phase="resolve", current_file="llama.cpp release", message="正在获取 llama.cpp 最新版本")
+            asset = resolve_llama_server_asset(llama_release_api_url)
+            server_zip = temp_root / "llama-server-win-cpu-x64.zip"
+            _download_file(asset["url"], server_zip, progress, asset["name"])
+            _emit_progress(progress, phase="extract", current_file="llama-server.exe", message="正在解压 llama-server.exe")
+            with zipfile.ZipFile(server_zip) as archive:
+                member = _find_package_member(archive, "llama-server.exe")
+                if member is None:
+                    raise RuntimeError("llama.cpp 压缩包内未找到 llama-server.exe")
+                server_target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as src, server_target.open("wb") as dst:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+            copied.append("llama-server.exe")
+
+        if model_target.exists() and not overwrite:
+            skipped.append(model_target.name)
+            _emit_progress(
+                progress,
+                phase="skip",
+                current_file=model_target.name,
+                message=f"{model_target.name} 已存在，跳过下载",
+                server_path=str(server_target),
+                model_path=str(model_target),
+            )
+        else:
+            _emit_progress(progress, phase="download", current_file=model_target.name, message="正在下载 Jina GGUF 模型")
+            model_target.parent.mkdir(parents=True, exist_ok=True)
+            temp_model = temp_root / model_target.name
+            _download_file(jina_model_url, temp_model, progress, model_target.name)
+            shutil.move(str(temp_model), str(model_target))
+            copied.append(model_target.name)
+
+    status_settings = settings.copy()
+    status_settings.llama_server_path = str(server_target)
+    status_settings.jina_model_path = str(model_target)
+    status = jina_deployment_status(status_settings)
+    if not status["deployed"]:
+        raise RuntimeError("在线部署完成后仍未检测到关键文件，请检查网络和目标目录权限")
+    if copied and skipped:
+        message = f"在线部署完成：新增 {', '.join(copied)}；已存在 {', '.join(skipped)}"
+    elif copied:
+        message = f"在线部署完成：{', '.join(copied)} 已就绪"
+    else:
+        message = "在线部署完成：运行时和模型已存在"
+    status.update({"copied": copied, "skipped": skipped, "message": message})
+    return status
+
+
+def create_jina_offline_package(settings: AISettings, package_path: str) -> dict[str, Any]:
+    """把当前已部署的本地 Jina 运行时与模型打包成离线 zip。"""
+
+    if not str(package_path or "").strip():
+        raise RuntimeError("请先选择离线包保存路径")
+    server_path = Path(settings.llama_server_path or DEFAULT_SERVER_PATH).expanduser()
+    model_path = Path(settings.jina_model_path or DEFAULT_MODEL_PATH).expanduser()
+    if not server_path.exists():
+        raise FileNotFoundError(f"未找到 llama-server：{server_path}")
+    if not model_path.exists():
+        raise FileNotFoundError(f"未找到 Jina GGUF 模型：{model_path}")
+
+    target = Path(package_path).expanduser()
+    if target.suffix.lower() != ".zip":
+        target = target.with_suffix(".zip")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.write(server_path, _PACKAGE_SERVER_MEMBER)
+        archive.write(model_path, _PACKAGE_MODEL_MEMBER)
+    return {
+        "deployed": True,
+        "package_path": str(target),
+        "server_path": str(server_path),
+        "model_path": str(model_path),
+        "message": f"离线包已生成：{target}",
+    }
+
+
+def resolve_llama_server_asset(release_api_url: str = LLAMA_RELEASE_API_URL) -> dict[str, str]:
+    """从 llama.cpp 最新 release 中选择 Windows CPU x64 二进制包。"""
+
+    data = _request_json("GET", release_api_url, timeout=DEFAULT_TIMEOUT)
+    assets = data.get("assets", [])
+    if not isinstance(assets, list):
+        raise RuntimeError("GitHub release 响应缺少 assets")
+    for item in assets:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        url = str(item.get("browser_download_url") or "")
+        if name.startswith("llama-") and name.endswith("-bin-win-cpu-x64.zip") and url:
+            return {"name": name, "url": url}
+    raise RuntimeError("未在 llama.cpp 最新 release 中找到 Windows CPU x64 运行时")
 
 
 def match_with_jina(settings: AISettings, summary_text: str) -> list[dict[str, Any]]:
@@ -445,7 +673,7 @@ def _request_json_result(
     timeout: float = DEFAULT_TIMEOUT,
 ) -> tuple[dict[str, Any], int, str]:
     body = None
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": "EchoGuard-AI-Runtime/1.0"}
     if payload is not None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -471,6 +699,63 @@ def _request_json_result(
     return data, status, url
 
 
+def _download_file(
+    url: str,
+    target: Path,
+    progress: ProgressCallback | None,
+    current_file: str,
+) -> None:
+    request = urllib.request.Request(url, headers={"User-Agent": "EchoGuard-AI-Runtime/1.0"})
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with urllib.request.urlopen(request, timeout=DOWNLOAD_TIMEOUT) as response:  # noqa: S310 - 官方下载源。
+            total_text = response.headers.get("Content-Length") or "0"
+            total = int(total_text) if total_text.isdigit() else 0
+            downloaded = 0
+            with target.open("wb") as handle:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    percent = int(downloaded * 100 / total) if total else 0
+                    _emit_progress(
+                        progress,
+                        phase="download",
+                        current_file=current_file,
+                        downloaded_bytes=downloaded,
+                        total_bytes=total,
+                        percent=percent,
+                        message=_download_message(current_file, downloaded, total),
+                    )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"下载失败 HTTP {exc.code}：{current_file} {detail[:180]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"下载失败：{current_file} {exc.reason}") from exc
+
+
+def _download_message(current_file: str, downloaded: int, total: int) -> str:
+    if total:
+        return f"正在下载 {current_file}：{_format_bytes(downloaded)} / {_format_bytes(total)}"
+    return f"正在下载 {current_file}：{_format_bytes(downloaded)}"
+
+
+def _format_bytes(value: int) -> str:
+    size = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _emit_progress(progress: ProgressCallback | None, **payload: Any) -> None:
+    if progress is not None:
+        progress(dict(payload))
+
+
 def _join_url(base_url: str, path: str, provider: str = "openai_compatible") -> str:
     base = (base_url or "").rstrip("/")
     if not base:
@@ -482,6 +767,17 @@ def _join_url(base_url: str, path: str, provider: str = "openai_compatible") -> 
     if path.startswith("/v1/") and base.endswith("/v1"):
         path = path[3:]
     return base + path
+
+
+def _find_package_member(archive: zipfile.ZipFile, expected_suffix: str) -> str | None:
+    expected = expected_suffix.replace("\\", "/").lower()
+    for name in archive.namelist():
+        normalized = name.replace("\\", "/").strip("/")
+        if normalized.endswith("/") or normalized.lower().endswith("__macosx"):
+            continue
+        if normalized.lower().endswith(expected):
+            return name
+    return None
 
 
 def _normalize_provider(provider: str, values: dict[str, Any]) -> str:
@@ -543,6 +839,14 @@ def _host_port(base_url: str) -> tuple[str, int]:
     host = parsed.hostname or "127.0.0.1"
     port = parsed.port or 18081
     return host, port
+
+
+def _is_tcp_port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.35):
+            return True
+    except OSError:
+        return False
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
