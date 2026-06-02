@@ -20,9 +20,9 @@ from pathlib import Path
 # 品牌与基础常量
 # ---------------------------------------------------------------------------
 BRAND_NAME = "EchoGuard"
-BRAND_VERSION = "v2.4"
-APP_TITLE = "EchoGuard v2.4 · WiFi-CSI + LoRa 感知救援控制台"
-WINDOW_TITLE = "EchoGuard v2.4"
+BRAND_VERSION = ""
+APP_TITLE = "EchoGuard"
+WINDOW_TITLE = "EchoGuard"
 CONTROL_ID = "0xFF-AD-01"
 
 BAUDRATE = 115200
@@ -38,6 +38,7 @@ MAX_HISTORY_ROWS = 6000
 MAX_EVENT_ROWS = 240
 
 EXPORT_DIR = Path(__file__).resolve().parent / "exports"
+APP_ICON_PATH = Path(__file__).resolve().parent / "assets" / "app_icon.ico"
 
 
 # ---------------------------------------------------------------------------
