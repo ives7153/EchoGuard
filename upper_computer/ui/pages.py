@@ -68,6 +68,7 @@ try:
         ThresholdSlider,
         TopologyWidget,
     )
+    from .icons import refresh_widget_icons
     from ..rules.detection_fusion import ai_fallback_text, build_detection_summary, verdict_color_key
 except ImportError:
     from config import (
@@ -94,6 +95,7 @@ except ImportError:
         ThresholdSlider,
         TopologyWidget,
     )
+    from ui.icons import refresh_widget_icons
     from rules.detection_fusion import ai_fallback_text, build_detection_summary, verdict_color_key  # type: ignore
 
 
@@ -133,8 +135,11 @@ class AISettingsDialog(QDialog):
         self._last_operation_active = False
         self._available_models: list[str] = []
         self._model_source = ""
+        self._status_ok = True
+        self._jina_status_ok = True
         self._build_ui()
         self._load_config(self._config)
+        self.refresh_theme()
 
     def _build_ui(self) -> None:
         outer = QVBoxLayout(self)
@@ -358,6 +363,7 @@ class AISettingsDialog(QDialog):
         button.setEnabled(not running)
         label = self._action_label(action)
         button.setText(f"{label}..." if running else label)
+        refresh_widget_icons(button)
 
     def _action_label(self, action: str) -> str:
         return {
@@ -376,13 +382,7 @@ class AISettingsDialog(QDialog):
 
     def _show_model_menu(self) -> None:
         menu = QMenu(self)
-        menu.setStyleSheet(
-            f"QMenu {{ background: {THEME['card_alt']}; border: 1px solid {THEME['border']};"
-            f" border-radius: 8px; padding: 6px; }}"
-            f"QMenu::item {{ color: {THEME['text_soft']}; padding: 8px 22px 8px 12px; border-radius: 6px; }}"
-            f"QMenu::item:selected {{ background: {THEME['blue']}; color: #FFFFFF; }}"
-            f"QMenu::item:disabled {{ color: {THEME['muted_2']}; }}"
-        )
+        menu.setStyleSheet(_menu_qss())
         if not self._available_models:
             empty = QAction("暂无模型，请先点击获取模型", menu)
             empty.setEnabled(False)
@@ -494,12 +494,14 @@ class AISettingsDialog(QDialog):
         self._request_action("create_jina_offline_package", {"package_path": path})
 
     def set_status(self, text: str, ok: bool = True) -> None:
+        self._status_ok = ok
         self.status_label.setText(text)
         self.status_label.setStyleSheet(
             f"color: {THEME['blue_soft'] if ok else THEME['red']}; font-size: 12px;"
         )
 
     def set_jina_status(self, text: str, ok: bool = True) -> None:
+        self._jina_status_ok = ok
         self.jina_status_label.setText(text)
         self.jina_status_label.setStyleSheet(
             f"color: {THEME['blue_soft'] if ok else THEME['red']}; font-size: 12px;"
@@ -563,6 +565,15 @@ class AISettingsDialog(QDialog):
             self.set_status(error, False)
         elif status:
             self.set_status(status, True)
+
+    def refresh_theme(self) -> None:
+        self.setStyleSheet(
+            f"QDialog {{ background: {THEME['bg']}; }}"
+            f"QLabel {{ color: {THEME['text_soft']}; }}"
+        )
+        self.set_status(self.status_label.text(), self._status_ok)
+        self.set_jina_status(self.jina_status_label.text(), self._jina_status_ok)
+        refresh_widget_icons(self)
 
     def _apply_model_result(self, result: dict[str, Any]) -> None:
         models = result.get("models")
@@ -653,6 +664,10 @@ class DashboardPage(QWidget):
         self._last_verdict = ("等待数据", "尚未收到有效节点数据", THEME["muted"])
         self._latest_ai_config: dict[str, Any] = {}
         self._ai_dialog: AISettingsDialog | None = None
+        self._latest_nodes: dict[int, dict[str, Any]] = {}
+        self._latest_active_node = 0
+        self._latest_active_state: dict[str, Any] = {}
+        self._export_ok = True
 
         body = QHBoxLayout(self)
         body.setContentsMargins(0, 0, 0, 0)
@@ -862,6 +877,7 @@ class DashboardPage(QWidget):
         active_state = nodes.get(active_node, {}) if active_node else {}
         self._latest_nodes = nodes
         self._latest_active_node = active_node
+        self._latest_active_state = dict(active_state)
         self._latest_ai_config = dict(ai_state.get("config") or {})
         if self._ai_dialog is not None:
             self._ai_dialog.set_runtime_state(ai_state)
@@ -907,6 +923,7 @@ class DashboardPage(QWidget):
             self.node_combo.addItem("等待节点接入", 0)
             self.node_combo.setEnabled(False)
             self.detail_btn.setEnabled(False)
+            refresh_widget_icons(self.detail_btn)
             self.node_combo.blockSignals(False)
             return 0
 
@@ -916,6 +933,7 @@ class DashboardPage(QWidget):
             self.node_combo.addItem(label, node_id)
         self.node_combo.setEnabled(True)
         self.detail_btn.setEnabled(True)
+        refresh_widget_icons(self.detail_btn)
         self.node_combo.setCurrentIndex(discovered_ids.index(selected))
         self.node_combo.blockSignals(False)
         return selected
@@ -991,6 +1009,7 @@ class DashboardPage(QWidget):
         self.ai_verdict.setText(ai_text)
 
     def set_export_message(self, text: str, ok: bool = True) -> None:
+        self._export_ok = ok
         self.export_message.setText(text)
         self.export_message.setStyleSheet(
             f"color: {THEME['blue_soft'] if ok else THEME['red']};"
@@ -1040,6 +1059,28 @@ class DashboardPage(QWidget):
             f"font-size: 19px; color: {THEME['red'] if loss >= 8 else THEME['orange'] if loss >= 2 else THEME['text']};"
         )
 
+    def refresh_theme(self) -> None:
+        status, detail, _color = self._last_verdict
+        color = THEME[verdict_color_key(status)]
+        self._last_verdict = (status, detail, color)
+        self.verdict_status.setStyleSheet(f"font-size: 22px; color: {color};")
+        self.ai_verdict.setStyleSheet(f"color: {THEME['blue_soft']}; font-size: 13px; font-weight: 600;")
+        self.set_export_message(self.export_message.text(), self._export_ok)
+        self.csi_plot.refresh_theme()
+        self.event_panel.refresh_theme()
+        self.topology_widget.update()
+        for card in self.metric_cards.values():
+            card.refresh_theme()
+        if self._latest_active_state:
+            self._update_metric_cards(self._latest_active_state)
+            self._update_group_cards(self._latest_active_state)
+        else:
+            for value_label in self.group_values.values():
+                value_label.setStyleSheet("font-size: 19px;")
+        if self._ai_dialog is not None:
+            self._ai_dialog.refresh_theme()
+        refresh_widget_icons(self)
+
 
 # ===========================================================================
 # 传感器页 / 活动节点矩阵（图 1）
@@ -1055,11 +1096,7 @@ class _MatrixRow(QFrame):
         self._state: dict[str, Any] = {}
         self.setObjectName("MatrixRow")
         self.setFixedHeight(78)
-        self.setStyleSheet(
-            "QFrame#MatrixRow { background: transparent; border: 0;"
-            f" border-bottom: 1px solid {THEME['border_soft']}; }}"
-            "QFrame#MatrixRow:hover { background: #1A1C22; }"
-        )
+        self._apply_row_style()
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(20, 8, 16, 8)
@@ -1102,6 +1139,13 @@ class _MatrixRow(QFrame):
         self.menu_btn.clicked.connect(lambda: self.menu_requested.emit(self.matrix_id))
         layout.addWidget(self._fixed(self.menu_btn, _MATRIX_COLUMNS[6][1], align_left=False))
 
+    def _apply_row_style(self) -> None:
+        self.setStyleSheet(
+            "QFrame#MatrixRow { background: transparent; border: 0;"
+            f" border-bottom: 1px solid {THEME['border_soft']}; }}"
+            f"QFrame#MatrixRow:hover {{ background: {THEME['row_hover']}; }}"
+        )
+
     @staticmethod
     def _fixed(widget: QWidget, width: int, align_left: bool) -> QWidget:
         holder = QWidget()
@@ -1134,6 +1178,13 @@ class _MatrixRow(QFrame):
         advice, color = _matrix_advice(state)
         self.advice_label.setText(advice)
         self.advice_label.setStyleSheet(f"color: {color}; font-size: 13px;")
+
+    def refresh_theme(self) -> None:
+        self._apply_row_style()
+        self.mode_tag.refresh_theme()
+        self.battery.refresh_theme()
+        self.health.refresh_theme()
+        self.update_state(self._state)
 
 
 class SensorMatrixPage(QWidget):
@@ -1200,7 +1251,8 @@ class SensorMatrixPage(QWidget):
         table_layout.setContentsMargins(0, 0, 0, 0)
         table_layout.setSpacing(0)
 
-        table_layout.addWidget(self._build_table_header())
+        self.matrix_header = self._build_table_header()
+        table_layout.addWidget(self.matrix_header)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -1225,11 +1277,7 @@ class SensorMatrixPage(QWidget):
         header = QFrame()
         header.setObjectName("MatrixHeader")
         header.setFixedHeight(50)
-        header.setStyleSheet(
-            "QFrame#MatrixHeader { background: #16171C; border: 0;"
-            f" border-bottom: 1px solid {THEME['border']};"
-            " border-top-left-radius: 12px; border-top-right-radius: 12px; }"
-        )
+        self._style_matrix_header(header)
         layout = QHBoxLayout(header)
         layout.setContentsMargins(20, 0, 16, 0)
         layout.setSpacing(0)
@@ -1291,18 +1339,18 @@ class SensorMatrixPage(QWidget):
         self.gas_slider.valueChanged.connect(self.gas_threshold_changed.emit)
         layout.addWidget(self.gas_slider)
 
-        divider = QFrame()
-        divider.setFixedHeight(1)
-        divider.setStyleSheet(f"background: {THEME['divider']};")
-        layout.addWidget(divider)
+        self.config_divider = QFrame()
+        self.config_divider.setFixedHeight(1)
+        self.config_divider.setStyleSheet(f"background: {THEME['divider']};")
+        layout.addWidget(self.config_divider)
 
-        afh_row = SettingRow("自动频率跳变 (AFH)", checked=DEFAULT_AFH_ENABLED)
-        afh_row.toggled.connect(self.afh_toggled.emit)
-        layout.addWidget(afh_row)
+        self.afh_row = SettingRow("自动频率跳变 (AFH)", checked=DEFAULT_AFH_ENABLED)
+        self.afh_row.toggled.connect(self.afh_toggled.emit)
+        layout.addWidget(self.afh_row)
 
-        mesh_row = SettingRow("多级网格中继", checked=DEFAULT_MESH_ENABLED)
-        mesh_row.toggled.connect(self.mesh_toggled.emit)
-        layout.addWidget(mesh_row)
+        self.mesh_row = SettingRow("多级网格中继", checked=DEFAULT_MESH_ENABLED)
+        self.mesh_row.toggled.connect(self.mesh_toggled.emit)
+        layout.addWidget(self.mesh_row)
 
         layout.addStretch(1)
 
@@ -1452,6 +1500,26 @@ class SensorMatrixPage(QWidget):
             ),
         )
 
+    def _style_matrix_header(self, header: QFrame) -> None:
+        header.setStyleSheet(
+            f"QFrame#MatrixHeader {{ background: {THEME['card_alt']}; border: 0;"
+            f" border-bottom: 1px solid {THEME['border']};"
+            " border-top-left-radius: 12px; border-top-right-radius: 12px; }"
+        )
+
+    def refresh_theme(self) -> None:
+        self.empty_matrix_label.setStyleSheet(f"color: {THEME['muted']}; padding: 24px;")
+        self._style_matrix_header(self.matrix_header)
+        self.config_divider.setStyleSheet(f"background: {THEME['divider']};")
+        self.presence_slider.refresh_theme()
+        self.gas_slider.refresh_theme()
+        self.afh_row.refresh_theme()
+        self.mesh_row.refresh_theme()
+        self.warning_bar.refresh_theme()
+        for row in self._rows.values():
+            row.refresh_theme()
+        refresh_widget_icons(self)
+
 
 # ===========================================================================
 # 数据分析页
@@ -1543,8 +1611,8 @@ class AnalysisPage(QWidget):
         self.plot.addLegend(offset=(10, 10))
         for axis_name in ("bottom", "left"):
             axis = self.plot.getAxis(axis_name)
-            axis.setPen(pg.mkPen("#3A3D45"))
-            axis.setTextPen(pg.mkPen("#6C7280"))
+            axis.setPen(pg.mkPen(THEME["plot_axis"]))
+            axis.setTextPen(pg.mkPen(THEME["plot_axis_text"]))
         self.plot.setLabel("left", "Value")
         self.plot.setLabel("bottom", "Last 60s")
         self._curves = {}
@@ -1641,6 +1709,20 @@ class AnalysisPage(QWidget):
             self.active_node_changed.emit(node_id)
         self._last_plot_at = 0.0
 
+    def refresh_theme(self) -> None:
+        self.plot.setBackground(THEME["card"])
+        for axis_name in ("bottom", "left"):
+            axis = self.plot.getAxis(axis_name)
+            axis.setPen(pg.mkPen(THEME["plot_axis"]))
+            axis.setTextPen(pg.mkPen(THEME["plot_axis_text"]))
+        self.analysis_empty_label.setStyleSheet(f"color: {THEME['muted']}; padding: 8px;")
+        self._palette = [THEME["blue_bright"], THEME["green"], THEME["orange"], THEME["cyan"]]
+        for index, curve in enumerate(self._curves.values()):
+            curve.setPen(pg.mkPen(self._palette[index % len(self._palette)], width=2.0))
+        for card in self.stat_cards.values():
+            card.refresh_theme()
+        refresh_widget_icons(self)
+
     def _analysis_history(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         now = time.time()
         selected_node = int(self.analysis_node_combo.currentData() or 0)
@@ -1664,6 +1746,7 @@ class DiagnosticsPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._link_labels: dict[int, dict[str, QLabel]] = {}
+        self._latest_snapshot: dict[str, Any] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -1766,6 +1849,7 @@ class DiagnosticsPage(QWidget):
         layout.addStretch(1)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self._latest_snapshot = snapshot
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         config: dict[str, Any] = snapshot.get("config", {})
 
@@ -1831,6 +1915,21 @@ class DiagnosticsPage(QWidget):
     def _copy_report(self) -> None:
         QApplication.clipboard().setText(self.report_box.toPlainText())
 
+    def refresh_theme(self) -> None:
+        self.report_box.setStyleSheet(
+            f"background: {THEME['card_alt']}; border: 1px solid {THEME['border']};"
+            f" border-radius: 8px; color: {THEME['text_soft']}; padding: 8px;"
+        )
+        for cells in self._link_labels.values():
+            for key, label in cells.items():
+                if key not in {"status", "loss"}:
+                    label.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px;")
+        for value in self.info_labels.values():
+            value.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 14px; font-weight: 600;")
+        if self._latest_snapshot:
+            self.update_snapshot(self._latest_snapshot)
+        refresh_widget_icons(self)
+
 
 # ===========================================================================
 # 历史记录页
@@ -1849,6 +1948,7 @@ class HistoryPage(QWidget):
         self._last_refresh_at = 0.0
         self._latest_filtered: list[dict[str, Any]] = []
         self._known_nodes: list[tuple[int, str]] = []
+        self._export_ok = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -1999,10 +2099,16 @@ class HistoryPage(QWidget):
         )
 
     def set_export_message(self, text: str, ok: bool = True) -> None:
+        self._export_ok = ok
         self.export_message.setText(text)
         self.export_message.setStyleSheet(
             f"color: {THEME['blue_soft'] if ok else THEME['red']};"
         )
+
+    def refresh_theme(self) -> None:
+        self.empty_label.setStyleSheet(f"color: {THEME['muted']}; padding: 8px;")
+        self.set_export_message(self.export_message.text(), self._export_ok)
+        refresh_widget_icons(self)
 
 
 # ---------------------------------------------------------------------------
@@ -2045,6 +2151,16 @@ def _show_detail_dialog(parent: QWidget, title: str, rows: tuple[tuple[str, Any]
     footer.addWidget(close_btn)
     layout.addLayout(footer)
     dialog.exec()
+
+
+def _menu_qss() -> str:
+    return (
+        f"QMenu {{ background: {THEME['card_alt']}; border: 1px solid {THEME['border']};"
+        f" border-radius: 10px; padding: 6px; }}"
+        f"QMenu::item {{ color: {THEME['text_soft']}; padding: 8px 22px 8px 12px; border-radius: 6px; }}"
+        f"QMenu::item:selected {{ background: {THEME['blue']}; color: {THEME['selection_text']}; }}"
+        f"QMenu::item:disabled {{ color: {THEME['muted_2']}; }}"
+    )
 
 
 def _node_label(node_id: int, state: dict[str, Any] | None = None) -> str:

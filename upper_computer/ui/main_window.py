@@ -11,6 +11,7 @@ from typing import Any
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -29,8 +30,13 @@ try:
         BRAND_VERSION,
         NAV_ITEMS,
         THEME,
+        build_qss,
+        save_ui_settings,
+        set_theme_mode,
+        theme_mode,
     )
     from .components import StatusPill
+    from .icons import IconButton, SvgIcon, refresh_widget_icons
     from .pages import (
         AnalysisPage,
         DashboardPage,
@@ -45,8 +51,13 @@ except ImportError:
         BRAND_VERSION,
         NAV_ITEMS,
         THEME,
+        build_qss,
+        save_ui_settings,
+        set_theme_mode,
+        theme_mode,
     )
     from ui.components import StatusPill
+    from ui.icons import IconButton, SvgIcon, refresh_widget_icons
     from ui.pages import (
         AnalysisPage,
         DashboardPage,
@@ -73,9 +84,8 @@ class NavItem(QFrame):
         layout.setContentsMargins(16, 0, 14, 0)
         layout.setSpacing(14)
 
-        self.icon_label = QLabel(icon)
+        self.icon_label = SvgIcon(icon, size=19, color=self._icon_color(selected))
         self.icon_label.setObjectName("NavIcon")
-        self.icon_label.setProperty("selected", selected)
         self.icon_label.setFixedWidth(34)
         self.text_label = QLabel(text)
         self.text_label.setObjectName("NavText")
@@ -86,15 +96,19 @@ class NavItem(QFrame):
 
     def set_selected(self, selected: bool) -> None:
         self.setProperty("selected", selected)
-        self.icon_label.setProperty("selected", selected)
+        self.icon_label.set_icon_color(self._icon_color(selected))
         self.text_label.setProperty("selected", selected)
-        for widget in (self, self.icon_label, self.text_label):
+        for widget in (self, self.text_label):
             widget.style().unpolish(widget)
             widget.style().polish(widget)
 
     def mousePressEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
         del event
         self.clicked.emit(self.key)
+
+    @staticmethod
+    def _icon_color(selected: bool) -> str:
+        return THEME["blue_bright"] if selected else THEME["text_soft"]
 
 
 class MainWindow(QMainWindow):
@@ -138,9 +152,12 @@ class MainWindow(QMainWindow):
         self.nav_items: dict[str, NavItem] = {}
         self.pages: dict[str, QWidget] = {}
         self._current_key = "dashboard"
+        self._last_status_text = "串口状态：初始化中"
+        self._last_status_ok = False
 
         self._build_ui()
         self._wire_pages()
+        self.refresh_theme()
 
     # ------------------------------------------------------------------ 构建
     def _build_ui(self) -> None:
@@ -173,15 +190,21 @@ class MainWindow(QMainWindow):
         brand.setObjectName("AppTitle")
         layout.addWidget(brand)
 
-        sep = QLabel("|")
-        sep.setStyleSheet(f"color: {THEME['muted_3']};")
-        layout.addWidget(sep)
+        self.top_sep = QLabel("|")
+        self.top_sep.setStyleSheet(f"color: {THEME['muted_3']};")
+        layout.addWidget(self.top_sep)
 
         self.page_subtitle = QLabel("实时生命体征监测")
         self.page_subtitle.setObjectName("TopSubtitle")
         layout.addWidget(self.page_subtitle)
 
         layout.addStretch(1)
+
+        self.theme_btn = IconButton("sun")
+        self.theme_btn.setObjectName("GhostButton")
+        self.theme_btn.setFixedSize(38, 34)
+        self.theme_btn.clicked.connect(self.toggle_theme)
+        layout.addWidget(self.theme_btn)
 
         self.status_pill = StatusPill()
         layout.addWidget(self.status_pill)
@@ -218,11 +241,11 @@ class MainWindow(QMainWindow):
 
         caption = QLabel("系统核心")
         caption.setObjectName("NavCaption")
-        session = QLabel("● 当前会话")
-        session.setObjectName("NavSession")
-        session.setStyleSheet(f"color: {THEME['green']}; font-size: 12px;")
+        self.session_label = QLabel("● 当前会话")
+        self.session_label.setObjectName("NavSession")
+        self.session_label.setStyleSheet(f"color: {THEME['green']}; font-size: 12px;")
         layout.addWidget(caption)
-        layout.addWidget(session)
+        layout.addWidget(self.session_label)
         layout.addSpacing(16)
 
         for entry in NAV_ITEMS:
@@ -235,10 +258,10 @@ class MainWindow(QMainWindow):
             layout.addWidget(item)
 
         layout.addSpacing(16)
-        line = QFrame()
-        line.setFixedHeight(1)
-        line.setStyleSheet(f"background: {THEME['divider']};")
-        layout.addWidget(line)
+        self.nav_divider = QFrame()
+        self.nav_divider.setFixedHeight(1)
+        self.nav_divider.setStyleSheet(f"background: {THEME['divider']};")
+        layout.addWidget(self.nav_divider)
         layout.addSpacing(10)
 
         layout.addStretch(1)
@@ -344,6 +367,8 @@ class MainWindow(QMainWindow):
         self.port_combo.blockSignals(False)
 
     def set_status(self, text: str, ok: bool = True) -> None:
+        self._last_status_text = text
+        self._last_status_ok = ok
         self.status_pill.set_state("● 实时生命体征监测" if ok else "● 待连接真实串口", ok)
         self.status_detail.setText(text)
         self.status_detail.setStyleSheet(
@@ -371,3 +396,39 @@ class MainWindow(QMainWindow):
         # 避免后台页面做无意义的重绘。
         for page in self.pages.values():
             page.update_snapshot(snapshot)
+
+    # ------------------------------------------------------------------ 主题
+    def toggle_theme(self) -> None:
+        target = "light" if theme_mode() == "dark" else "dark"
+        self.apply_theme(target)
+
+    def apply_theme(self, mode: str) -> None:
+        applied = set_theme_mode(mode)
+        save_ui_settings({"theme_mode": applied})
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(build_qss())
+        self.refresh_theme()
+
+    def refresh_theme(self) -> None:
+        if hasattr(self, "theme_btn"):
+            is_dark = theme_mode() == "dark"
+            self.theme_btn.set_icon_name("sun" if is_dark else "moon")
+            self.theme_btn.setToolTip("切换到浅色主题" if is_dark else "切换到深色主题")
+        if hasattr(self, "top_sep"):
+            self.top_sep.setStyleSheet(f"color: {THEME['muted_3']};")
+        if hasattr(self, "session_label"):
+            self.session_label.setStyleSheet(f"color: {THEME['green']}; font-size: 12px;")
+        if hasattr(self, "nav_divider"):
+            self.nav_divider.setStyleSheet(f"background: {THEME['divider']};")
+        if hasattr(self, "status_pill"):
+            self.status_pill.refresh_theme()
+        if hasattr(self, "status_detail"):
+            self.status_detail.setStyleSheet(
+                f"color: {THEME['green'] if self._last_status_ok else THEME['orange']}; font-size: 12px;"
+            )
+        for page in getattr(self, "pages", {}).values():
+            refresh = getattr(page, "refresh_theme", None)
+            if callable(refresh):
+                refresh()
+        refresh_widget_icons(self)
