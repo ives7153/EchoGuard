@@ -209,6 +209,9 @@ class AISettingsDialog(QDialog):
         deploy_btn = QPushButton("导入离线包")
         deploy_btn.setObjectName("GhostButton")
         deploy_btn.clicked.connect(self._deploy_jina_package)
+        import_model_btn = QPushButton("导入 GGUF")
+        import_model_btn.setObjectName("GhostButton")
+        import_model_btn.clicked.connect(self._import_jina_model)
         package_btn = QPushButton("生成离线包")
         package_btn.setObjectName("GhostButton")
         package_btn.clicked.connect(self._create_jina_package)
@@ -226,6 +229,7 @@ class AISettingsDialog(QDialog):
         test_embed_btn.clicked.connect(lambda: self._request_action("test_embedding"))
         self._action_buttons["online_deploy_jina"] = online_deploy_btn
         self._action_buttons["deploy_jina_package"] = deploy_btn
+        self._action_buttons["import_jina_model"] = import_model_btn
         self._action_buttons["create_jina_offline_package"] = package_btn
         self._action_buttons["start_and_test_jina"] = one_key_start_btn
         self._action_buttons["start_jina"] = start_btn
@@ -233,6 +237,7 @@ class AISettingsDialog(QDialog):
         self._action_buttons["test_embedding"] = test_embed_btn
         jina_actions.addWidget(online_deploy_btn)
         jina_actions.addWidget(deploy_btn)
+        jina_actions.addWidget(import_model_btn)
         jina_actions.addWidget(package_btn)
         jina_actions.addWidget(one_key_start_btn)
         jina_actions.addWidget(start_btn)
@@ -358,7 +363,13 @@ class AISettingsDialog(QDialog):
         self._last_operation_active = True
         self._set_action_running(action, True)
         self.set_status(self._action_label(action) + "执行中...", True)
-        if action in {"check_jina_deployment", "deploy_jina_package", "online_deploy_jina", "create_jina_offline_package"}:
+        if action in {
+            "check_jina_deployment",
+            "deploy_jina_package",
+            "online_deploy_jina",
+            "import_jina_model",
+            "create_jina_offline_package",
+        }:
             self.set_jina_status(self._action_label(action) + "执行中...", True)
         elif action in {"start_jina", "start_and_test_jina"}:
             self.set_jina_status("部署状态：服务启动中", True)
@@ -382,6 +393,7 @@ class AISettingsDialog(QDialog):
             "check_jina_deployment": "检查部署",
             "online_deploy_jina": "在线部署",
             "deploy_jina_package": "导入离线包",
+            "import_jina_model": "导入 GGUF",
             "create_jina_offline_package": "生成离线包",
             "start_and_test_jina": "一键启动",
             "start_jina": "启动本地 Jina",
@@ -504,6 +516,18 @@ class AISettingsDialog(QDialog):
             return
         self._request_action("create_jina_offline_package", {"package_path": path})
 
+    def _import_jina_model(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "选择 Jina GGUF 模型",
+            self.model_path_edit.text(),
+            "GGUF Model (*.gguf);;All Files (*)",
+        )
+        if not path:
+            self.set_jina_status("部署状态：已取消导入 GGUF 模型", False)
+            return
+        self._request_action("import_jina_model", {"package_path": path})
+
     def set_status(self, text: str, ok: bool = True) -> None:
         self._status_ok = ok
         self.status_label.setText(text)
@@ -543,6 +567,7 @@ class AISettingsDialog(QDialog):
             "check_jina_deployment",
             "online_deploy_jina",
             "deploy_jina_package",
+            "import_jina_model",
             "create_jina_offline_package",
             "start_and_test_jina",
             "start_jina",
@@ -608,6 +633,7 @@ class AISettingsDialog(QDialog):
                 "check_jina_deployment": "部署状态：检查中",
                 "online_deploy_jina": "部署状态：在线部署中",
                 "deploy_jina_package": "部署状态：部署中",
+                "import_jina_model": "部署状态：正在导入 GGUF 模型",
                 "create_jina_offline_package": "部署状态：正在生成离线包",
                 "start_jina": "部署状态：服务启动中",
                 "start_and_test_jina": "部署状态：服务启动中",
@@ -626,7 +652,7 @@ class AISettingsDialog(QDialog):
 
         ok = bool(result.get("ok", False))
         message = str(result.get("message") or "")
-        if ok and action in {"check_jina_deployment", "deploy_jina_package", "online_deploy_jina"}:
+        if ok and action in {"check_jina_deployment", "deploy_jina_package", "online_deploy_jina", "import_jina_model"}:
             deployed = bool(result.get("deployed", False))
             prefix = "部署状态：已部署" if deployed else "部署状态：未部署"
             self.set_jina_status(f"{prefix} · {message}", deployed)
@@ -666,6 +692,16 @@ class DashboardPage(QWidget):
     ai_llm_test_requested = pyqtSignal()
     ai_action_requested = pyqtSignal(object)
 
+    _VERDICT_PRIORITY = {
+        "等待数据": 0,
+        "未检测到稳定微动": 1,
+        "数据不足": 2,
+        "疑似局部微动": 3,
+        "多节点疑似生命微动": 4,
+    }
+    _VERDICT_MIN_HOLD_SECONDS = 2.0
+    _VERDICT_STABLE_SECONDS = 1.2
+
     def __init__(self) -> None:
         super().__init__()
         self.metric_cards: dict[str, MetricCard] = {}
@@ -679,6 +715,11 @@ class DashboardPage(QWidget):
         self._latest_active_node = 0
         self._latest_active_state: dict[str, Any] = {}
         self._export_ok = True
+        self._display_verdict_summary: Any | None = None
+        self._pending_verdict_summary: Any | None = None
+        self._pending_verdict_since = 0.0
+        self._display_verdict_since = 0.0
+        self._verdict_chips: dict[str, QLabel] = {}
 
         body = QHBoxLayout(self)
         body.setContentsMargins(0, 0, 0, 0)
@@ -733,10 +774,10 @@ class DashboardPage(QWidget):
         layout.addLayout(controls)
 
         self.verdict_card = CardFrame()
-        self.verdict_card.setMinimumHeight(128)
+        self.verdict_card.setFixedHeight(128)
         verdict_layout = QHBoxLayout(self.verdict_card)
-        verdict_layout.setContentsMargins(18, 16, 18, 16)
-        verdict_layout.setSpacing(20)
+        verdict_layout.setContentsMargins(18, 14, 18, 14)
+        verdict_layout.setSpacing(18)
         verdict_title_box = QVBoxLayout()
         verdict_title_box.setSpacing(6)
         verdict_title = QLabel("综合研判结果")
@@ -751,23 +792,46 @@ class DashboardPage(QWidget):
         verdict_title_box.addWidget(verdict_subtitle)
         verdict_title_box.addWidget(self.ai_settings_btn)
         verdict_title_box.addStretch(1)
+
+        verdict_status_box = QVBoxLayout()
+        verdict_status_box.setSpacing(6)
         self.verdict_status = QLabel("等待数据")
         self.verdict_status.setObjectName("MetricValue")
-        self.verdict_status.setStyleSheet(f"font-size: 22px; color: {THEME['muted']};")
-        self.verdict_detail = QLabel("尚未收到有效节点数据")
+        self.verdict_meta = QLabel("规则融合 · 最近 5 秒 · 稳定显示")
+        self.verdict_meta.setObjectName("SubtleText")
+        self.verdict_detail = QLabel("规则融合：尚未收到有效节点数据")
         self.verdict_detail.setObjectName("SubtleText")
         self.verdict_detail.setWordWrap(True)
         self.ai_verdict = QLabel("AI辅助研判：暂无有效样本，建议连接 Gateway 后继续采集")
         self.ai_verdict.setObjectName("SubtleText")
         self.ai_verdict.setWordWrap(True)
-        self.ai_verdict.setStyleSheet(f"color: {THEME['blue_soft']}; font-size: 13px; font-weight: 600;")
-        verdict_result_box = QVBoxLayout()
-        verdict_result_box.setSpacing(8)
-        verdict_result_box.addWidget(self.verdict_detail)
-        verdict_result_box.addWidget(self.ai_verdict)
+        verdict_status_box.addWidget(self.verdict_status)
+        verdict_status_box.addWidget(self.verdict_meta)
+        verdict_status_box.addWidget(self.verdict_detail)
+        verdict_status_box.addWidget(self.ai_verdict)
+
+        verdict_facts = QGridLayout()
+        verdict_facts.setHorizontalSpacing(8)
+        verdict_facts.setVerticalSpacing(8)
+        for key, text in (
+            ("participants", "参与节点：0"),
+            ("triggered", "触发节点：无"),
+            ("window", "时间窗口：最近 5 秒"),
+            ("updated", "更新：--"),
+        ):
+            chip = QLabel(text)
+            chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            chip.setMinimumHeight(26)
+            self._verdict_chips[key] = chip
+        verdict_facts.addWidget(self._verdict_chips["participants"], 0, 0)
+        verdict_facts.addWidget(self._verdict_chips["triggered"], 0, 1)
+        verdict_facts.addWidget(self._verdict_chips["window"], 1, 0)
+        verdict_facts.addWidget(self._verdict_chips["updated"], 1, 1)
+
         verdict_layout.addLayout(verdict_title_box, 1)
-        verdict_layout.addWidget(self.verdict_status)
-        verdict_layout.addLayout(verdict_result_box, 2)
+        verdict_layout.addLayout(verdict_status_box, 3)
+        verdict_layout.addLayout(verdict_facts, 2)
+        self._apply_verdict_styles(THEME["muted"])
         layout.addWidget(self.verdict_card)
 
         self.csi_plot = CsiTrendPlot()
@@ -1005,19 +1069,103 @@ class DashboardPage(QWidget):
         ai_state: dict[str, Any],
     ) -> None:
         summary = build_detection_summary(nodes, history)
-        status = summary.status
-        detail = summary.detail
+        display_summary = self._stable_verdict_summary(summary)
+        status = display_summary.status
+        detail = display_summary.detail
         color = THEME[verdict_color_key(status)]
         self._last_verdict = (status, detail, color)
-        self.verdict_status.setText(status)
-        self.verdict_status.setStyleSheet(f"font-size: 22px; color: {color};")
-        self.verdict_detail.setText(detail)
-        ai_text = str(ai_state.get("text") or ai_fallback_text(status))
+        self._render_verdict(display_summary, ai_state, color)
+
+    def _stable_verdict_summary(self, candidate: Any) -> Any:
+        now = time.time()
+        current = self._display_verdict_summary
+        if current is None:
+            self._display_verdict_summary = candidate
+            self._pending_verdict_summary = None
+            self._display_verdict_since = now
+            return candidate
+
+        if candidate.state_key == current.state_key:
+            self._display_verdict_summary = candidate
+            self._pending_verdict_summary = None
+            return candidate
+
+        pending = self._pending_verdict_summary
+        if pending is None or pending.state_key != candidate.state_key:
+            self._pending_verdict_summary = candidate
+            self._pending_verdict_since = now
+            return current
+
+        current_priority = self._VERDICT_PRIORITY.get(current.status, 0)
+        candidate_priority = self._VERDICT_PRIORITY.get(candidate.status, 0)
+        stable_seconds = (
+            0.25
+            if candidate_priority > current_priority and candidate_priority >= 4
+            else self._VERDICT_STABLE_SECONDS
+        )
+        hold_seconds = 0.4 if candidate_priority > current_priority else self._VERDICT_MIN_HOLD_SECONDS
+        if (
+            now - self._pending_verdict_since >= stable_seconds
+            and now - self._display_verdict_since >= hold_seconds
+        ):
+            self._display_verdict_summary = candidate
+            self._pending_verdict_summary = None
+            self._display_verdict_since = now
+            return candidate
+        return current
+
+    def _render_verdict(self, summary: Any, ai_state: dict[str, Any], color: str) -> None:
+        self.verdict_status.setText(summary.status)
+        self.verdict_detail.setText(f"规则融合：{self._verdict_advice(summary.detail)}")
+        age = max(0.0, time.time() - self._display_verdict_since) if self._display_verdict_since else 0.0
+        self.verdict_meta.setText(f"规则主判断 · 最近 {summary.window_seconds:.0f} 秒 · 稳定显示 {age:.0f}s")
+        self._verdict_chips["participants"].setText(
+            f"参与节点：{self._format_verdict_nodes(summary.participant_labels, '0')}"
+        )
+        self._verdict_chips["triggered"].setText(
+            f"触发节点：{self._format_verdict_nodes(summary.triggered_labels, '无')}"
+        )
+        self._verdict_chips["window"].setText(f"时间窗口：最近 {summary.window_seconds:.0f} 秒")
+        self._verdict_chips["updated"].setText(f"更新：{age:.0f}s前")
+        self._apply_verdict_styles(color)
+
+        ai_text = str(ai_state.get("text") or ai_fallback_text(summary.status))
         updated_at = _float(ai_state.get("updated_at"))
         if updated_at > 0 and ai_state.get("source") != "rule_fallback":
-            age = max(0.0, time.time() - updated_at)
-            ai_text = f"{ai_text}（{age:.0f}s前）"
-        self.ai_verdict.setText(ai_text)
+            ai_age = max(0.0, time.time() - updated_at)
+            ai_text = f"{ai_text}（{ai_age:.0f}s前）"
+        display_ai_text = ai_text if len(ai_text) <= 92 else ai_text[:89] + "..."
+        self.ai_verdict.setText(display_ai_text)
+        self.ai_verdict.setToolTip(ai_text)
+
+    def _apply_verdict_styles(self, color: str) -> None:
+        self.verdict_status.setStyleSheet(f"font-size: 25px; font-weight: 800; color: {color};")
+        self.verdict_detail.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 13px;")
+        self.verdict_meta.setStyleSheet(f"color: {THEME['muted']}; font-size: 12px;")
+        self.ai_verdict.setStyleSheet(
+            f"color: {THEME['blue_soft']}; font-size: 13px; font-weight: 600;"
+        )
+        chip_style = (
+            f"background: {THEME['card_alt']};"
+            f"border: 1px solid {THEME['border']};"
+            "border-radius: 8px;"
+            "padding: 5px 8px;"
+            f"color: {THEME['text_soft']};"
+            "font-size: 12px;"
+        )
+        for chip in self._verdict_chips.values():
+            chip.setStyleSheet(chip_style)
+
+    def _format_verdict_nodes(self, labels: list[str], empty: str) -> str:
+        if not labels:
+            return empty
+        shown = labels[:3]
+        suffix = f" +{len(labels) - len(shown)}" if len(labels) > len(shown) else ""
+        return f"{len(labels)} · " + "、".join(shown) + suffix
+
+    def _verdict_advice(self, detail: str) -> str:
+        parts = [part.strip() for part in str(detail).split("；") if part.strip()]
+        return parts[-1] if parts else "等待有效节点样本"
 
     def set_export_message(self, text: str, ok: bool = True) -> None:
         self._export_ok = ok
@@ -1074,8 +1222,7 @@ class DashboardPage(QWidget):
         status, detail, _color = self._last_verdict
         color = THEME[verdict_color_key(status)]
         self._last_verdict = (status, detail, color)
-        self.verdict_status.setStyleSheet(f"font-size: 22px; color: {color};")
-        self.ai_verdict.setStyleSheet(f"color: {THEME['blue_soft']}; font-size: 13px; font-weight: 600;")
+        self._apply_verdict_styles(color)
         self.set_export_message(self.export_message.text(), self._export_ok)
         self.csi_plot.refresh_theme()
         self.event_panel.refresh_theme()
@@ -1953,13 +2100,16 @@ class HistoryPage(QWidget):
     clear_history_requested = pyqtSignal()
 
     _COLUMNS = ("时间", "节点", "有效性", "存在", "运动", "置信度", "气体", "温度", "湿度", "RSSI")
+    _TABLE_MAX_ROWS = 1000
 
     def __init__(self) -> None:
         super().__init__()
         self._last_refresh_at = 0.0
         self._latest_filtered: list[dict[str, Any]] = []
+        self._displayed_rows: list[dict[str, Any]] = []
         self._known_nodes: list[tuple[int, str]] = []
         self._export_ok = True
+        self._last_render_key: tuple[Any, ...] | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -1979,11 +2129,11 @@ class HistoryPage(QWidget):
         header.addStretch(1)
         self.history_node_combo = QComboBox()
         self.history_node_combo.addItem("全部节点", 0)
-        self.history_node_combo.currentIndexChanged.connect(lambda: setattr(self, "_last_refresh_at", 0.0))
+        self.history_node_combo.currentIndexChanged.connect(self._invalidate_table_render)
         self.history_limit_combo = QComboBox()
-        for label, limit in (("最新 200", 200), ("最新 500", 500), ("全部", 0)):
+        for label, limit in (("最新 200", 200), ("最新 500", 500), ("最新 1000", 1000)):
             self.history_limit_combo.addItem(label, limit)
-        self.history_limit_combo.currentIndexChanged.connect(lambda: setattr(self, "_last_refresh_at", 0.0))
+        self.history_limit_combo.currentIndexChanged.connect(self._invalidate_table_render)
         export_btn = QPushButton("CSV 导出")
         export_btn.setObjectName("PrimaryButton")
         export_btn.clicked.connect(self.export_csv_requested.emit)
@@ -2017,8 +2167,10 @@ class HistoryPage(QWidget):
         self.table.cellDoubleClicked.connect(self._show_sample_detail)
         header_view = self.table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        for col in range(1, len(self._COLUMNS)):
-            header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        fixed_widths = (86, 78, 72, 72, 78, 66, 70, 70, 78)
+        for col, width in enumerate(fixed_widths, start=1):
+            header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+            self.table.setColumnWidth(col, width)
         layout.addWidget(self.table, 1)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
@@ -2029,41 +2181,72 @@ class HistoryPage(QWidget):
         self._refresh_history_nodes(nodes)
         filtered = self._filter_history(history)
         self._latest_filtered = filtered
-        self.subtitle.setText(f"最近 {len(history)} 条样本（当前筛选 {len(filtered)} 条）")
-        limit = int(self.history_limit_combo.currentData() or 0)
-        recent = (filtered[-limit:] if limit else filtered)[::-1]
+        limit = min(int(self.history_limit_combo.currentData() or self._TABLE_MAX_ROWS), self._TABLE_MAX_ROWS)
+        recent = filtered[-limit:][::-1]
+        self.subtitle.setText(
+            f"最近 {len(history)} 条样本（当前筛选 {len(filtered)} 条，表格显示 {len(recent)} 条）"
+        )
         self.empty_label.setVisible(not bool(recent))
+
+        last_sample = filtered[-1] if filtered else {}
+        render_key = (
+            len(history),
+            len(filtered),
+            int(self.history_node_combo.currentData() or 0),
+            limit,
+            last_sample.get("node_id"),
+            last_sample.get("seq"),
+            last_sample.get("timestamp"),
+        )
+        if render_key == self._last_render_key:
+            return
+
+        limit = int(self.history_limit_combo.currentData() or 0)
+        limit = min(limit or self._TABLE_MAX_ROWS, self._TABLE_MAX_ROWS)
+        recent = filtered[-limit:][::-1]
 
         now = time.time()
         if now - self._last_refresh_at < 1.0:
             return
         self._last_refresh_at = now
+        self._last_render_key = render_key
+        self._displayed_rows = recent
 
-        self.table.setRowCount(len(recent))
-        for row, sample in enumerate(recent):
-            ts = _float(sample.get("timestamp"), now)
-            values = (
-                time.strftime("%H:%M:%S", time.localtime(ts)),
-                str(sample.get("node_code", sample.get("node_id", ""))),
-                _sample_validity(sample),
-                f"{_score(sample.get('presence_score')):.2f}",
-                f"{_score(sample.get('motion_score')):.2f}",
-                f"{_score(sample.get('confidence')) * 100:.0f}%",
-                f"{_float(sample.get('gas')):.0f}",
-                f"{_float(sample.get('temperature')):.1f}",
-                f"{_float(sample.get('humidity')):.0f}",
-                f"{_float(sample.get('rssi')):.0f}",
-            )
-            for col, text in enumerate(values):
-                item = QTableWidgetItem(text)
-                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.table.setItem(row, col, item)
+        self.table.setUpdatesEnabled(False)
+        self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(len(recent))
+            for row, sample in enumerate(recent):
+                ts = _float(sample.get("timestamp"), now)
+                values = (
+                    time.strftime("%H:%M:%S", time.localtime(ts)),
+                    str(sample.get("node_code", sample.get("node_id", ""))),
+                    _sample_validity(sample),
+                    f"{_score(sample.get('presence_score')):.2f}",
+                    f"{_score(sample.get('motion_score')):.2f}",
+                    f"{_score(sample.get('confidence')) * 100:.0f}%",
+                    f"{_float(sample.get('gas')):.0f}",
+                    f"{_float(sample.get('temperature')):.1f}",
+                    f"{_float(sample.get('humidity')):.0f}",
+                    f"{_float(sample.get('rssi')):.0f}",
+                )
+                for col, text in enumerate(values):
+                    item = QTableWidgetItem(text)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    self.table.setItem(row, col, item)
+        finally:
+            self.table.blockSignals(False)
+            self.table.setUpdatesEnabled(True)
 
     def _filter_history(self, history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         node_id = int(self.history_node_combo.currentData() or 0)
         if not node_id:
-            return list(history)
+            return history
         return [sample for sample in history if int(sample.get("node_id") or 0) == node_id]
+
+    def _invalidate_table_render(self, *_args: Any) -> None:
+        self._last_refresh_at = 0.0
+        self._last_render_key = None
 
     def _refresh_history_nodes(self, nodes: dict[int, dict[str, Any]]) -> None:
         discovered = [
@@ -2086,14 +2269,12 @@ class HistoryPage(QWidget):
             self.history_node_combo.setCurrentIndex(0)
         self.history_node_combo.blockSignals(False)
         self._known_nodes = discovered
-        self._last_refresh_at = 0.0
+        self._invalidate_table_render()
 
     def _show_sample_detail(self, row: int, _col: int) -> None:
-        limit = int(self.history_limit_combo.currentData() or 0)
-        recent = (self._latest_filtered[-limit:] if limit else self._latest_filtered)[::-1]
-        if row < 0 or row >= len(recent):
+        if row < 0 or row >= len(self._displayed_rows):
             return
-        sample = recent[row]
+        sample = self._displayed_rows[row]
         _show_detail_dialog(
             self,
             "历史样本详情",
@@ -2120,6 +2301,10 @@ class HistoryPage(QWidget):
         self.empty_label.setStyleSheet(f"color: {THEME['muted']}; padding: 8px;")
         self.set_export_message(self.export_message.text(), self._export_ok)
         refresh_widget_icons(self)
+
+    def showEvent(self, event: object) -> None:
+        super().showEvent(event)
+        self._invalidate_table_render()
 
 
 # ---------------------------------------------------------------------------

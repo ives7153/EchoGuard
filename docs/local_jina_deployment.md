@@ -16,12 +16,14 @@
 ```text
 EchoGuard-AI-Runtime.zip
 ├── runtime/
-│   └── llama-server.exe
+│   ├── llama-server.exe
+│   ├── *.dll
+│   └── 其他 llama.cpp Windows 运行时文件
 └── models/
     └── v5-nano-retrieval-Q4_K_M.gguf
 ```
 
-压缩包外层可以再套一个目录，例如 `EchoGuard-AI-Runtime/runtime/llama-server.exe`，上位机会按后缀自动查找关键文件。
+压缩包外层可以再套一个目录，例如 `EchoGuard-AI-Runtime/runtime/llama-server.exe`，上位机会按后缀自动查找关键文件。`runtime/` 目录不要只放 `llama-server.exe`，Windows 版 llama.cpp 通常还需要同目录的 DLL/运行库。
 
 ## 默认部署位置
 
@@ -40,7 +42,7 @@ upper_computer/models/v5-nano-retrieval-Q4_K_M.gguf
 
 1. 打开上位机，进入仪表盘“综合研判结果”卡片中的 `AI设置`。
 2. 在“本地 Jina embedding”区域点击 `在线部署`。
-3. 上位机会从 llama.cpp GitHub Release 获取 Windows CPU x64 运行时，并从 Hugging Face 获取 Jina Q4 GGUF 模型。
+3. 上位机会从 llama.cpp GitHub Release 获取 Windows CPU x64 完整运行时，并从 Hugging Face 获取 Jina Q4 GGUF 模型。
 4. 看到 `部署状态：已部署` 后，点击 `一键启动`。
 5. 上位机会启动 `llama-server`，并轮询真实 embedding 请求。
 6. 成功时显示类似：
@@ -66,6 +68,7 @@ upper_computer/models/v5-nano-retrieval-Q4_K_M.gguf
 
 - `在线部署`：从官方源下载 llama.cpp Windows CPU x64 运行时和 Jina GGUF 模型，并更新本机 AI 配置。
 - `导入离线包`：选择离线 zip 包，解压运行时和 GGUF 模型，并更新本机 AI 配置。
+- `导入 GGUF`：在 Hugging Face 下载不稳定时，手动选择已经下载好的 `.gguf` 模型文件并复制到配置路径。
 - `生成离线包`：把当前已部署的运行时和模型打包为 `EchoGuard-AI-Runtime.zip`。
 - `一键启动`：启动本地 `llama-server`，并立即发起一次真实 embedding 测试，成功后才显示可用。
 - `启动本地 Jina`：只按当前配置启动服务，并等待 embedding 就绪。
@@ -78,8 +81,8 @@ upper_computer/models/v5-nano-retrieval-Q4_K_M.gguf
 - `未在 llama.cpp 最新 release 中找到 Windows CPU x64 运行时`：GitHub release 资产命名变化，可临时手动下载后使用离线包导入。
 - `未找到离线包`：没有选择 zip 文件，或路径已失效。
 - `离线包结构不完整`：zip 内缺少 `runtime/llama-server.exe` 或 `models/v5-nano-retrieval-Q4_K_M.gguf`。
-- `未找到 llama-server`：配置路径指向的 exe 不存在，请重新一键部署或手动浏览选择。
-- `未找到 Jina GGUF 模型`：配置路径指向的模型不存在，请重新一键部署或手动浏览选择。
+- `llama.cpp runtime 不完整`：只有极小的 `llama-server.exe`，或缺少同目录 DLL/运行库，请重新在线部署或导入完整离线包。
+- `未找到 Jina GGUF 模型`：配置路径指向的模型不存在，请重新在线部署、导入离线包或点击 `导入 GGUF`。
 - `本地 Jina 服务未就绪`：服务启动了但 `/v1/embeddings` 没有在超时时间内返回有效向量。
 - `响应不是 JSON`：服务地址可能不是 llama-server 的 OpenAI 兼容接口，或端口被其他程序占用。
 
