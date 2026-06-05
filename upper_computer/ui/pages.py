@@ -880,7 +880,7 @@ class DashboardPage(QWidget):
     # ----- 数据刷新 -----
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
-        history: list[dict[str, Any]] = snapshot.get("history", [])
+        history: list[dict[str, Any]] = snapshot.get("recent_history") or snapshot.get("history", [])
         events: list[dict[str, Any]] = snapshot.get("events", [])
         ai_state: dict[str, Any] = snapshot.get("ai", {})
         requested_active = int(snapshot.get("active_node") or 0)
@@ -1637,6 +1637,8 @@ class AnalysisPage(QWidget):
         layout.addWidget(plot_card, 1)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
+        if not self.isVisible():
+            return
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         history: list[dict[str, Any]] = snapshot.get("history", [])
         self._refresh_analysis_nodes(nodes)
@@ -1661,8 +1663,6 @@ class AnalysisPage(QWidget):
             THEME["green"] if online else None,
         )
 
-        if not self.isVisible():
-            return
         now = time.time()
         if now - self._last_plot_at < 0.8:
             return
@@ -2022,6 +2022,8 @@ class HistoryPage(QWidget):
         layout.addWidget(self.table, 1)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
+        if not self.isVisible():
+            return
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         history: list[dict[str, Any]] = snapshot.get("history", [])
         self._refresh_history_nodes(nodes)
@@ -2032,8 +2034,6 @@ class HistoryPage(QWidget):
         recent = (filtered[-limit:] if limit else filtered)[::-1]
         self.empty_label.setVisible(not bool(recent))
 
-        if not self.isVisible():
-            return
         now = time.time()
         if now - self._last_refresh_at < 1.0:
             return

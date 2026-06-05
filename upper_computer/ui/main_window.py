@@ -156,6 +156,7 @@ class MainWindow(QMainWindow):
         self._current_key = "dashboard"
         self._last_status_text = "串口状态：初始化中"
         self._last_status_ok = False
+        self._latest_snapshot: dict[str, Any] | None = None
 
         self._build_ui()
         self._wire_pages()
@@ -351,6 +352,7 @@ class MainWindow(QMainWindow):
         if key not in self.pages or key == self._current_key:
             if key in self.pages:
                 self.stack.setCurrentWidget(self.pages[key])
+                self._refresh_current_page()
             return
 
         self.nav_items[self._current_key].set_selected(False)
@@ -358,6 +360,7 @@ class MainWindow(QMainWindow):
         self._current_key = key
         self.stack.setCurrentWidget(self.pages[key])
         self.page_subtitle.setText(self._SUBTITLE.get(key, ""))
+        self._refresh_current_page()
 
     # ------------------------------------------------------------------ DataManager -> UI
     def update_ports(self, ports: list[str], selected: str | None = None) -> None:
@@ -395,10 +398,16 @@ class MainWindow(QMainWindow):
         self.dashboard_page.set_ai_operation_result(result)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
-        # 中文注释：所有页面都拿到同一份快照，但页面内部会判断自身是否可见，
-        # 避免后台页面做无意义的重绘。
-        for page in self.pages.values():
-            page.update_snapshot(snapshot)
+        # 中文注释：串口高频输入时只刷新当前页；后台页切换显示时再吃最新快照。
+        self._latest_snapshot = snapshot
+        self._refresh_current_page()
+
+    def _refresh_current_page(self) -> None:
+        if self._latest_snapshot is None:
+            return
+        page = self.pages.get(self._current_key)
+        if page is not None:
+            page.update_snapshot(self._latest_snapshot)
 
     # ------------------------------------------------------------------ 主题
     def toggle_theme(self) -> None:
