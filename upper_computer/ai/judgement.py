@@ -41,6 +41,10 @@ ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
 ZHIPU_MODEL_PRESETS = ("glm-5.1", "glm-5-turbo", "glm-4.5", "glm-4.5-air")
 _PACKAGE_SERVER_MEMBER = "runtime/llama-server.exe"
 _PACKAGE_MODEL_MEMBER = "models/v5-nano-retrieval-Q4_K_M.gguf"
+_MIN_SERVER_EXE_BYTES = 1024 * 1024
+_MIN_MODEL_BYTES = 1024 * 1024
+_RUNTIME_EXTENSIONS = {".exe", ".dll", ".so", ".dylib", ".json", ".txt"}
+_RUNTIME_REQUIRED_EXE = "llama-server.exe"
 LLAMA_RELEASE_API_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
 JINA_GGUF_DOWNLOAD_URL = (
     "https://huggingface.co/jinaai/jina-embeddings-v5-text-nano-retrieval-GGUF/resolve/main/"
@@ -80,8 +84,9 @@ class LocalJinaRuntime:
 
         server_path = Path(settings.llama_server_path)
         model_path = Path(settings.jina_model_path)
-        if not server_path.exists():
-            raise FileNotFoundError(f"未找到 llama-server：{server_path}")
+        status = jina_deployment_status(settings)
+        if not status["runtime_ok"]:
+            raise RuntimeError(f"本地 Jina 运行时不完整：{status['runtime_message']}")
         if not model_path.exists():
             raise FileNotFoundError(f"未找到 Jina GGUF 模型：{model_path}")
 
@@ -229,23 +234,29 @@ def jina_deployment_status(settings: AISettings) -> dict[str, Any]:
 
     server_path = Path(settings.llama_server_path or DEFAULT_SERVER_PATH).expanduser()
     model_path = Path(settings.jina_model_path or DEFAULT_MODEL_PATH).expanduser()
-    server_exists = server_path.exists()
-    model_exists = model_path.exists()
+    runtime_status = _runtime_status(server_path)
+    model_status = _model_status(model_path)
     host, port = _host_port(settings.jina_base_url)
     port_open = _is_tcp_port_open(host, port)
-    deployed = server_exists and model_exists
+    deployed = bool(runtime_status["ok"] and model_status["ok"])
     missing: list[str] = []
-    if not server_exists:
-        missing.append("llama-server.exe")
-    if not model_exists:
-        missing.append("Jina GGUF 模型")
+    if not runtime_status["ok"]:
+        missing.append(str(runtime_status["message"]))
+    if not model_status["ok"]:
+        missing.append(str(model_status["message"]))
     if deployed:
         service_text = "服务端口可连接" if port_open else "服务端口未启动"
         message = f"已部署：本地 Jina 运行时和 GGUF 模型均存在；{service_text}"
     else:
-        message = f"未部署：缺少{'、'.join(missing)}"
+        message = f"未部署：{'；'.join(missing)}"
     return {
         "deployed": deployed,
+        "runtime_ok": bool(runtime_status["ok"]),
+        "runtime_message": str(runtime_status["message"]),
+        "runtime_files": int(runtime_status["file_count"]),
+        "model_exists": bool(model_status["exists"]),
+        "model_ok": bool(model_status["ok"]),
+        "model_message": str(model_status["message"]),
         "port_open": port_open,
         "server_path": str(server_path),
         "model_path": str(model_path),
@@ -287,17 +298,20 @@ def deploy_jina_package(
             raise RuntimeError(f"离线包结构不完整，缺少：{', '.join(missing)}")
 
         copied: list[str] = []
-        for member, target in ((server_member, server_target), (model_member, model_target)):
+        runtime_members = _runtime_members_from_package(archive, server_member)
+        runtime_target_dir = server_target.parent
+        for member in runtime_members:
+            target = runtime_target_dir / Path(member.replace("\\", "/")).name
             if target.exists() and not overwrite:
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(member) as src, target.open("wb") as dst:
-                while True:
-                    chunk = src.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
+            _extract_member_to_file(archive, member, target)
             copied.append(target.name)
+
+        if model_target.exists() and not overwrite:
+            pass
+        else:
+            _extract_member_to_file(archive, model_member, model_target)
+            copied.append(model_target.name)
 
     status_settings = settings.copy()
     status_settings.llama_server_path = str(server_target)
@@ -325,19 +339,22 @@ def online_deploy_jina(
 
     server_target = Path(settings.llama_server_path or DEFAULT_SERVER_PATH).expanduser()
     model_target = Path(settings.jina_model_path or DEFAULT_MODEL_PATH).expanduser()
+    initial_status = jina_deployment_status(settings)
+    runtime_needs_fix = overwrite or not bool(initial_status["runtime_ok"])
+    model_needs_fix = overwrite or not bool(initial_status["model_ok"])
     copied: list[str] = []
     skipped: list[str] = []
 
     with tempfile.TemporaryDirectory(prefix="echoguard-ai-") as tmp:
         temp_root = Path(tmp)
 
-        if server_target.exists() and not overwrite:
-            skipped.append("llama-server.exe")
+        if not runtime_needs_fix:
+            skipped.append("llama.cpp runtime")
             _emit_progress(
                 progress,
                 phase="skip",
-                current_file="llama-server.exe",
-                message="llama-server.exe 已存在，跳过下载",
+                current_file="llama.cpp runtime",
+                message="llama.cpp runtime 已完整，跳过下载",
                 server_path=str(server_target),
                 model_path=str(model_target),
             )
@@ -346,21 +363,21 @@ def online_deploy_jina(
             asset = resolve_llama_server_asset(llama_release_api_url)
             server_zip = temp_root / "llama-server-win-cpu-x64.zip"
             _download_file(asset["url"], server_zip, progress, asset["name"])
-            _emit_progress(progress, phase="extract", current_file="llama-server.exe", message="正在解压 llama-server.exe")
+            _emit_progress(progress, phase="extract", current_file="llama.cpp runtime", message="正在解压 llama.cpp 完整运行时")
             with zipfile.ZipFile(server_zip) as archive:
-                member = _find_package_member(archive, "llama-server.exe")
-                if member is None:
+                server_member = _find_package_member(archive, "llama-server.exe")
+                if server_member is None:
                     raise RuntimeError("llama.cpp 压缩包内未找到 llama-server.exe")
+                runtime_members = _runtime_members_from_package(archive, server_member)
+                if not runtime_members:
+                    raise RuntimeError("llama.cpp 压缩包内未找到可部署运行时文件")
                 server_target.parent.mkdir(parents=True, exist_ok=True)
-                with archive.open(member) as src, server_target.open("wb") as dst:
-                    while True:
-                        chunk = src.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        dst.write(chunk)
-            copied.append("llama-server.exe")
+                for member in runtime_members:
+                    target = server_target.parent / Path(member.replace("\\", "/")).name
+                    _extract_member_to_file(archive, member, target)
+                    copied.append(target.name)
 
-        if model_target.exists() and not overwrite:
+        if not model_needs_fix:
             skipped.append(model_target.name)
             _emit_progress(
                 progress,
@@ -374,8 +391,15 @@ def online_deploy_jina(
             _emit_progress(progress, phase="download", current_file=model_target.name, message="正在下载 Jina GGUF 模型")
             model_target.parent.mkdir(parents=True, exist_ok=True)
             temp_model = temp_root / model_target.name
-            _download_file(jina_model_url, temp_model, progress, model_target.name)
-            shutil.move(str(temp_model), str(model_target))
+            try:
+                _download_file(jina_model_url, temp_model, progress, model_target.name)
+                if not temp_model.exists() or temp_model.stat().st_size <= 0:
+                    raise RuntimeError("模型下载完成但临时文件为空")
+                shutil.move(str(temp_model), str(model_target))
+            except Exception:
+                if temp_model.exists():
+                    temp_model.unlink(missing_ok=True)
+                raise
             copied.append(model_target.name)
 
     status_settings = settings.copy()
@@ -401,8 +425,9 @@ def create_jina_offline_package(settings: AISettings, package_path: str) -> dict
         raise RuntimeError("请先选择离线包保存路径")
     server_path = Path(settings.llama_server_path or DEFAULT_SERVER_PATH).expanduser()
     model_path = Path(settings.jina_model_path or DEFAULT_MODEL_PATH).expanduser()
-    if not server_path.exists():
-        raise FileNotFoundError(f"未找到 llama-server：{server_path}")
+    status = jina_deployment_status(settings)
+    if not status["runtime_ok"]:
+        raise RuntimeError(f"本地 Jina 运行时不完整：{status['runtime_message']}")
     if not model_path.exists():
         raise FileNotFoundError(f"未找到 Jina GGUF 模型：{model_path}")
 
@@ -411,7 +436,8 @@ def create_jina_offline_package(settings: AISettings, package_path: str) -> dict
         target = target.with_suffix(".zip")
     target.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(server_path, _PACKAGE_SERVER_MEMBER)
+        for runtime_file in _runtime_files_for_package(server_path):
+            archive.write(runtime_file, f"runtime/{runtime_file.name}")
         archive.write(model_path, _PACKAGE_MODEL_MEMBER)
     return {
         "deployed": True,
@@ -420,6 +446,40 @@ def create_jina_offline_package(settings: AISettings, package_path: str) -> dict
         "model_path": str(model_path),
         "message": f"离线包已生成：{target}",
     }
+
+
+def import_jina_model(settings: AISettings, model_path: str, overwrite: bool = True) -> dict[str, Any]:
+    """手动导入已经下载好的 Jina GGUF 模型文件。"""
+
+    if not str(model_path or "").strip():
+        raise RuntimeError("请先选择 Jina GGUF 模型文件")
+    source = Path(model_path).expanduser()
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"未找到 Jina GGUF 模型：{source}")
+    if source.suffix.lower() != ".gguf":
+        raise RuntimeError("请选择 .gguf 格式的 Jina 模型文件")
+    target = Path(settings.jina_model_path or DEFAULT_MODEL_PATH).expanduser()
+    if source.resolve() != target.resolve():
+        if target.exists() and not overwrite:
+            raise RuntimeError(f"目标模型已存在：{target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temp_target = target.with_suffix(target.suffix + ".tmp")
+        try:
+            shutil.copyfile(source, temp_target)
+            shutil.move(str(temp_target), str(target))
+        finally:
+            if temp_target.exists():
+                temp_target.unlink(missing_ok=True)
+    status_settings = settings.copy()
+    status_settings.jina_model_path = str(target)
+    status = jina_deployment_status(status_settings)
+    status.update(
+        {
+            "copied": [target.name],
+            "message": f"Jina GGUF 模型已导入：{target}",
+        }
+    )
+    return status
 
 
 def resolve_llama_server_asset(release_api_url: str = LLAMA_RELEASE_API_URL) -> dict[str, str]:
@@ -736,6 +796,8 @@ def _download_file(
         raise RuntimeError(f"下载失败 HTTP {exc.code}：{current_file} {detail[:180]}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"下载失败：{current_file} {exc.reason}") from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(f"下载失败：{current_file} 网络超时，请检查 Hugging Face/GitHub 访问或使用离线包") from exc
 
 
 def _download_message(current_file: str, downloaded: int, total: int) -> str:
@@ -780,6 +842,102 @@ def _find_package_member(archive: zipfile.ZipFile, expected_suffix: str) -> str 
         if normalized.lower().endswith(expected):
             return name
     return None
+
+
+def _runtime_status(server_path: Path) -> dict[str, Any]:
+    server_path = server_path.expanduser()
+    if not server_path.exists():
+        return {"ok": False, "exists": False, "file_count": 0, "message": "缺少 llama-server.exe"}
+    if not server_path.is_file():
+        return {"ok": False, "exists": True, "file_count": 0, "message": f"llama-server 路径不是文件：{server_path}"}
+
+    runtime_files = _runtime_files_for_package(server_path)
+    dll_count = sum(1 for item in runtime_files if item.suffix.lower() == ".dll")
+    exe_size = server_path.stat().st_size
+    if exe_size < _MIN_SERVER_EXE_BYTES and dll_count <= 0:
+        return {
+            "ok": False,
+            "exists": True,
+            "file_count": len(runtime_files),
+            "message": f"llama.cpp runtime 不完整：llama-server.exe 仅 {_format_bytes(exe_size)}，且缺少 DLL/运行库",
+        }
+    return {
+        "ok": True,
+        "exists": True,
+        "file_count": len(runtime_files),
+        "message": f"llama.cpp runtime 完整（{len(runtime_files)} 个文件）",
+    }
+
+
+def _model_status(model_path: Path) -> dict[str, Any]:
+    model_path = model_path.expanduser()
+    if not model_path.exists():
+        return {"ok": False, "exists": False, "message": "缺少 Jina GGUF 模型"}
+    if not model_path.is_file():
+        return {"ok": False, "exists": True, "message": f"Jina GGUF 模型路径不是文件：{model_path}"}
+    size = model_path.stat().st_size
+    if model_path.suffix.lower() != ".gguf":
+        return {"ok": False, "exists": True, "message": "Jina 模型不是 .gguf 文件"}
+    if size < _MIN_MODEL_BYTES:
+        return {"ok": False, "exists": True, "message": f"Jina GGUF 模型文件过小，可能下载不完整：{_format_bytes(size)}"}
+    return {"ok": True, "exists": True, "message": f"Jina GGUF 模型存在（{_format_bytes(size)}）"}
+
+
+def _runtime_members_from_package(archive: zipfile.ZipFile, server_member: str) -> list[str]:
+    server_norm = server_member.replace("\\", "/").strip("/")
+    runtime_dir = server_norm.rsplit("/", 1)[0] if "/" in server_norm else ""
+    members: list[str] = []
+    for raw_name in archive.namelist():
+        normalized = raw_name.replace("\\", "/").strip("/")
+        if not normalized or normalized.endswith("/"):
+            continue
+        if runtime_dir and not normalized.startswith(runtime_dir + "/"):
+            continue
+        if "/" in normalized[len(runtime_dir):].strip("/"):
+            continue
+        suffix = Path(normalized).suffix.lower()
+        if suffix in _RUNTIME_EXTENSIONS:
+            members.append(raw_name)
+    if not any(Path(item.replace("\\", "/")).name.lower() == _RUNTIME_REQUIRED_EXE for item in members):
+        members.append(server_member)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in members:
+        key = item.replace("\\", "/").lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def _runtime_files_for_package(server_path: Path) -> list[Path]:
+    runtime_dir = server_path.expanduser().parent
+    if not runtime_dir.exists():
+        return []
+    files = [
+        item
+        for item in runtime_dir.iterdir()
+        if item.is_file() and item.suffix.lower() in _RUNTIME_EXTENSIONS
+    ]
+    if server_path.exists() and server_path not in files:
+        files.append(server_path)
+    return sorted(files, key=lambda item: item.name.lower())
+
+
+def _extract_member_to_file(archive: zipfile.ZipFile, member: str, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_target = target.with_suffix(target.suffix + ".tmp")
+    try:
+        with archive.open(member) as src, temp_target.open("wb") as dst:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        shutil.move(str(temp_target), str(target))
+    finally:
+        if temp_target.exists():
+            temp_target.unlink(missing_ok=True)
 
 
 def _normalize_provider(provider: str, values: dict[str, Any]) -> str:
