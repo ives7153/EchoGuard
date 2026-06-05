@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import time
 import threading
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -189,28 +190,38 @@ class SerialWorker(QObject):
     读取串口，回调触发 Qt 信号，Qt 会自动把信号投递回主线程。
     """
 
-    line_received = pyqtSignal(str)
+    frames_received = pyqtSignal(object, object)
     error = pyqtSignal(str)
     opened = pyqtSignal(str)
     closed = pyqtSignal()
+    _BATCH_INTERVAL_SECONDS = 0.06
+    _MAX_QUEUE_LINES = 5000
+    _MAX_BATCH_LINES = 1200
 
     def __init__(self, port: str, baudrate: int) -> None:
         super().__init__()
         self.port = port
         self.baudrate = baudrate
         self._reader: SerialReader | None = None
+        self._pending_lines: deque[str] = deque()
+        self._pending_lock = threading.Lock()
+        self._batch_stop = threading.Event()
+        self._batch_thread: threading.Thread | None = None
+        self._dropped_lines = 0
 
     @pyqtSlot()
     def start_reader(self) -> None:
         try:
+            self._start_batch_thread()
             self._reader = SerialReader()
             self._reader.start(
                 port=self.port,
                 baudrate=self.baudrate,
-                on_line=self.line_received.emit,
+                on_line=self._enqueue_line,
                 on_error=self.error.emit,
             )
         except Exception as exc:  # noqa: BLE001 - 串口占用 / 权限 / 拔插异常需回传 UI。
+            self._stop_batch_thread()
             self.error.emit(str(exc))
             return
 
@@ -221,7 +232,74 @@ class SerialWorker(QObject):
         if self._reader:
             self._reader.stop()
             self._reader = None
+        self._stop_batch_thread()
         self.closed.emit()
+
+    def _start_batch_thread(self) -> None:
+        with self._pending_lock:
+            self._pending_lines.clear()
+            self._dropped_lines = 0
+        self._batch_stop.clear()
+        self._batch_thread = threading.Thread(
+            target=self._batch_loop,
+            name="gateway-serial-batcher",
+            daemon=True,
+        )
+        self._batch_thread.start()
+
+    def _stop_batch_thread(self) -> None:
+        self._batch_stop.set()
+        thread = self._batch_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=0.8)
+        self._batch_thread = None
+
+    def _enqueue_line(self, line: str) -> None:
+        with self._pending_lock:
+            if len(self._pending_lines) >= self._MAX_QUEUE_LINES:
+                self._pending_lines.popleft()
+                self._dropped_lines += 1
+            self._pending_lines.append(line)
+
+    def _batch_loop(self) -> None:
+        while not self._batch_stop.wait(self._BATCH_INTERVAL_SECONDS):
+            self._flush_pending_lines()
+        self._flush_pending_lines()
+
+    def _flush_pending_lines(self) -> None:
+        with self._pending_lock:
+            if not self._pending_lines and not self._dropped_lines:
+                return
+            line_count = min(len(self._pending_lines), self._MAX_BATCH_LINES)
+            lines = [self._pending_lines.popleft() for _ in range(line_count)]
+            dropped = self._dropped_lines
+            self._dropped_lines = 0
+            pending = len(self._pending_lines)
+
+        frames: list[dict[str, Any]] = []
+        invalid = 0
+        last_raw = ""
+        for line in lines:
+            parsed = parse_gateway_frame(line)
+            if parsed.get("valid"):
+                parsed["timestamp"] = time.time()
+                parsed["source"] = "serial"
+                frames.append(parsed)
+                last_raw = str(parsed.get("raw", line))
+            else:
+                invalid += 1
+                last_raw = line
+
+        stats = {
+            "total": len(lines),
+            "valid": len(frames),
+            "invalid": invalid,
+            "dropped": dropped,
+            "pending": pending,
+            "last_raw": last_raw,
+        }
+        if frames or invalid or dropped:
+            self.frames_received.emit(frames, stats)
 
 
 class DataManager(QObject):
@@ -288,6 +366,19 @@ class DataManager(QObject):
         self._serial_auto_connected = False
         self._serial_started_at = 0.0
         self._last_serial_sample_at = 0.0
+        self._last_frame_ui_at = 0.0
+        self._last_invalid_frame_ui_at = 0.0
+        self._last_serial_overload_notice_at = 0.0
+        self._serial_stats: dict[str, int] = {
+            "last_batch_total": 0,
+            "last_batch_valid": 0,
+            "last_batch_invalid": 0,
+            "last_batch_dropped": 0,
+            "last_batch_pending": 0,
+            "total_valid": 0,
+            "total_invalid": 0,
+            "total_dropped": 0,
+        }
         self._dirty = True
         self._active_node = 0
         self._paused = False
@@ -918,7 +1009,7 @@ class DataManager(QObject):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.start_reader)
         self._worker.opened.connect(self._handle_serial_opened)
-        self._worker.line_received.connect(self._handle_raw_line)
+        self._worker.frames_received.connect(self._handle_frame_batch)
         self._worker.error.connect(self._handle_serial_error)
         self._thread.start()
 
@@ -970,19 +1061,135 @@ class DataManager(QObject):
 
     @pyqtSlot(str)
     def _handle_raw_line(self, raw_line: str) -> None:
+        """兼容离线测试/旧调用入口；真实串口路径走批量帧处理。"""
+
         parsed = parse_gateway_frame(raw_line)
         if not parsed.get("valid"):
-            self.latest_frame_changed.emit(f"最新帧：忽略非 JSON 数据 - {raw_line[:120]}")
+            self._handle_frame_batch(
+                [],
+                {"total": 1, "valid": 0, "invalid": 1, "dropped": 0, "pending": 0, "last_raw": raw_line},
+            )
             return
 
         now = time.time()
         parsed["timestamp"] = now
         parsed["source"] = "serial"
-        self._last_serial_sample_at = now
-        self.latest_frame_changed.emit(f"最新帧：{parsed.get('raw', raw_line)}")
+        self._handle_frame_batch(
+            [parsed],
+            {"total": 1, "valid": 1, "invalid": 0, "dropped": 0, "pending": 0, "last_raw": raw_line},
+        )
+
+    @pyqtSlot(object, object)
+    def _handle_frame_batch(self, frames: object, stats: object) -> None:
+        """主线程低频消费后台解析好的串口帧批次。"""
+
+        batch_stats = stats if isinstance(stats, dict) else {}
+        valid_frames = [frame for frame in frames if isinstance(frame, dict)] if isinstance(frames, list) else []
+        total = int(batch_stats.get("total") or len(valid_frames))
+        invalid = int(batch_stats.get("invalid") or 0)
+        dropped = int(batch_stats.get("dropped") or 0)
+        pending = int(batch_stats.get("pending") or 0)
+        self._serial_stats.update(
+            {
+                "last_batch_total": total,
+                "last_batch_valid": len(valid_frames),
+                "last_batch_invalid": invalid,
+                "last_batch_dropped": dropped,
+                "last_batch_pending": pending,
+                "total_valid": self._serial_stats.get("total_valid", 0) + len(valid_frames),
+                "total_invalid": self._serial_stats.get("total_invalid", 0) + invalid,
+                "total_dropped": self._serial_stats.get("total_dropped", 0) + dropped,
+            }
+        )
+
+        now = time.time()
+        if not valid_frames:
+            if invalid and now - self._last_invalid_frame_ui_at >= 1.0:
+                self._last_invalid_frame_ui_at = now
+                self._emit_latest_frame(f"忽略非 JSON 数据 {invalid} 行", now=now, force=True)
+            self._maybe_report_serial_overload(pending, dropped, now)
+            return
+
+        self._last_serial_sample_at = max(_float(frame.get("timestamp"), now) for frame in valid_frames)
+        self._emit_latest_frame(
+            self._batch_frame_summary(valid_frames[-1], total, len(valid_frames), invalid, dropped, pending),
+            now=now,
+        )
+        self._maybe_report_serial_overload(pending, dropped, now)
         if self._paused:
             return
-        self._apply_sample(parsed)
+
+        latest_by_node: dict[int, dict[str, Any]] = {}
+        applied = False
+        for frame in valid_frames:
+            enriched = self._apply_sample(frame, run_rules=False, mark_dirty=False)
+            if not enriched:
+                continue
+            applied = True
+            latest_by_node[int(enriched.get("node_id") or 0)] = enriched
+
+        for node_id, enriched in latest_by_node.items():
+            node = self.nodes.get(node_id)
+            if node is not None:
+                self._handle_life_events(node)
+            event_time = _float(enriched.get("timestamp"), now)
+            for alarm in self.alarm_engine.evaluate(enriched, None, event_time):
+                alarm_node = int(alarm.get("node_id") or node_id)
+                self._append_event(
+                    str(alarm.get("title", "SYSTEM ALARM")),
+                    f"{self._node_label(alarm_node)} {alarm.get('message', '规则报警')}",
+                    node_id=alarm_node,
+                    level=str(alarm.get("level", "ALARM")),
+                    kind=str(alarm.get("kind", "alarm")),
+                    event_time=float(alarm.get("time", event_time)),
+                )
+
+        if applied:
+            self._dirty = True
+
+    def _emit_latest_frame(self, text: str, now: float | None = None, force: bool = False) -> None:
+        """低频更新左侧最新帧，避免 Gateway 高频输出拖慢 QLabel 重排。"""
+
+        current = now if now is not None else time.time()
+        if not force and current - self._last_frame_ui_at < 0.3:
+            return
+        self._last_frame_ui_at = current
+        compact = " ".join(str(text).split())
+        if len(compact) > 180:
+            compact = compact[:177] + "..."
+        self.latest_frame_changed.emit(f"最新帧：{compact}")
+
+    def _batch_frame_summary(
+        self,
+        frame: dict[str, Any],
+        total: int,
+        valid: int,
+        invalid: int,
+        dropped: int,
+        pending: int,
+    ) -> str:
+        node_id = int(frame.get("node_id") or 0)
+        label = str(frame.get("node_label") or "").strip() or NODE_LABELS.get(node_id, f"node{node_id}")
+        seq = _optional_int(frame.get("seq"))
+        parts = [label if seq is None else f"{label} seq={seq}", f"本批 {total} 行 / 有效 {valid} 帧"]
+        if invalid:
+            parts.append(f"忽略 {invalid} 行")
+        if pending:
+            parts.append(f"待处理 {pending} 行")
+        if dropped:
+            parts.append(f"丢弃 {dropped} 行")
+        return " · ".join(parts)
+
+    def _maybe_report_serial_overload(self, pending: int, dropped: int, now: float) -> None:
+        if not dropped and pending < 1500:
+            return
+        if now - self._last_serial_overload_notice_at < 3.0:
+            return
+        self._last_serial_overload_notice_at = now
+        self.status_changed.emit(
+            f"串口状态：输入过快，已合并刷新（待处理 {pending} 行，丢弃 {dropped} 行）",
+            True,
+        )
 
     # ------------------------------------------------------------------ LoRa 矩阵
     def _ensure_node_state(self, node_id: int) -> NodeState | None:
@@ -1046,12 +1253,17 @@ class DataManager(QObject):
         return HEALTH_EXCELLENT
 
     # ------------------------------------------------------------------ 样本应用
-    def _apply_sample(self, sample: dict[str, Any]) -> None:
+    def _apply_sample(
+        self,
+        sample: dict[str, Any],
+        run_rules: bool = True,
+        mark_dirty: bool = True,
+    ) -> dict[str, Any] | None:
         node_id = int(sample.get("node_id") or 0)
         node = self._ensure_node_state(node_id)
         matrix_state = self._ensure_matrix_node(node_id)
         if node is None:
-            return
+            return None
 
         now = float(sample.get("timestamp") or time.time())
         was_online = node.online
@@ -1109,19 +1321,22 @@ class DataManager(QObject):
                 kind="node",
             )
 
-        self._handle_life_events(node)
-        for alarm in self.alarm_engine.evaluate(enriched, None, now):
-            alarm_node = int(alarm.get("node_id") or node_id)
-            self._append_event(
-                str(alarm.get("title", "SYSTEM ALARM")),
-                f"{self._node_label(alarm_node)} {alarm.get('message', '规则报警')}",
-                node_id=alarm_node,
-                level=str(alarm.get("level", "ALARM")),
-                kind=str(alarm.get("kind", "alarm")),
-                event_time=float(alarm.get("time", now)),
-            )
+        if run_rules:
+            self._handle_life_events(node)
+            for alarm in self.alarm_engine.evaluate(enriched, None, now):
+                alarm_node = int(alarm.get("node_id") or node_id)
+                self._append_event(
+                    str(alarm.get("title", "SYSTEM ALARM")),
+                    f"{self._node_label(alarm_node)} {alarm.get('message', '规则报警')}",
+                    node_id=alarm_node,
+                    level=str(alarm.get("level", "ALARM")),
+                    kind=str(alarm.get("kind", "alarm")),
+                    event_time=float(alarm.get("time", now)),
+                )
 
-        self._dirty = True
+        if mark_dirty:
+            self._dirty = True
+        return enriched
 
     def _handle_life_events(self, node: NodeState) -> None:
         """根据状态变化生成右侧实时事件流。"""
@@ -1252,7 +1467,7 @@ class DataManager(QObject):
     def _maybe_schedule_ai_analysis(self) -> None:
         """低频异步生成 AI 辅助解释；实时主判断仍由规则融合负责。"""
 
-        summary = build_detection_summary(self._node_dicts(), self.history)
+        summary = build_detection_summary(self._node_dicts(), self._recent_history(5.0, 1200))
         self._refresh_ai_fallback(summary)
         if not self.ai_settings.enabled or not self.ai_settings.embedding_enabled:
             return
@@ -1298,7 +1513,7 @@ class DataManager(QObject):
         if request_id != self._ai_request_id or not isinstance(result, dict):
             return
 
-        current_summary = build_detection_summary(self._node_dicts(), self.history)
+        current_summary = build_detection_summary(self._node_dicts(), self._recent_history(5.0, 1200))
         if str(result.get("state_key", "")) != current_summary.state_key:
             self.ai_state.update(
                 {
@@ -1394,18 +1609,22 @@ class DataManager(QObject):
             return
 
         self._dirty = False
-        summary = build_detection_summary(self._node_dicts(), self.history)
+        nodes = self._node_dicts()
+        recent_history = self._recent_history(60.0, 1200)
+        summary = build_detection_summary(nodes, recent_history)
         self._refresh_ai_fallback(summary)
         self.ai_state["running"] = self._ai_busy
         self.ai_state["jina_running"] = self.ai_runtime.is_running()
         self.ai_state["config"] = self._public_ai_config()
         self.snapshot_changed.emit(
             {
-                "nodes": self._node_dicts(),
+                "nodes": nodes,
                 "matrix": [state.to_dict() for state in self.matrix.values()],
-                "history": list(self.history),
+                "history": self.history,
+                "recent_history": recent_history,
                 "events": [event.to_dict() for event in self.events],
                 "ai": dict(self.ai_state),
+                "serial_stats": dict(self._serial_stats),
                 "active_node": self._active_node,
                 "serial_connected": self._serial_connected,
                 "paused": self._paused,
@@ -1423,6 +1642,24 @@ class DataManager(QObject):
                 },
             }
         )
+
+    def _recent_history(self, seconds: float, limit: int) -> list[dict[str, Any]]:
+        """返回 UI 实时绘图/研判需要的最近窗口，避免反复扫描完整历史。"""
+
+        if not self.history:
+            return []
+        now = time.time()
+        cutoff = now - float(seconds)
+        recent: list[dict[str, Any]] = []
+        for sample in reversed(self.history):
+            timestamp = _float(sample.get("timestamp"), now)
+            if timestamp < cutoff:
+                break
+            recent.append(sample)
+            if len(recent) >= limit:
+                break
+        recent.reverse()
+        return recent
 
     def _append_event(
         self,

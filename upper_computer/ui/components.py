@@ -393,13 +393,18 @@ class TopologyWidget(QWidget):
         self.setMinimumHeight(220)
         self._anim_started_at = time.time()
         self._timer = QTimer(self)
-        self._timer.setInterval(50)
-        self._timer.timeout.connect(self.update)
+        self._timer.setInterval(100)
+        self._timer.timeout.connect(self._tick)
         self._timer.start()
 
     def set_nodes(self, nodes: dict[int, dict[str, Any]]) -> None:
         self.nodes = nodes
-        self.update()
+        if self.isVisible():
+            self.update()
+
+    def _tick(self) -> None:
+        if self.isVisible():
+            self.update()
 
     def paintEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
         del event
