@@ -1,85 +1,131 @@
-# wifi-csi-lora-rescue
+# EchoGuard
 
-基于 ESP32-S3 的 WiFi-CSI 穿墙/遮挡生命微动感知与 LoRa 感传分离救援原型系统
+[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.3.2-e7352c?logo=espressif)](https://docs.espressif.com/projects/esp-idf/)
+[![Python](https://img.shields.io/badge/Python-3.11+-3776ab?logo=python&logoColor=white)](https://www.python.org/)
+[![PyQt6](https://img.shields.io/badge/UI-PyQt6-41cd52?logo=qt&logoColor=white)](https://www.riverbankcomputing.com/software/pyqt/)
+[![Platform](https://img.shields.io/badge/Platform-ESP32--S3%20%7C%20Windows-lightgrey)](#)
 
-本项目面向地震、坍塌、废墟遮挡等应急救援场景，构建一套基于 ESP32-S3 的 WiFi-CSI 生命微动感知、LoRa 远距离回传与上位机可视化研判的低成本感传分离救援原型系统。
+基于 ESP32-S3、WiFi CSI 与 LoRa 的感传分离救援原型系统。EchoGuard 面向地震、坍塌、废墟遮挡等应急场景，用低成本节点采集 WiFi CSI 生命微动特征，经 LoRa 回传到 Gateway，再由 Windows 上位机完成可视化、规则融合和 AI 辅助研判。
+
+![EchoGuard social preview](docs/assets/EchoGuard-social-preview.png)
+
+## 项目简介
+
+EchoGuard 由三部分组成：
+
+- **Rescue Node 感知节点**：ESP32-S3 采集 WiFi CSI、温湿度、姿态和气体原始值，并通过 Ra-02/SX1278 LoRa 模块上报。
+- **Gateway 汇聚网关**：ESP32-S3 接收 LoRa 帧，将节点数据转换为 JSON Lines，经 USB Serial/JTAG 输出给上位机。
+- **EchoGuard 上位机**：PyQt6 桌面程序，负责串口接收、节点自动发现、实时曲线、事件流、历史导出、规则报警和 AI 辅助解释。
+
+本项目强调“真实数据链路优先”：未收到 Gateway 串口帧前，上位机不生成假节点、不伪造历史样本；实时结论由规则融合输出，AI 只做异步辅助解释。
+
+## 核心能力
+
+- WiFi CSI 生命微动感知：基于 ESP32-S3 WiFi CSI 滑动窗口提取幅度扰动特征。
+- LoRa 远距离回传：节点与 Gateway 使用 433 MHz、BW125、SF7、CR4/5 的 SX1278 链路。
+- 多节点自动发现：上位机根据 Gateway JSON 中的 `id` 自动创建 `node{id}`。
+- 多节点综合研判：最近 5 秒窗口内融合 presence、motion、confidence 和 RSSI。
+- 现场安全提示：LoRa 天线、电源共地、MQ-135 分压、I2C 上拉等硬件注意事项文档化。
+- 数据导出能力：支持 CSV 导出、CSI 曲线截图和整窗截图。
+- AI 辅助研判：本地 Jina GGUF embedding 与可选大模型 API，仅用于解释和辅助，不接管实时判断。
+- Windows 打包：提供 PyInstaller spec 与一键打包脚本，生成 `dist/EchoGuard/EchoGuard.exe`。
+
+## 系统架构
+
+```text
+Rescue Node(s)
+  ESP32-S3 + WiFi CSI + SHT30/MPU6050/MQ-135
+        |
+        | 14-byte LoRa binary frame
+        v
+Gateway
+  ESP32-S3 + SX1278 LoRa receiver
+        |
+        | USB Serial/JTAG JSON Lines @ 115200
+        v
+EchoGuard Upper Computer
+  PyQt6 UI + parser + rule fusion + export + AI helper
+```
+
+## 数据协议
+
+节点通过 LoRa 发送 14 字节二进制帧：
+
+```text
+id:u8
+seq:u32
+presence:u8
+motion:u8
+bpm:u8
+conf:u8
+gas:u16
+temp_x10:i16
+hum:u8
+```
+
+Gateway 输出一行 JSON：
+
+```json
+{
+  "id": 1,
+  "seq": 0,
+  "presence": 0,
+  "motion": 0,
+  "bpm": 0,
+  "conf": 0,
+  "gas": 0,
+  "temp": 25.0,
+  "hum": 50,
+  "rssi": -80,
+  "ts": 12345
+}
+```
+
+上位机将字段规范化为 `node_id`、`presence_score`、`motion_score`、`confidence`、`temperature`、`humidity`、`rssi` 等内部字段。详见 [docs/interface_alignment.md](docs/interface_alignment.md)。
 
 ## 目录结构
 
 ```text
 wifi-csi-lora-rescue/
-|-- .devcontainer
-|   |-- devcontainer.json
-|   +-- Dockerfile
-|-- .vscode
-|   |-- c_cpp_properties.json
-|   |-- launch.json
-|   +-- settings.json
-|-- docs
-|   +-- readme.md
-|-- firmware
-|   |-- gateway
-|   |   |-- main
-|   |   |   |-- CMakeLists.txt
-|   |   |   +-- main.c
-|   |   |-- CMakeLists.txt
-|   |   |-- sdkconfig
-|   |   +-- sdkconfig.defaults
-|   +-- node
-|       |-- main
-|       |   |-- CMakeLists.txt
-|       |   +-- main.c
-|       |-- CMakeLists.txt
-|       |-- sdkconfig
-|       +-- sdkconfig.defaults
-|-- hardware
-|   +-- readme.md
-|-- scripts
-|   +-- readme.md
-|-- tests
-|   +-- readme.md
-|-- upper_computer
-|   |-- ai
-|   |   +-- __init__.py
-|   |-- rules
-|   |   +-- __init__.py
-|   |-- utils
-|   |   +-- __init__.py
-|   |-- viz
-|   |   +-- __init__.py
-|   |-- __init__.py
-|   |-- data_parser.py
-|   |-- main.py
-|   |-- requirements.txt
-|   +-- serial_handler.py
-|-- .clangd
-|-- .gitignore
-|-- partitions-8Mib.csv
+|-- docs/                    # 接口、AI、本地部署、打包说明
+|-- firmware/
+|   |-- gateway/              # Gateway LoRa 接收与 JSON 串口转发固件
+|   +-- node/                 # Rescue Node WiFi CSI、传感器与 LoRa 上报固件
+|-- hardware/                 # 接线、自检、硬件风险与接线表
+|-- scripts/                  # 上位机打包与辅助脚本
+|-- tests/                    # 测试与联调记录目录
+|-- upper_computer/           # PyQt6 上位机源码
+|-- EchoGuard.spec            # PyInstaller 打包配置
+|-- partitions-8Mib.csv       # ESP32-S3 分区表
 +-- README.md
 ```
 
-## 快速启动指南
+## 硬件准备
 
-### 硬件准备
+最小演示需要：
 
-- ESP32-S3-DevKitC-1 N8R8 开发板，至少 2 块：1 块作为 Gateway，1 块或多块作为感知节点。
-- Ra-02/SX1278 LoRa 模块，Gateway 与每个节点各 1 个。
-- LoRa 匹配频段天线，上电和发射前必须安装。
-- 节点侧可接入 SHT30、MPU6050、MQ-135 等环境与姿态传感器。
+- ESP32-S3-DevKitC-1 N8R8 开发板至少 2 块：1 块 Gateway，1 块 Rescue Node。
+- Ra-02/SX1278 LoRa 模块每块板 1 个。
+- 433 MHz 匹配天线，上电和发射前必须安装。
+- 节点侧可接 SHT30、MPU6050、MQ-135。
 - USB 数据线、杜邦线、面包板或焊接底板、稳定 5V 电源。
-- 详细接线、自检与常见硬件问题见 `hardware/readme.md`。
 
-### ESP-IDF 环境
+硬件接线请先阅读：
 
-本项目 ESP32-S3 固件使用 ESP-IDF v5.3.2。
+- [hardware/readme.md](hardware/readme.md)
+- [hardware/接线表.md](hardware/%E6%8E%A5%E7%BA%BF%E8%A1%A8.md)
+
+## 固件构建
+
+本项目固件使用 ESP-IDF v5.3.2，目标芯片为 ESP32-S3。
+
+确认环境：
 
 ```powershell
 idf.py --version
 ```
 
-建议确认输出版本为 ESP-IDF v5.3.2，并确保 `idf.py` 已加入当前终端环境。
-
-### Gateway 烧录命令
+构建并烧录 Gateway：
 
 ```powershell
 cd firmware\gateway
@@ -88,9 +134,7 @@ idf.py build
 idf.py -p COMx flash monitor
 ```
 
-其中 `COMx` 替换为 Gateway 开发板实际串口号，例如 `COM5`。
-
-### 节点烧录命令
+构建并烧录 Rescue Node：
 
 ```powershell
 cd firmware\node
@@ -100,42 +144,92 @@ idf.py build
 idf.py -p COMx flash monitor
 ```
 
-其中 `COMx` 替换为节点开发板实际串口号，例如 `COM6`。每个实体节点烧录前，需要在
-`menuconfig -> Rescue Node Configuration -> Rescue node ID` 中设置唯一编号，
-例如 4 个节点分别设置为 `1 / 2 / 3 / 4`。Gateway 串口输出中的 `id` 会直接作为
-上位机的 `node{id}` 显示和多节点交叉研判依据。
+每个实体节点烧录前，需要在 `menuconfig -> Rescue Node Configuration -> Rescue node ID` 中设置唯一编号，例如 `1 / 2 / 3 / 4`。Gateway 串口输出中的 `id` 会直接作为上位机节点编号。
 
-### 上位机运行命令
+## 上位机运行
+
+推荐在仓库根目录运行：
+
+```powershell
+python -m pip install -r upper_computer\requirements.txt
+python -m upper_computer.main
+```
+
+也可以进入目录后运行：
 
 ```powershell
 cd upper_computer
-pip install -r requirements.txt
 python main.py
 ```
+
+上位机启动后会自动刷新串口列表。连接 Gateway 后，收到有效 JSON Lines 时会自动发现节点并刷新仪表盘、节点管理、数据分析、历史记录和技术诊断页面。
+
+## 打包 Windows 程序
+
+安装打包依赖：
+
+```powershell
+python -m pip install -r requirements-build.txt
+```
+
+执行打包：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\build_upper_computer.ps1
+```
+
+打包产物：
+
+```text
+dist/
++-- EchoGuard/
+    +-- EchoGuard.exe
+```
+
+详细说明见 [docs/upper_computer_packaging.md](docs/upper_computer_packaging.md)。
+
+## AI 辅助研判
+
+AI 模块默认以规则回退为主，不影响实时判断。可选能力包括：
+
+- 本地 Jina GGUF embedding：用于对规则融合摘要做模式相似度匹配。
+- 可选大模型 API：用于生成更自然的解释文本。
+- 离线包导入：适合比赛、答辩和无网现场。
+
+模型和 llama.cpp runtime 不提交到仓库，默认放在：
+
+```text
+upper_computer/models/
+upper_computer/runtime/
+```
+
+这两个目录已由 `.gitignore` 排除。部署说明见 [docs/local_jina_deployment.md](docs/local_jina_deployment.md)。
+
+## 文档索引
+
+- [hardware/readme.md](hardware/readme.md)：硬件接线、自检、电源与天线布局。
+- [hardware/接线表.md](hardware/%E6%8E%A5%E7%BA%BF%E8%A1%A8.md)：Gateway 与 Rescue Node 接线表。
+- [docs/interface_alignment.md](docs/interface_alignment.md)：固件、Gateway 与上位机协议对齐。
+- [docs/ai_auxiliary_judgement.md](docs/ai_auxiliary_judgement.md)：AI 辅助研判边界与异步链路。
+- [docs/ai_auxiliary_feature.md](docs/ai_auxiliary_feature.md)：AI 功能构造、原理和回退策略。
+- [docs/local_jina_deployment.md](docs/local_jina_deployment.md)：本地 Jina GGUF 离线部署。
+- [docs/upper_computer_packaging.md](docs/upper_computer_packaging.md)：Windows 打包流程。
 
 ## 项目阶段
 
 - Phase 0：项目初始化与需求拆解，明确救援场景、系统边界、目录结构和原型目标。
 - Phase 1：硬件接线与上电自检，完成 ESP32-S3、LoRa 与传感器基础连通。
-- Phase 2：感知节点固件开发，完成 WiFi-CSI 采集、传感器采集与 LoRa 上报链路。
+- Phase 2：感知节点固件开发，完成 WiFi CSI 采集、传感器采集与 LoRa 上报链路。
 - Phase 3：Gateway 固件开发，完成 LoRa 接收、数据汇聚与 USB 串口转发。
 - Phase 4：上位机开发，完成串口接收、协议解析、数据可视化、规则判断与 AI 模块接入。
-- Phase 5：系统联调与演示封装，完成穿墙/遮挡场景验证、问题闭环、文档整理和答辩材料准备。
+- Phase 5：系统联调与演示封装，完成遮挡场景验证、问题闭环、文档整理和展示材料准备。
 
-## 团队分工
+## 注意事项
 
-- 上位机：，重点完成 Python 上位机界面、串口接收、数据解析、可视化展示、规则判断和 AI 模块接入。
-- 感知节点固件：负责 WiFi-CSI 采集、环境/姿态传感器采集、节点状态管理和 LoRa 数据发送。
-- Gateway 固件：负责 LoRa 数据接收、节点数据汇聚、串口协议输出和联调日志支持。
-- 硬件：负责 ESP32-S3、Ra-02/SX1278、SHT30、MPU6050、MQ-135、电源、天线与状态 LED 接线。
-- 文档与测试：负责项目卡、阶段报告、实验记录、测试用例、联调记录和最终展示材料。
-
-## 参考文档
-
-- `hardware/readme.md`：硬件接线、上电自检、常见硬件坑点、电源与天线布局建议。
-- `docs/interface_alignment.md`：上位机与固件接口一致性、节点自动发现、电池和气体字段说明。
-- `docs/ai_auxiliary_judgement.md`：AI 辅助研判异步链路和实时规则边界说明。
-- `docs/ai_auxiliary_feature.md`：AI 辅助功能构造、原理、链路和回退策略说明。
-- `docs/local_jina_deployment.md`：本地 Jina GGUF 离线包一键部署和启动说明。
-- `docs/upper_computer_packaging.md`：Windows 上位机 PyInstaller 打包流程和验收说明。
-- `docs/`：项目卡、阶段报告、答辩材料和实验记录模板。
+- Ra-02/SX1278 只能接 3.3V，禁止接 5V。
+- LoRa 天线必须在上电和发射前安装。
+- 所有模块必须共地。
+- MQ-135 的 AO 进入 ESP32-S3 ADC 前必须确认不超过 3.3V。
+- 当前 `gas` 是原始值或近似有害气体指数，未完成 ppm 标定。
+- 当前节点固件不上传电池电量，上位机显示为“未上报”。
+- `upper_computer/models/`、`upper_computer/runtime/`、`upper_computer/exports/` 和 `dist/` 不应提交到 GitHub。
