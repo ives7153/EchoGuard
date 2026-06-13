@@ -34,7 +34,7 @@ EchoGuard 由三部分组成：
 
 ```text
 Rescue Node(s)
-  ESP32-S3 + WiFi CSI + SHT30/MPU6050/MQ-135
+  ESP32-S3 + WiFi CSI + SHT20/MPU6050/MQ-135
         |
         | 14-byte LoRa binary frame
         v
@@ -107,7 +107,7 @@ wifi-csi-lora-rescue/
 - ESP32-S3-DevKitC-1 N8R8 开发板至少 2 块：1 块 Gateway，1 块 Rescue Node。
 - Ra-02/SX1278 LoRa 模块每块板 1 个。
 - 433 MHz 匹配天线，上电和发射前必须安装。
-- 节点侧可接 SHT30、MPU6050、MQ-135。
+- 节点侧可接 SHT20、MPU6050、MQ-135。
 - USB 数据线、杜邦线、面包板或焊接底板、稳定 5V 电源。
 
 硬件接线请先阅读：
