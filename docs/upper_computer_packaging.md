@@ -1,6 +1,6 @@
 # EchoGuard 上位机打包说明
 
-本文档说明如何把当前 PyQt 上位机打包为 Windows 可运行目录。打包目标是上位机主体，不包含 Jina GGUF 模型和 `llama-server.exe`。
+本文档说明如何把当前 PyQt 上位机打包为 Windows 可运行目录。v0.2.0 起，上位机包含 SHT20 文案同步与 MQ-135 CO2 估算 ppm 标定能力。打包目标是上位机主体，不包含 Jina GGUF 模型和 `llama-server.exe`。
 
 ## 打包前检查
 
@@ -72,5 +72,6 @@ dist/
 - 侧边导航图标和太阳/月亮主题按钮正常。
 - Gateway 串口可刷新、连接、显示最新帧。
 - 节点收到数据后自动出现在仪表盘、节点管理、分析、历史和诊断页。
+- 环境状态中显示 `CO2 估算 ppm`，传感器页可执行 `MQ-135 清洁空气校准`。
 - CSV 导出、CSI 曲线截图、整窗截图可写入 `upper_computer/exports/`。
 - 无本地 Jina 或 API 时，AI 区域保持规则回退，不影响主界面运行。

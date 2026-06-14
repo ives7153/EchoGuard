@@ -13,7 +13,7 @@
 
 EchoGuard 由三部分组成：
 
-- **Rescue Node 感知节点**：ESP32-S3 采集 WiFi CSI、温湿度、姿态和气体原始值，并通过 Ra-02/SX1278 LoRa 模块上报。
+- **Rescue Node 感知节点**：ESP32-S3 采集 WiFi CSI、SHT20 温湿度、姿态和 MQ-135 气体原始值，并通过 Ra-02/SX1278 LoRa 模块上报。
 - **Gateway 汇聚网关**：ESP32-S3 接收 LoRa 帧，将节点数据转换为 JSON Lines，经 USB Serial/JTAG 输出给上位机。
 - **EchoGuard 上位机**：PyQt6 桌面程序，负责串口接收、节点自动发现、实时曲线、事件流、历史导出、规则报警和 AI 辅助解释。
 
@@ -26,6 +26,7 @@ EchoGuard 由三部分组成：
 - 多节点自动发现：上位机根据 Gateway JSON 中的 `id` 自动创建 `node{id}`。
 - 多节点综合研判：最近 5 秒窗口内融合 presence、motion、confidence 和 RSSI。
 - 现场安全提示：LoRa 天线、电源共地、MQ-135 分压、I2C 上拉等硬件注意事项文档化。
+- MQ-135 CO2 估算 ppm：上位机将节点上报的 ADC 原始值按分压、电阻和 R0 标定参数换算为估算 ppm，支持清洁空气一键校准。
 - 数据导出能力：支持 CSV 导出、CSI 曲线截图和整窗截图。
 - AI 辅助研判：本地 Jina GGUF embedding 与可选大模型 API，仅用于解释和辅助，不接管实时判断。
 - Windows 打包：提供 PyInstaller spec 与一键打包脚本，生成 `dist/EchoGuard/EchoGuard.exe`。
@@ -81,7 +82,7 @@ Gateway 输出一行 JSON：
 }
 ```
 
-上位机将字段规范化为 `node_id`、`presence_score`、`motion_score`、`confidence`、`temperature`、`humidity`、`rssi` 等内部字段。详见 [docs/interface_alignment.md](docs/interface_alignment.md)。
+上位机将字段规范化为 `node_id`、`presence_score`、`motion_score`、`confidence`、`gas_raw`、`gas_ppm`、`temperature`、`humidity`、`rssi` 等内部字段，其中 `gas` 兼容字段等同于 CO2 估算 ppm。详见 [docs/interface_alignment.md](docs/interface_alignment.md)。
 
 ## 目录结构
 
@@ -230,6 +231,6 @@ upper_computer/runtime/
 - LoRa 天线必须在上电和发射前安装。
 - 所有模块必须共地。
 - MQ-135 的 AO 进入 ESP32-S3 ADC 前必须确认不超过 3.3V。
-- 当前 `gas` 是原始值或近似有害气体指数，未完成 ppm 标定。
+- 当前 `gas` 在 Gateway JSON 中仍是 MQ-135 ADC 原始值；上位机显示的 `gas_ppm` / 兼容 `gas` 为 CO2 估算 ppm，需通过清洁空气校准提升可信度。
 - 当前节点固件不上传电池电量，上位机显示为“未上报”。
 - `upper_computer/models/`、`upper_computer/runtime/`、`upper_computer/exports/` 和 `dist/` 不应提交到 GitHub。

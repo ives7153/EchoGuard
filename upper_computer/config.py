@@ -20,7 +20,7 @@ from pathlib import Path
 # 品牌与基础常量
 # ---------------------------------------------------------------------------
 BRAND_NAME = "EchoGuard"
-BRAND_VERSION = ""
+BRAND_VERSION = "v0.2.0"
 APP_TITLE = "EchoGuard"
 WINDOW_TITLE = "EchoGuard"
 CONTROL_ID = "0xFF-AD-01"
@@ -287,10 +287,10 @@ def _sync_derived_theme() -> None:
 # 阈值默认值（传感器页右侧配置 + 报警规则共享）
 # ---------------------------------------------------------------------------
 PRESENCE_THRESHOLD = 0.42       # 存在感应阈值（0~1，对应设计稿 42%）
-GAS_THRESHOLD_RAW = 280.0       # MQ-135 原始值 / 有害气体指数阈值，未做 ppm 标定
-GAS_ALARM_RAW = 550.0           # 触发系统警告的气体原始值上限
-GAS_THRESHOLD_PPM = GAS_THRESHOLD_RAW  # 兼容旧导入名；UI 不再按 ppm 展示
-GAS_ALARM_PPM = GAS_ALARM_RAW          # 兼容旧导入名；规则仍比较原始值
+GAS_THRESHOLD_PPM = 1000.0      # MQ-135 CO2 估算 ppm 预警阈值
+GAS_ALARM_PPM = 2000.0          # 触发系统警告的 CO2 估算 ppm 上限
+GAS_THRESHOLD_RAW = GAS_THRESHOLD_PPM  # 兼容旧导入名；当前语义已迁移为 ppm
+GAS_ALARM_RAW = GAS_ALARM_PPM          # 兼容旧导入名；规则比较 ppm
 CONFIDENCE_THRESHOLD = 0.75     # 生命微动报警的置信度门限
 ALARM_DEDUP_SECONDS = 5.0       # 同类报警去重窗口
 
@@ -312,6 +312,8 @@ CSV_FIELDS = [
     "breath_bpm",
     "confidence",
     "gas",
+    "gas_raw",
+    "gas_ppm",
     "temperature",
     "humidity",
     "rssi",

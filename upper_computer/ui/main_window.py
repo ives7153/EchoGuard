@@ -131,6 +131,7 @@ class MainWindow(QMainWindow):
     clear_history_requested = pyqtSignal()
     presence_threshold_changed = pyqtSignal(float)
     gas_threshold_changed = pyqtSignal(float)
+    gas_calibration_requested = pyqtSignal()
     afh_toggled = pyqtSignal(bool)
     mesh_toggled = pyqtSignal(bool)
     sync_requested = pyqtSignal()
@@ -328,6 +329,7 @@ class MainWindow(QMainWindow):
         # 传感器页配置
         self.sensor_page.presence_threshold_changed.connect(self.presence_threshold_changed.emit)
         self.sensor_page.gas_threshold_changed.connect(self.gas_threshold_changed.emit)
+        self.sensor_page.gas_calibration_requested.connect(self.gas_calibration_requested.emit)
         self.sensor_page.afh_toggled.connect(self.afh_toggled.emit)
         self.sensor_page.mesh_toggled.connect(self.mesh_toggled.emit)
         self.sensor_page.sync_requested.connect(self.sync_requested.emit)
