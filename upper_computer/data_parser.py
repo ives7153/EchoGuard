@@ -16,6 +16,13 @@ import json
 import time
 from typing import Any
 
+try:
+    from .gas_calibration import calculate_gas_ppm
+except ImportError:
+    if __package__:
+        raise
+    from gas_calibration import calculate_gas_ppm
+
 
 def parse_gateway_frame(line: str) -> dict[str, Any]:
     """解析 Gateway 串口输出的一行 JSON 数据。
@@ -37,6 +44,8 @@ def parse_gateway_frame(line: str) -> dict[str, Any]:
         "breath_bpm": 0.0,
         "confidence": 0.0,
         "gas": 0.0,
+        "gas_raw": 0.0,
+        "gas_ppm": 0.0,
         "temperature": 0.0,
         "humidity": 0.0,
         "rssi": 0.0,
@@ -64,6 +73,11 @@ def parse_gateway_frame(line: str) -> dict[str, Any]:
         result["error"] = "缺少节点 id"
         return result
 
+    gas_raw = _number(_first(payload, "gas", "gas_raw"), 0.0)
+    gas_ppm = _number(_first(payload, "gas_ppm", "ppm"), -1.0)
+    if gas_ppm < 0.0:
+        gas_ppm = calculate_gas_ppm(gas_raw)
+
     result.update(
         {
             "valid": True,
@@ -73,7 +87,9 @@ def parse_gateway_frame(line: str) -> dict[str, Any]:
             "motion_score": _normalize_score(_first(payload, "motion", "motion_score")),
             "breath_bpm": _number(_first(payload, "bpm", "breath_bpm"), 0.0),
             "confidence": _normalize_score(_first(payload, "conf", "confidence")),
-            "gas": _number(_first(payload, "gas", "gas_raw"), 0.0),
+            "gas": gas_ppm,
+            "gas_raw": gas_raw,
+            "gas_ppm": gas_ppm,
             "temperature": _number(_first(payload, "temp", "temperature"), 0.0),
             "humidity": _number(_first(payload, "hum", "humidity"), 0.0),
             "rssi": _number(_first(payload, "rssi"), 0.0),

@@ -60,6 +60,7 @@ def main() -> int:
     window.clear_history_requested.connect(manager.clear_history)
     window.presence_threshold_changed.connect(manager.set_presence_threshold)
     window.gas_threshold_changed.connect(manager.set_gas_threshold)
+    window.gas_calibration_requested.connect(manager.calibrate_mq135_clean_air)
     window.afh_toggled.connect(manager.set_afh_enabled)
     window.mesh_toggled.connect(manager.set_mesh_enabled)
     window.sync_requested.connect(manager.sync_global_config)

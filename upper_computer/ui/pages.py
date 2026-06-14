@@ -48,7 +48,7 @@ try:
         CONTROL_ID,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
-        GAS_THRESHOLD_RAW,
+        GAS_THRESHOLD_PPM,
         GATEWAY_ID,
         HEALTH_CRITICAL,
         NODE_LABELS,
@@ -77,7 +77,7 @@ except ImportError:
         CONTROL_ID,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
-        GAS_THRESHOLD_RAW,
+        GAS_THRESHOLD_PPM,
         GATEWAY_ID,
         HEALTH_CRITICAL,
         NODE_LABELS,
@@ -855,7 +855,7 @@ class DashboardPage(QWidget):
                 (
                     ("temp", "温度 TEMP", "-- °C"),
                     ("hum", "湿度 HUM", "-- %"),
-                    ("gas", "有害气体指数", "--"),
+                    ("gas", "CO2 估算 ppm", "-- ppm"),
                 ),
             ),
             1,
@@ -1031,7 +1031,7 @@ class DashboardPage(QWidget):
                 ("Presence", f"{_score(state.get('presence_score')):.2f}"),
                 ("Motion", f"{_score(state.get('motion_score')):.2f}"),
                 ("Confidence", f"{_score(state.get('confidence')) * 100:.0f}%"),
-                ("有害气体指数", f"{_float(state.get('gas')):.0f}"),
+                ("CO2 估算 ppm", f"{_float(state.get('gas_ppm', state.get('gas'))):.0f} ppm"),
                 ("RSSI", f"{_float(state.get('rssi')):.0f} dBm"),
             ),
         )
@@ -1198,16 +1198,16 @@ class DashboardPage(QWidget):
     def _update_group_cards(self, state: dict[str, Any]) -> None:
         temp = _float(state.get("temperature"))
         hum = _float(state.get("humidity"))
-        gas = _float(state.get("gas"))
+        gas = _float(state.get("gas_ppm", state.get("gas")))
         rssi = _float(state.get("rssi"))
         snr = _float(state.get("snr"))
         loss = _float(state.get("packet_loss"))
 
         self.group_values["temp"].setText(f"{temp:.1f}°C")
         self.group_values["hum"].setText(f"{hum:.0f}%")
-        self.group_values["gas"].setText(f"{gas:.0f}")
+        self.group_values["gas"].setText(f"{gas:.0f} ppm")
         self.group_values["gas"].setStyleSheet(
-            f"font-size: 19px; color: {THEME['red'] if gas >= 550 else THEME['text']};"
+            f"font-size: 19px; color: {THEME['red'] if gas >= 2000 else THEME['orange'] if gas >= 1000 else THEME['text']};"
         )
 
         self.group_values["rssi"].setText(f"{rssi:.0f} dBm")
@@ -1350,6 +1350,7 @@ class SensorMatrixPage(QWidget):
 
     presence_threshold_changed = pyqtSignal(float)
     gas_threshold_changed = pyqtSignal(float)
+    gas_calibration_requested = pyqtSignal()
     afh_toggled = pyqtSignal(bool)
     mesh_toggled = pyqtSignal(bool)
     sync_requested = pyqtSignal()
@@ -1486,16 +1487,26 @@ class SensorMatrixPage(QWidget):
         layout.addWidget(self.presence_slider)
 
         self.gas_slider = ThresholdSlider(
-            "有害气体原始值阈值",
+            "CO2 估算 ppm 阈值",
             minimum=0.0,
-            maximum=1000.0,
-            value=GAS_THRESHOLD_RAW,
-            value_fmt=lambda v: f"{v:.0f}",
-            min_label="0",
-            max_label="1000",
+            maximum=5000.0,
+            value=GAS_THRESHOLD_PPM,
+            value_fmt=lambda v: f"{v:.0f} ppm",
+            min_label="0 ppm",
+            max_label="5000 ppm",
         )
         self.gas_slider.valueChanged.connect(self.gas_threshold_changed.emit)
         layout.addWidget(self.gas_slider)
+
+        self.gas_calibrate_btn = QPushButton("MQ-135 清洁空气校准")
+        self.gas_calibrate_btn.setObjectName("GhostButton")
+        self.gas_calibrate_btn.clicked.connect(self.gas_calibration_requested.emit)
+        layout.addWidget(self.gas_calibrate_btn)
+
+        self.gas_calibration_label = QLabel("MQ-135 R0：默认估算")
+        self.gas_calibration_label.setObjectName("SubtleText")
+        self.gas_calibration_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.gas_calibration_label)
 
         self.config_divider = QFrame()
         self.config_divider.setFixedHeight(1)
@@ -1569,6 +1580,9 @@ class SensorMatrixPage(QWidget):
             self.sync_time_label.setText(
                 "最后同步时间: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(last_sync)))
             )
+        r0 = _float(config.get("gas_calibration_r0"))
+        if r0 > 0.0:
+            self.gas_calibration_label.setText(f"MQ-135 R0：{r0:.2f} kΩ · 清洁空气 {config.get('gas_clean_air_ppm', 400):.0f} ppm")
 
         # 严重错误节点 → 底部系统警告条
         critical = next((m for m in matrix if m.get("health") == HEALTH_CRITICAL), None)
@@ -1717,7 +1731,7 @@ class AnalysisPage(QWidget):
         for label, key in (
             ("运动分值", "motion_score"),
             ("存在感应", "presence_score"),
-            ("有害气体指数", "gas"),
+            ("CO2 估算 ppm", "gas_ppm"),
             ("LoRa RSSI", "rssi"),
         ):
             self.metric_combo.addItem(label, key)
@@ -1745,7 +1759,7 @@ class AnalysisPage(QWidget):
         self.stat_cards: dict[str, MetricCard] = {
             "samples": MetricCard("累计样本\n(SAMPLES)", "0", "历史缓存"),
             "avg_motion": MetricCard("平均运动\n(AVG MOTION)", "--", "全部节点"),
-            "max_gas": MetricCard("有害气体峰值\n(GAS INDEX)", "--", "全部节点"),
+            "max_gas": MetricCard("CO2 峰值\n(PPM EST.)", "-- ppm", "全部节点"),
             "online": MetricCard("在线节点\n(ONLINE)", "0 / 0", "已发现节点"),
         }
         for index, card in enumerate(self.stat_cards.values()):
@@ -1799,10 +1813,10 @@ class AnalysisPage(QWidget):
         motions = [_score(s.get("motion_score")) for s in filtered_history]
         avg_motion = sum(motions) / len(motions) if motions else 0.0
         self.stat_cards["avg_motion"].set_value(f"{avg_motion:.2f}", "当前筛选")
-        gases = [_float(s.get("gas")) for s in filtered_history]
+        gases = [_float(s.get("gas_ppm", s.get("gas"))) for s in filtered_history]
         max_gas = max(gases) if gases else 0.0
         self.stat_cards["max_gas"].set_value(
-            f"{max_gas:.0f}", "当前筛选", THEME["red"] if max_gas >= 550 else None
+            f"{max_gas:.0f} ppm", "当前筛选", THEME["red"] if max_gas >= 2000 else THEME["orange"] if max_gas >= 1000 else None
         )
         online = sum(1 for n in nodes.values() if n.get("online"))
         self.stat_cards["online"].set_value(
@@ -1972,7 +1986,7 @@ class DiagnosticsPage(QWidget):
             ("afh", "自动频率跳变 (AFH)"),
             ("mesh", "多级网格中继"),
             ("presence", "存在感应阈值"),
-            ("gas", "气体原始值阈值"),
+            ("gas", "CO2 估算 ppm 阈值"),
         ):
             row = QHBoxLayout()
             caption = QLabel(label)
@@ -2047,7 +2061,7 @@ class DiagnosticsPage(QWidget):
         self.info_labels["afh"].setText("开启" if config.get("afh_enabled") else "关闭")
         self.info_labels["mesh"].setText("开启" if config.get("mesh_enabled") else "关闭")
         self.info_labels["presence"].setText(f"{_float(config.get('presence_threshold')) * 100:.0f}%")
-        self.info_labels["gas"].setText(f"{_float(config.get('gas_threshold')):.0f}")
+        self.info_labels["gas"].setText(f"{_float(config.get('gas_threshold_ppm', config.get('gas_threshold'))):.0f} ppm")
         report = str(snapshot.get("diagnostics_report") or "")
         if report:
             self.report_box.setText(report)
@@ -2099,7 +2113,7 @@ class HistoryPage(QWidget):
     export_filtered_csv_requested = pyqtSignal(object)
     clear_history_requested = pyqtSignal()
 
-    _COLUMNS = ("时间", "节点", "有效性", "存在", "运动", "置信度", "气体", "温度", "湿度", "RSSI")
+    _COLUMNS = ("时间", "节点", "有效性", "存在", "运动", "置信度", "CO2 ppm", "温度", "湿度", "RSSI")
     _TABLE_MAX_ROWS = 1000
 
     def __init__(self) -> None:
@@ -2225,7 +2239,7 @@ class HistoryPage(QWidget):
                     f"{_score(sample.get('presence_score')):.2f}",
                     f"{_score(sample.get('motion_score')):.2f}",
                     f"{_score(sample.get('confidence')) * 100:.0f}%",
-                    f"{_float(sample.get('gas')):.0f}",
+                    f"{_float(sample.get('gas_ppm', sample.get('gas'))):.0f}",
                     f"{_float(sample.get('temperature')):.1f}",
                     f"{_float(sample.get('humidity')):.0f}",
                     f"{_float(sample.get('rssi')):.0f}",
@@ -2285,7 +2299,8 @@ class HistoryPage(QWidget):
                 ("Presence", f"{_score(sample.get('presence_score')):.2f}"),
                 ("Motion", f"{_score(sample.get('motion_score')):.2f}"),
                 ("Confidence", f"{_score(sample.get('confidence')) * 100:.0f}%"),
-                ("有害气体指数", f"{_float(sample.get('gas')):.0f}"),
+                ("CO2 估算 ppm", f"{_float(sample.get('gas_ppm', sample.get('gas'))):.0f} ppm"),
+                ("气体原始值", f"{_float(sample.get('gas_raw')):.0f}"),
                 ("Raw", sample.get("raw", "")),
             ),
         )

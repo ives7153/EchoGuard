@@ -26,7 +26,7 @@ try:
         CONTROL_ID,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
-        GAS_THRESHOLD_RAW,
+        GAS_THRESHOLD_PPM,
         GATEWAY_ID,
         HEALTH_CRITICAL,
         HEALTH_EXCELLENT,
@@ -38,6 +38,8 @@ try:
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
         UI_REFRESH_MS,
+        load_ui_settings,
+        save_ui_settings,
     )
     from ..data_parser import parse_gateway_frame
     from ..ai import (
@@ -62,6 +64,12 @@ try:
     from ..rules.detection_fusion import ai_fallback_text, build_detection_summary
     from ..serial_handler import SerialReader
     from .alarm_rules import AlarmEngine
+    from ..gas_calibration import (
+        DEFAULT_MQ135_R0_KOHM,
+        MQ135_CLEAN_AIR_PPM,
+        calculate_gas_ppm,
+        calibrate_r0_from_clean_air_raw,
+    )
     from .exporter import (
         export_samples_to_csv,
         save_csi_screenshot,
@@ -76,7 +84,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         CONTROL_ID,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
-        GAS_THRESHOLD_RAW,
+        GAS_THRESHOLD_PPM,
         GATEWAY_ID,
         HEALTH_CRITICAL,
         HEALTH_EXCELLENT,
@@ -88,6 +96,8 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
         UI_REFRESH_MS,
+        load_ui_settings,
+        save_ui_settings,
     )
     from data_parser import parse_gateway_frame
     from ai import (  # type: ignore
@@ -112,6 +122,12 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
     from rules.detection_fusion import ai_fallback_text, build_detection_summary  # type: ignore
     from serial_handler import SerialReader
     from core.alarm_rules import AlarmEngine
+    from gas_calibration import (
+        DEFAULT_MQ135_R0_KOHM,
+        MQ135_CLEAN_AIR_PPM,
+        calculate_gas_ppm,
+        calibrate_r0_from_clean_air_raw,
+    )
     from core.exporter import (
         export_samples_to_csv,
         save_csi_screenshot,
@@ -142,6 +158,8 @@ class NodeState:
     breath_bpm: float = 0.0
     confidence: float = 0.0
     gas: float = 0.0
+    gas_raw: float = 0.0
+    gas_ppm: float = 0.0
     temperature: float = 0.0
     humidity: float = 0.0
     source: str = "serial"
@@ -351,9 +369,10 @@ class DataManager(QObject):
         # 报警引擎（阈值可被传感器页热更新）
         self.alarm_engine = AlarmEngine()
         self.presence_threshold = PRESENCE_THRESHOLD
-        self.gas_threshold = GAS_THRESHOLD_RAW
+        self.gas_threshold = GAS_THRESHOLD_PPM
         self.afh_enabled = DEFAULT_AFH_ENABLED
         self.mesh_enabled = DEFAULT_MESH_ENABLED
+        self.gas_calibration_r0 = self._load_gas_calibration_r0()
         self.last_sync_at: float | None = None
 
         # 节点由 Gateway 串口帧自动发现；无真实数据时保持空状态。
@@ -939,11 +958,32 @@ class DataManager(QObject):
 
     @pyqtSlot(float)
     def set_gas_threshold(self, value: float) -> None:
-        """传感器页有害气体原始值阈值滑条回调。"""
+        """传感器页 CO2 估算 ppm 阈值滑条回调。"""
 
         self.gas_threshold = max(0.0, float(value))
         self._dirty = True
 
+    @pyqtSlot()
+    def calibrate_mq135_clean_air(self) -> None:
+        """用当前最新 MQ-135 原始值按 400 ppm 清洁空气估算 R0。"""
+
+        latest = self._latest_gas_raw_for_calibration()
+        if latest is None:
+            self.status_changed.emit("MQ-135 校准失败：暂无真实气体原始值", False)
+            self._append_event("MQ-135 CALIBRATION FAILED", "暂无真实气体原始值，无法校准 R0", level="WARN", kind="config")
+            return
+
+        node_id, gas_raw = latest
+        self.gas_calibration_r0 = calibrate_r0_from_clean_air_raw(gas_raw, MQ135_CLEAN_AIR_PPM)
+        save_ui_settings({"mq135_r0_kohm": self.gas_calibration_r0})
+        self._recalculate_gas_history()
+        message = (
+            f"MQ-135 清洁空气校准完成：{self._node_label(node_id)} raw={gas_raw:.0f}，"
+            f"R0={self.gas_calibration_r0:.2f} kΩ"
+        )
+        self.status_changed.emit(message, True)
+        self._append_event("MQ-135 CALIBRATED", message, node_id=node_id, level="OK", kind="config")
+        self._dirty = True
     @pyqtSlot(bool)
     def set_afh_enabled(self, enabled: bool) -> None:
         self.afh_enabled = bool(enabled)
@@ -971,11 +1011,11 @@ class DataManager(QObject):
         self.last_sync_at = time.time()
         self.alarm_engine.update_thresholds(
             presence_threshold=self.presence_threshold,
-            gas_alarm_raw=max(self.gas_threshold, self.alarm_engine.gas_alarm_raw),
+            gas_alarm_ppm=max(self.gas_threshold, self.alarm_engine.gas_alarm_ppm),
         )
         self._append_event(
             "CONFIG SYNCED",
-            f"本地配置已同步：存在阈值 {self.presence_threshold * 100:.0f}% · 气体原始值阈值 {self.gas_threshold:.0f}",
+            f"本地配置已同步：存在阈值 {self.presence_threshold * 100:.0f}% · CO2 估算阈值 {self.gas_threshold:.0f} ppm",
             level="OK",
             kind="config",
         )
@@ -1281,6 +1321,46 @@ class DataManager(QObject):
         if state.rssi < -100.0:
             return HEALTH_GOOD
         return HEALTH_EXCELLENT
+    def _load_gas_calibration_r0(self) -> float:
+        settings = load_ui_settings()
+        value = _float(settings.get("mq135_r0_kohm"), DEFAULT_MQ135_R0_KOHM)
+        return value if value > 0.0 else DEFAULT_MQ135_R0_KOHM
+
+    def _apply_gas_calibration(self, sample: dict[str, Any]) -> dict[str, Any]:
+        enriched = dict(sample)
+        gas_raw = _float(enriched.get("gas_raw", enriched.get("gas")))
+        gas_ppm = calculate_gas_ppm(gas_raw, self.gas_calibration_r0)
+        enriched["gas_raw"] = gas_raw
+        enriched["gas_ppm"] = gas_ppm
+        enriched["gas"] = gas_ppm
+        return enriched
+
+    def _latest_gas_raw_for_calibration(self) -> tuple[int, float] | None:
+        preferred_node = int(self._active_node or 0)
+        for sample in reversed(self.history):
+            node_id = int(sample.get("node_id") or 0)
+            if preferred_node and node_id != preferred_node:
+                continue
+            gas_raw = _float(sample.get("gas_raw"))
+            if gas_raw > 0.0:
+                return node_id, gas_raw
+        for sample in reversed(self.history):
+            node_id = int(sample.get("node_id") or 0)
+            gas_raw = _float(sample.get("gas_raw"))
+            if gas_raw > 0.0:
+                return node_id, gas_raw
+        return None
+
+    def _recalculate_gas_history(self) -> None:
+        for sample in self.history:
+            gas_raw = _float(sample.get("gas_raw", sample.get("gas")))
+            gas_ppm = calculate_gas_ppm(gas_raw, self.gas_calibration_r0)
+            sample["gas_raw"] = gas_raw
+            sample["gas_ppm"] = gas_ppm
+            sample["gas"] = gas_ppm
+        for node in self.nodes.values():
+            node.gas_ppm = calculate_gas_ppm(node.gas_raw, self.gas_calibration_r0)
+            node.gas = node.gas_ppm
 
     # ------------------------------------------------------------------ 样本应用
     def _apply_sample(
@@ -1289,6 +1369,7 @@ class DataManager(QObject):
         run_rules: bool = True,
         mark_dirty: bool = True,
     ) -> dict[str, Any] | None:
+        sample = self._apply_gas_calibration(sample)
         node_id = int(sample.get("node_id") or 0)
         node = self._ensure_node_state(node_id)
         matrix_state = self._ensure_matrix_node(node_id)
@@ -1314,7 +1395,9 @@ class DataManager(QObject):
         node.motion_score = _score(sample.get("motion_score", sample.get("motion")))
         node.breath_bpm = _float(sample.get("breath_bpm", sample.get("bpm")))
         node.confidence = _score(sample.get("confidence", sample.get("conf")))
-        node.gas = _float(sample.get("gas"))
+        node.gas_raw = _float(sample.get("gas_raw", sample.get("gas")))
+        node.gas_ppm = _float(sample.get("gas_ppm", sample.get("gas")))
+        node.gas = node.gas_ppm
         node.temperature = _float(sample.get("temperature", sample.get("temp")))
         node.humidity = _float(sample.get("humidity", sample.get("hum")))
         node.source = str(sample.get("source", "serial"))
@@ -1331,6 +1414,9 @@ class DataManager(QObject):
                 "snr": node.snr,
                 "packet_loss": node.packet_loss,
                 "battery": node.battery,
+                "gas": node.gas_ppm,
+                "gas_raw": node.gas_raw,
+                "gas_ppm": node.gas_ppm,
                 "mode": "NORMAL",
             }
         )
@@ -1662,6 +1748,9 @@ class DataManager(QObject):
                 "config": {
                     "presence_threshold": self.presence_threshold,
                     "gas_threshold": self.gas_threshold,
+                    "gas_threshold_ppm": self.gas_threshold,
+                    "gas_calibration_r0": self.gas_calibration_r0,
+                    "gas_clean_air_ppm": MQ135_CLEAN_AIR_PPM,
                     "afh_enabled": self.afh_enabled,
                     "mesh_enabled": self.mesh_enabled,
                     "last_sync_at": self.last_sync_at,
