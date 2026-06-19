@@ -54,16 +54,23 @@
 #define LORA_TX_PAYLOAD_LEN             14
 #define LORA_TX_TIMEOUT_MS              1000
 
-/* 节点传感器引脚：SHT20 与 MPU6050 共用 I2C，MQ-135 使用 GPIO6 ADC 输入。 */
+/* 节点传感器引脚：AHT20 与 MPU6050 共用 I2C，MQ-135 使用 GPIO6 ADC 输入。 */
 #define I2C_PORT_NUM                    I2C_NUM_0
 #define I2C_PIN_SDA                     GPIO_NUM_8
 #define I2C_PIN_SCL                     GPIO_NUM_9
 #define I2C_FREQ_HZ                     100000
-#define SHT20_ADDR                      0x40
-#define SHT20_CMD_TEMP_NO_HOLD          0xF3
-#define SHT20_CMD_HUM_NO_HOLD           0xF5
-#define SHT20_TEMP_DELAY_MS             85
-#define SHT20_HUM_DELAY_MS              29
+#define AHT20_ADDR                      0x38
+#define AHT20_CMD_INIT                  0xBE
+#define AHT20_CMD_INIT_LEGACY           0xE1
+#define AHT20_CMD_SOFT_RESET            0xBA
+#define AHT20_CMD_TRIGGER               0xAC
+#define AHT20_POWER_ON_DELAY_MS         100
+#define AHT20_RESET_DELAY_MS            20
+#define AHT20_INIT_DELAY_MS             40
+#define AHT20_MEASURE_DELAY_MS          120
+#define AHT20_CMD_STATUS                0x71
+#define AHT20_STATUS_BUSY               0x80
+#define AHT20_STATUS_CALIBRATED         0x08
 #define MPU6050_ADDR                    0x68
 #define MQ135_ADC_GPIO                  GPIO_NUM_6
 
@@ -127,7 +134,7 @@ typedef struct {
     uint16_t gas_raw;
     int16_t temp_x10;
     uint8_t humidity;
-    bool sht20_ok;
+    bool aht20_ok;
     bool mpu6050_ok;
     bool mq135_ok;
     bool csi_ok;
@@ -149,10 +156,14 @@ static EventGroupHandle_t s_wifi_event_group;
 static SemaphoreHandle_t s_sample_mutex;
 static spi_device_handle_t s_lora_spi;
 static i2c_master_bus_handle_t s_i2c_bus;
-static i2c_master_dev_handle_t s_sht20_dev;
+static i2c_master_dev_handle_t s_aht20_dev;
 static i2c_master_dev_handle_t s_mpu6050_dev;
 static adc_oneshot_unit_handle_t s_mq135_adc;
 static adc_channel_t s_mq135_channel;
+static bool s_i2c_scan_done;
+static int64_t s_last_i2c_scan_ms;
+static bool s_aht20_initialized;
+static bool s_aht20_logged_first_read;
 
 static portMUX_TYPE s_csi_lock = portMUX_INITIALIZER_UNLOCKED;
 static float s_csi_window[CSI_WINDOW_SIZE];
@@ -184,8 +195,11 @@ static void csi_features_to_scores(const csi_window_features_t *features,
                                    float accel_delta_g,
                                    node_fusion_sample_t *sample);
 static esp_err_t sensors_init_once(void);
-static esp_err_t sht20_read(float *temperature_c, float *humidity_percent);
-static esp_err_t sht20_read_raw(uint8_t command, uint32_t delay_ms, uint16_t *raw);
+static void i2c_scan_bus_once(void);
+static esp_err_t aht20_init(void);
+static esp_err_t aht20_send_init_command(uint8_t command);
+static esp_err_t aht20_read_status(uint8_t *status);
+static esp_err_t aht20_read(float *temperature_c, float *humidity_percent);
 static esp_err_t mpu6050_read_accel(float *accel_g, float *accel_delta_g);
 static esp_err_t mq135_read_raw(uint16_t *raw);
 static esp_err_t lora_spi_bus_init_once(void);
@@ -196,7 +210,6 @@ static void lora_set_op_mode(uint8_t mode);
 static void lora_write_reg(uint8_t reg, uint8_t value);
 static uint8_t lora_read_reg(uint8_t reg);
 static uint8_t clamp_u8_int(int value);
-static uint8_t sht20_crc8(const uint8_t *data, size_t len);
 
 void app_main(void)
 {
@@ -344,6 +357,8 @@ static void csi_sensor_task(void *arg)
 
     xEventGroupWaitBits(s_wifi_event_group, WIFI_STARTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
 
+    uint32_t last_csi_total_packets = 0;
+
     bool csi_ready = (csi_init_once() == ESP_OK);
     bool sensors_ready = (sensors_init_once() == ESP_OK);
     if (!csi_ready) {
@@ -361,6 +376,11 @@ static void csi_sensor_task(void *arg)
             sensors_ready = (sensors_init_once() == ESP_OK);
         }
 
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (s_i2c_bus != NULL && now_ms - s_last_i2c_scan_ms >= 10000) {
+            i2c_scan_bus_once();
+        }
+
         node_fusion_sample_t sample = s_latest_sample;
         float temperature_c = 25.0f;
         float humidity_percent = 50.0f;
@@ -368,20 +388,22 @@ static void csi_sensor_task(void *arg)
         float accel_delta_g = 0.0f;
         uint16_t gas_raw = sample.gas_raw;
 
-        esp_err_t sht_ret = sht20_read(&temperature_c, &humidity_percent);
+        esp_err_t aht_ret = aht20_read(&temperature_c, &humidity_percent);
         esp_err_t mpu_ret = mpu6050_read_accel(&accel_g, &accel_delta_g);
         esp_err_t mq_ret = mq135_read_raw(&gas_raw);
 
         csi_window_features_t csi_features = csi_window_snapshot();
+        uint32_t csi_delta_packets = csi_features.total_packets - last_csi_total_packets;
+        last_csi_total_packets = csi_features.total_packets;
         csi_features_to_scores(&csi_features, accel_delta_g, &sample);
 
-        if (sht_ret == ESP_OK) {
+        if (aht_ret == ESP_OK) {
             sample.temp_x10 = (int16_t)lroundf(temperature_c * 10.0f);
             sample.humidity = clamp_u8_int((int)lroundf(humidity_percent));
-            sample.sht20_ok = true;
+            sample.aht20_ok = true;
         } else {
-            sample.sht20_ok = false;
-            ESP_LOGW(TAG, "SHT20 读取失败: %s，保留上次温湿度", esp_err_to_name(sht_ret));
+            sample.aht20_ok = false;
+            ESP_LOGW(TAG, "AHT20 read failed: %s, keeping last temperature/humidity", esp_err_to_name(aht_ret));
         }
 
         if (mpu_ret == ESP_OK) {
@@ -403,7 +425,7 @@ static void csi_sensor_task(void *arg)
         sample.updated_ms = esp_timer_get_time() / 1000;
 
         int confidence = sample.confidence;
-        confidence += sample.sht20_ok ? 8 : 0;
+        confidence += sample.aht20_ok ? 8 : 0;
         confidence += sample.mpu6050_ok ? 8 : 0;
         confidence += sample.mq135_ok ? 6 : 0;
         confidence += (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) ? 10 : 0;
@@ -426,6 +448,30 @@ static void csi_sensor_task(void *arg)
                  sample.humidity,
                  csi_features.sample_count,
                  (double)accel_g);
+
+        EventBits_t wifi_bits = xEventGroupGetBits(s_wifi_event_group);
+        bool wifi_connected = (wifi_bits & WIFI_CONNECTED_BIT) != 0;
+        int8_t wifi_rssi = 0;
+        if (wifi_connected) {
+            wifi_ap_record_t ap_info = {0};
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                wifi_rssi = ap_info.rssi;
+            }
+        }
+        ESP_LOGI(TAG,
+                 "诊断: wifi=%d wifi_rssi=%d csi_total=%" PRIu32 " csi_delta=%" PRIu32
+                 " csi_rssi=%d mean=%.2f range=%.2f abs_dev=%.2f aht20=%d mpu6050=%d mq135=%d",
+                 wifi_connected ? 1 : 0,
+                 wifi_rssi,
+                 csi_features.total_packets,
+                 csi_delta_packets,
+                 csi_features.last_rssi,
+                 (double)csi_features.mean_amp,
+                 (double)csi_features.range,
+                 (double)csi_features.abs_dev,
+                 sample.aht20_ok ? 1 : 0,
+                 sample.mpu6050_ok ? 1 : 0,
+                 sample.mq135_ok ? 1 : 0);
 
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -606,17 +652,33 @@ static esp_err_t sensors_init_once(void)
         }
     }
 
-    if (s_i2c_bus != NULL && s_sht20_dev == NULL) {
-        i2c_device_config_t sht20_config = {
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (s_i2c_bus != NULL && (!s_i2c_scan_done || now_ms - s_last_i2c_scan_ms >= 10000)) {
+        i2c_scan_bus_once();
+    }
+
+    if (s_i2c_bus != NULL && s_aht20_dev == NULL) {
+        i2c_device_config_t aht20_config = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-            .device_address = SHT20_ADDR,
+            .device_address = AHT20_ADDR,
             .scl_speed_hz = I2C_FREQ_HZ,
         };
-        esp_err_t ret = i2c_master_bus_add_device(s_i2c_bus, &sht20_config, &s_sht20_dev);
+        esp_err_t ret = i2c_master_bus_add_device(s_i2c_bus, &aht20_config, &s_aht20_dev);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "添加 SHT20 I2C 设备失败 addr=0x%02x: %s",
-                     SHT20_ADDR, esp_err_to_name(ret));
+            ESP_LOGW(TAG, "AHT20 I2C device add failed addr=0x%02x: %s",
+                     AHT20_ADDR, esp_err_to_name(ret));
             overall = ret;
+        }
+    }
+
+    if (s_aht20_dev != NULL && !s_aht20_initialized) {
+        esp_err_t ret = aht20_init();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "AHT20 init failed addr=0x%02x: %s", AHT20_ADDR, esp_err_to_name(ret));
+            overall = ret;
+        } else {
+            s_aht20_initialized = true;
+            ESP_LOGI(TAG, "AHT20 init ok addr=0x%02x", AHT20_ADDR);
         }
     }
 
@@ -680,58 +742,164 @@ static esp_err_t sensors_init_once(void)
     return overall;
 }
 
-static esp_err_t sht20_read(float *temperature_c, float *humidity_percent)
+static void i2c_scan_bus_once(void)
 {
-    if (s_sht20_dev == NULL || temperature_c == NULL || humidity_percent == NULL) {
+    if (s_i2c_bus == NULL) {
+        return;
+    }
+
+    bool found_any = false;
+    bool found_aht20 = false;
+    bool found_mpu6050 = false;
+    ESP_LOGI(TAG, "I2C_SCAN_START sda=GPIO%d scl=GPIO%d expected_aht20=0x%02x expected_mpu6050=0x%02x",
+             I2C_PIN_SDA, I2C_PIN_SCL, AHT20_ADDR, MPU6050_ADDR);
+    for (uint8_t addr = 0x03; addr <= 0x77; ++addr) {
+        esp_err_t ret = i2c_master_probe(s_i2c_bus, addr, 50);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "I2C_FOUND addr=0x%02x", addr);
+            found_any = true;
+            found_aht20 = found_aht20 || (addr == AHT20_ADDR);
+            found_mpu6050 = found_mpu6050 || (addr == MPU6050_ADDR);
+        }
+    }
+
+    if (!found_any) {
+        ESP_LOGW(TAG, "I2C_NONE_FOUND check_3v3_gnd_sda_scl_pullups");
+    }
+    if (!found_aht20) {
+        ESP_LOGW(TAG, "I2C_EXPECTED_MISSING device=AHT20 addr=0x%02x", AHT20_ADDR);
+    }
+    if (!found_mpu6050) {
+        ESP_LOGW(TAG, "I2C_EXPECTED_MISSING device=MPU6050 addr=0x%02x", MPU6050_ADDR);
+    }
+    s_i2c_scan_done = true;
+    s_last_i2c_scan_ms = esp_timer_get_time() / 1000;
+}
+
+static esp_err_t aht20_init(void)
+{
+    if (s_aht20_dev == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint16_t raw_temp = 0;
-    uint16_t raw_hum = 0;
-    esp_err_t ret = sht20_read_raw(SHT20_CMD_TEMP_NO_HOLD, SHT20_TEMP_DELAY_MS, &raw_temp);
+    vTaskDelay(pdMS_TO_TICKS(AHT20_POWER_ON_DELAY_MS));
+
+    uint8_t status = 0;
+    esp_err_t ret = aht20_read_status(&status);
+    if (ret == ESP_OK && (status & AHT20_STATUS_CALIBRATED) != 0) {
+        ESP_LOGI(TAG, "AHT20 already calibrated status=0x%02x", status);
+        return ESP_OK;
+    }
+
+    uint8_t reset_cmd = AHT20_CMD_SOFT_RESET;
+    ret = i2c_master_transmit(s_aht20_dev, &reset_cmd, 1, 100);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(AHT20_RESET_DELAY_MS));
+
+    ret = aht20_send_init_command(AHT20_CMD_INIT);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    ret = sht20_read_raw(SHT20_CMD_HUM_NO_HOLD, SHT20_HUM_DELAY_MS, &raw_hum);
+    ret = aht20_read_status(&status);
+    if (ret == ESP_OK && (status & AHT20_STATUS_CALIBRATED) != 0) {
+        ESP_LOGI(TAG, "AHT20 calibrated status=0x%02x", status);
+        return ESP_OK;
+    }
+
+    ret = aht20_send_init_command(AHT20_CMD_INIT_LEGACY);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    raw_temp &= 0xFFFC;
-    raw_hum &= 0xFFFC;
-    *temperature_c = -46.85f + 175.72f * (float)raw_temp / 65536.0f;
-    *humidity_percent = -6.0f + 125.0f * (float)raw_hum / 65536.0f;
-    return ESP_OK;
-}
-
-static esp_err_t sht20_read_raw(uint8_t command, uint32_t delay_ms, uint16_t *raw)
-{
-    if (s_sht20_dev == NULL || raw == NULL) {
+    ret = aht20_read_status(&status);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if ((status & AHT20_STATUS_CALIBRATED) == 0) {
+        ESP_LOGW(TAG, "AHT20 not calibrated status=0x%02x", status);
         return ESP_ERR_INVALID_STATE;
     }
 
-    uint8_t data[3] = {0};
-    esp_err_t ret = i2c_master_transmit(s_sht20_dev, &command, 1, 100);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(delay_ms));
-
-    ret = i2c_master_receive(s_sht20_dev, data, sizeof(data), 100);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-
-    if (sht20_crc8(data, 2) != data[2]) {
-        return ESP_ERR_INVALID_CRC;
-    }
-
-    *raw = ((uint16_t)data[0] << 8) | data[1];
+    ESP_LOGI(TAG, "AHT20 calibrated with legacy init status=0x%02x", status);
     return ESP_OK;
 }
 
+static esp_err_t aht20_send_init_command(uint8_t command)
+{
+    uint8_t init_cmd[] = {command, 0x08, 0x00};
+    esp_err_t ret = i2c_master_transmit(s_aht20_dev, init_cmd, sizeof(init_cmd), 100);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    vTaskDelay(pdMS_TO_TICKS(AHT20_INIT_DELAY_MS));
+    return ESP_OK;
+}
+
+static esp_err_t aht20_read_status(uint8_t *status)
+{
+    if (s_aht20_dev == NULL || status == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t command = AHT20_CMD_STATUS;
+    uint8_t value = 0;
+    esp_err_t ret = i2c_master_transmit_receive(s_aht20_dev, &command, 1, &value, 1, 100);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    *status = value;
+    return ESP_OK;
+}
+
+static esp_err_t aht20_read(float *temperature_c, float *humidity_percent)
+{
+    if (s_aht20_dev == NULL || !s_aht20_initialized || temperature_c == NULL || humidity_percent == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint8_t trigger_cmd[] = {AHT20_CMD_TRIGGER, 0x33, 0x00};
+    esp_err_t ret = i2c_master_transmit(s_aht20_dev, trigger_cmd, sizeof(trigger_cmd), 100);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(AHT20_MEASURE_DELAY_MS));
+
+    uint8_t data[7] = {0};
+    ret = i2c_master_receive(s_aht20_dev, data, sizeof(data), 100);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if ((data[0] & AHT20_STATUS_BUSY) != 0 || (data[0] & AHT20_STATUS_CALIBRATED) == 0) {
+        ESP_LOGW(TAG, "AHT20 invalid status=0x%02x", data[0]);
+        s_aht20_initialized = false;
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint32_t raw_hum = ((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | ((uint32_t)data[3] >> 4);
+    uint32_t raw_temp = (((uint32_t)data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5];
+    if (raw_hum == 0 && raw_temp == 0) {
+        ESP_LOGW(TAG, "AHT20 returned zero sample status=0x%02x raw=%02x %02x %02x %02x %02x %02x %02x",
+                 data[0], data[0], data[1], data[2], data[3], data[4], data[5], data[6]);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    *humidity_percent = (float)raw_hum * 100.0f / 1048576.0f;
+    *temperature_c = (float)raw_temp * 200.0f / 1048576.0f - 50.0f;
+
+    if (!s_aht20_logged_first_read) {
+        s_aht20_logged_first_read = true;
+        ESP_LOGI(TAG, "AHT20 first read ok temp=%.1f hum=%.1f",
+                 (double)*temperature_c, (double)*humidity_percent);
+    }
+
+    return ESP_OK;
+}
 static esp_err_t mpu6050_read_accel(float *accel_g, float *accel_delta_g)
 {
     static bool has_last = false;
@@ -742,7 +910,7 @@ static esp_err_t mpu6050_read_accel(float *accel_g, float *accel_delta_g)
     }
 
     uint8_t reg = 0x3B;
-    uint8_t data[6] = {0};
+    uint8_t data[7] = {0};
     esp_err_t ret = i2c_master_transmit_receive(s_mpu6050_dev, &reg, 1, data, sizeof(data), 100);
     if (ret != ESP_OK) {
         return ret;
@@ -1042,16 +1210,4 @@ static uint8_t clamp_u8_int(int value)
         return 100;
     }
     return (uint8_t)value;
-}
-
-static uint8_t sht20_crc8(const uint8_t *data, size_t len)
-{
-    uint8_t crc = 0x00;
-    for (size_t i = 0; i < len; ++i) {
-        crc ^= data[i];
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x31) : (uint8_t)(crc << 1);
-        }
-    }
-    return crc;
 }
