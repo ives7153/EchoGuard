@@ -154,10 +154,10 @@ class MetricCard(CardFrame):
 
 
 # ---------------------------------------------------------------------------
-# CSI 趋势图
+# 融合扰动趋势图
 # ---------------------------------------------------------------------------
 class CsiTrendPlot(CardFrame):
-    """实时 WiFi CSI 振幅趋势图。"""
+    """实时融合扰动趋势图。"""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent=parent)
@@ -172,9 +172,9 @@ class CsiTrendPlot(CardFrame):
         header = QHBoxLayout()
         title_box = QVBoxLayout()
         title_box.setSpacing(2)
-        title = QLabel("WiFi CSI 振幅趋势 (Amplitude Trends)")
+        title = QLabel("融合扰动趋势 (Fusion Disturbance Trends)")
         title.setObjectName("SectionTitle")
-        subtitle = QLabel("Real-time subcarrier magnitude tracking · 5GHz Band")
+        subtitle = QLabel("Derived from node presence, motion and confidence scores")
         subtitle.setObjectName("SubtleText")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -210,7 +210,7 @@ class CsiTrendPlot(CardFrame):
         self.empty_label.setStyleSheet(f"color: {THEME['muted']}; font-size: 13px;")
 
         self.amplitude_curve = self.plot.plot(
-            [], [], pen=pg.mkPen(THEME["blue_bright"], width=2.4), name="载波 A-14"
+            [], [], pen=pg.mkPen(THEME["blue_bright"], width=2.4), name="融合扰动"
         )
         self.noise_curve = self.plot.plot(
             [],
@@ -221,12 +221,12 @@ class CsiTrendPlot(CardFrame):
 
         legend = QHBoxLayout()
         legend.setSpacing(16)
-        self.amplitude_legend = _legend_label("● 载波 A-14", THEME["blue_bright"])
+        self.amplitude_legend = _legend_label("● 融合扰动", THEME["blue_bright"])
         self.noise_legend = _legend_label("○ 基准噪声", THEME["plot_noise_legend"])
         legend.addWidget(self.amplitude_legend)
         legend.addWidget(self.noise_legend)
         legend.addStretch(1)
-        self.sample_rate_label = QLabel("采样率: 1000Hz")
+        self.sample_rate_label = QLabel("刷新: 1Hz")
         self.sample_rate_label.setObjectName("SubtleText")
         legend.addWidget(self.sample_rate_label)
 
@@ -333,8 +333,23 @@ class EventLogPanel(CardFrame):
         self.scroll.setWidget(self.content)
         layout.addWidget(self.scroll, 1)
         self._events: list[dict[str, Any]] = []
+        self._last_render_key: tuple[Any, ...] | None = None
 
     def set_events(self, events: list[dict[str, Any]]) -> None:
+        rows = list(reversed(events[-40:]))
+        render_key = tuple(
+            (
+                event.get("time"),
+                event.get("title"),
+                event.get("message"),
+                event.get("level"),
+                event.get("node_id"),
+            )
+            for event in rows
+        )
+        if render_key == self._last_render_key:
+            return
+        self._last_render_key = render_key
         self._events = list(events)
         clear_layout(self.content_layout)
 
@@ -345,7 +360,7 @@ class EventLogPanel(CardFrame):
             self.content_layout.addStretch(1)
             return
 
-        for event in list(reversed(events[-40:])):
+        for event in rows:
             self.content_layout.addWidget(self._build_row(event))
         self.content_layout.addStretch(1)
 
@@ -378,6 +393,7 @@ class EventLogPanel(CardFrame):
         return row
 
     def refresh_theme(self) -> None:
+        self._last_render_key = None
         self.set_events(self._events)
 
 

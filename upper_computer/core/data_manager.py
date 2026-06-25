@@ -513,16 +513,16 @@ class DataManager(QObject):
         self._append_event("SCREENSHOT SAVED", f"控制台截图已保存到 {path.name}", level="OK", kind="export")
 
     def save_csi_image(self, widget: QWidget) -> None:
-        """单独保存 CSI 曲线截图。"""
+        """单独保存扰动曲线截图。"""
 
         try:
             path = save_csi_screenshot(widget)
         except Exception as exc:  # noqa: BLE001
-            self.export_message_changed.emit(f"CSI 曲线截图失败：{exc}", False)
+            self.export_message_changed.emit(f"扰动曲线截图失败：{exc}", False)
             return
 
-        self.export_message_changed.emit(f"CSI 曲线截图已保存：{path.name}", True)
-        self._append_event("CSI SNAPSHOT", f"CSI 振幅曲线已保存到 {path.name}", level="OK", kind="export")
+        self.export_message_changed.emit(f"扰动曲线截图已保存：{path.name}", True)
+        self._append_event("DISTURBANCE SNAPSHOT", f"融合扰动曲线已保存到 {path.name}", level="OK", kind="export")
 
     @pyqtSlot(object)
     def save_analysis_image(self, widget: QWidget) -> None:

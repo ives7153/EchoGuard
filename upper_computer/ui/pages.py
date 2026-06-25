@@ -715,6 +715,8 @@ class DashboardPage(QWidget):
         self._latest_active_node = 0
         self._latest_active_state: dict[str, Any] = {}
         self._export_ok = True
+        self._known_focus_nodes: list[tuple[int, str]] = []
+        self._last_dashboard_heavy_refresh_at = 0.0
         self._display_verdict_summary: Any | None = None
         self._pending_verdict_summary: Any | None = None
         self._pending_verdict_since = 0.0
@@ -762,7 +764,7 @@ class DashboardPage(QWidget):
         csv_btn = QPushButton("CSV 导出")
         csv_btn.setObjectName("PrimaryButton")
         csv_btn.clicked.connect(self.export_csv_requested.emit)
-        csi_btn = QPushButton("CSI 曲线截图")
+        csi_btn = QPushButton("扰动曲线截图")
         csi_btn.setObjectName("GhostButton")
         csi_btn.clicked.connect(lambda: self.csi_shot_requested.emit(self.csi_plot))
         shot_btn = QPushButton("整窗截图")
@@ -964,17 +966,30 @@ class DashboardPage(QWidget):
         if not self.isVisible():
             return
 
-        self.csi_plot.set_history(history, active_node, active_state)
-        self._update_verdict(nodes, history, ai_state)
         self._update_metric_cards(active_state)
         self._update_group_cards(active_state)
 
         filtered_events = self._filter_events(events)
-        event_key = (len(events), self.event_filter.currentText())
+        last_event = events[-1] if events else {}
+        event_key = (
+            len(events),
+            self.event_filter.currentText(),
+            last_event.get("time"),
+            last_event.get("title"),
+            last_event.get("message"),
+            last_event.get("level"),
+        )
         if event_key != self._last_event_count:
             self._last_event_count = event_key
             self.event_panel.set_events(filtered_events)
 
+        now = time.time()
+        if now - self._last_dashboard_heavy_refresh_at < 0.75:
+            return
+        self._last_dashboard_heavy_refresh_at = now
+
+        self.csi_plot.set_history(history, active_node, active_state)
+        self._update_verdict(nodes, history, ai_state)
         self.topology_widget.set_nodes(nodes)
 
     def _toggle_pause(self) -> None:
@@ -992,25 +1007,34 @@ class DashboardPage(QWidget):
             for node_id, state in sorted(nodes.items())
             if state.get("last_received") is not None
         ]
-        self.node_combo.blockSignals(True)
-        self.node_combo.clear()
         if not discovered:
-            self.node_combo.addItem("等待节点接入", 0)
+            if self._known_focus_nodes:
+                self.node_combo.blockSignals(True)
+                self.node_combo.clear()
+                self.node_combo.addItem("等待节点接入", 0)
+                self.node_combo.blockSignals(False)
             self.node_combo.setEnabled(False)
             self.detail_btn.setEnabled(False)
-            refresh_widget_icons(self.detail_btn)
-            self.node_combo.blockSignals(False)
+            self._known_focus_nodes = []
             return 0
 
         discovered_ids = [node_id for node_id, _label in discovered]
         selected = active_node if active_node in discovered_ids else discovered_ids[0]
-        for node_id, label in discovered:
-            self.node_combo.addItem(label, node_id)
+        if discovered != self._known_focus_nodes:
+            self.node_combo.blockSignals(True)
+            self.node_combo.clear()
+            for node_id, label in discovered:
+                self.node_combo.addItem(label, node_id)
+            self._known_focus_nodes = discovered
+            self.node_combo.blockSignals(False)
         self.node_combo.setEnabled(True)
         self.detail_btn.setEnabled(True)
         refresh_widget_icons(self.detail_btn)
-        self.node_combo.setCurrentIndex(discovered_ids.index(selected))
-        self.node_combo.blockSignals(False)
+        target_index = discovered_ids.index(selected)
+        if self.node_combo.currentIndex() != target_index:
+            self.node_combo.blockSignals(True)
+            self.node_combo.setCurrentIndex(target_index)
+            self.node_combo.blockSignals(False)
         return selected
 
     def _filter_events(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:

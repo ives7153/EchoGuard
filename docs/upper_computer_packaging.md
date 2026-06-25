@@ -73,5 +73,5 @@ dist/
 - Gateway 串口可刷新、连接、显示最新帧。
 - 节点收到数据后自动出现在仪表盘、节点管理、分析、历史和诊断页。
 - 环境状态中显示 `CO2 估算 ppm`，传感器页可执行 `MQ-135 清洁空气校准`。
-- CSV 导出、CSI 曲线截图、整窗截图可写入 `upper_computer/exports/`。
+- CSV 导出、融合扰动曲线截图、整窗截图可写入 `upper_computer/exports/`。
 - 无本地 Jina 或 API 时，AI 区域保持规则回退，不影响主界面运行。

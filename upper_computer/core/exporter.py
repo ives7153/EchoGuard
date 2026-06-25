@@ -1,9 +1,9 @@
-"""CSV 导出、整窗截图与 CSI 曲线截图工具。
+"""CSV 导出、整窗截图与扰动曲线截图工具。
 
 中文注释：本模块满足三项硬性需求：
 1. CSV 导出（``utf-8-sig`` 让 Excel 直接打开中文表头）。
 2. 整窗 / 任意控件截图（Qt ``grab()``，不依赖系统截图权限）。
-3. CSI 曲线单独截图（pyqtgraph ``PlotWidget`` 也是 QWidget，可直接 grab）。
+3. 扰动曲线单独截图（pyqtgraph ``PlotWidget`` 也是 QWidget，可直接 grab）。
 """
 
 from __future__ import annotations
@@ -68,9 +68,9 @@ def save_widget_screenshot(widget: QWidget, file_path: Path | None = None) -> Pa
 
 
 def save_csi_screenshot(widget: QWidget, file_path: Path | None = None) -> Path:
-    """单独保存 CSI 曲线区域截图为 PNG。
+    """单独保存扰动曲线区域截图为 PNG。
 
-    中文注释：传入 CSI 趋势卡片或其内部 PlotWidget 均可。文件名带 ``csi_`` 前缀，
+    中文注释：传入扰动趋势卡片或其内部 PlotWidget 均可。文件名沿用 ``csi_`` 前缀，
     便于和整窗截图区分。
     """
 
@@ -79,7 +79,7 @@ def save_csi_screenshot(widget: QWidget, file_path: Path | None = None) -> Path:
 
     pixmap = widget.grab()
     if not pixmap.save(str(target), "PNG"):
-        raise RuntimeError(f"CSI 曲线截图保存失败：{target}")
+        raise RuntimeError(f"扰动曲线截图保存失败：{target}")
     return target
 
 

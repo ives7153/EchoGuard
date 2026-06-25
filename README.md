@@ -27,7 +27,7 @@ EchoGuard 由三部分组成：
 - 多节点综合研判：最近 5 秒窗口内融合 presence、motion、confidence 和 RSSI。
 - 现场安全提示：LoRa 天线、电源共地、MQ-135 分压、I2C 上拉等硬件注意事项文档化。
 - MQ-135 CO2 估算 ppm：上位机将节点上报的 ADC 原始值按分压、电阻和 R0 标定参数换算为估算 ppm，支持清洁空气一键校准。
-- 数据导出能力：支持 CSV 导出、CSI 曲线截图和整窗截图。
+- 数据导出能力：支持 CSV 导出、融合扰动曲线截图和整窗截图。
 - AI 辅助研判：本地 Jina GGUF embedding 与可选大模型 API，仅用于解释和辅助，不接管实时判断。
 - Windows 打包：提供 PyInstaller spec 与一键打包脚本，生成 `dist/EchoGuard/EchoGuard.exe`。
 
