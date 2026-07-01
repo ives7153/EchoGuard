@@ -39,6 +39,7 @@ try:
         THEME,
         TOPOLOGY_NODE_POSITIONS,
     )
+    from ..rules.detection_fusion import life_motion_triggered
 except ImportError:
     if __package__ and __package__.startswith("upper_computer"):
         raise
@@ -51,6 +52,7 @@ except ImportError:
         THEME,
         TOPOLOGY_NODE_POSITIONS,
     )
+    from rules.detection_fusion import life_motion_triggered  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +146,8 @@ class MetricCard(CardFrame):
         layout.addWidget(self.hint_label)
 
     def set_value(self, value: str, hint: str = "", accent: str | None = None) -> None:
+        if self.value_label.text() == value and self.hint_label.text() == hint and self._accent == accent:
+            return
         self._accent = accent
         self.value_label.setText(value)
         self.hint_label.setText(hint)
@@ -556,10 +560,8 @@ class TopologyWidget(QWidget):
         return _rssi_color(_float(state.get("rssi")), True)
 
     def _is_active_node(self, state: dict[str, Any]) -> bool:
-        presence = _score(state.get("presence_score"))
-        confidence = _score(state.get("confidence"))
         motion = _score(state.get("motion_score"))
-        return (presence >= 0.5 and confidence >= 0.62) or motion >= 0.65
+        return life_motion_triggered(state) or motion >= 0.65
 
 
 # ---------------------------------------------------------------------------

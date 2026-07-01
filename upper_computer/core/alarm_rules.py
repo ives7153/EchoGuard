@@ -19,6 +19,7 @@ try:
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
     )
+    from ..rules.detection_fusion import life_motion_triggered
 except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
     if __package__ and __package__.startswith("upper_computer"):
         raise
@@ -29,6 +30,7 @@ except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
         OFFLINE_SECONDS,
         PRESENCE_THRESHOLD,
     )
+    from rules.detection_fusion import life_motion_triggered  # type: ignore
 
 
 _TITLE_BY_KIND = {
@@ -100,14 +102,15 @@ class AlarmEngine:
         # ----- 单样本规则：生命微动 / CO2 估算 ppm 异常 -----
         if sample and sample.get("valid", True):
             node_id = int(sample.get("node_id") or 0)
-            presence = _score(sample, "presence_score", "presence")
-            confidence = _score(sample, "confidence", "conf")
             gas = _number(sample.get("gas_ppm", sample.get("gas")))
 
             if (
                 node_id > 0
-                and presence > self.presence_threshold
-                and confidence > self.confidence_threshold
+                and life_motion_triggered(
+                    sample,
+                    presence_threshold=self.presence_threshold,
+                    confidence_threshold=self.confidence_threshold,
+                )
             ):
                 self._append(events, now, node_id, "life_motion", "疑似生命微动", level="ALARM")
             if node_id > 0 and gas > self.gas_alarm_ppm:
@@ -149,13 +152,6 @@ class AlarmEngine:
                 "title": _TITLE_BY_KIND.get(kind, "SYSTEM ALARM"),
             }
         )
-
-
-def _score(sample: dict[str, Any], primary: str, alias: str) -> float:
-    value = _number(sample.get(primary, sample.get(alias, 0.0)))
-    if value > 1.0:
-        value /= 100.0
-    return max(0.0, min(value, 1.0))
 
 
 def _number(value: Any, default: float = 0.0) -> float:

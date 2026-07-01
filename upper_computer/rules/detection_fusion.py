@@ -10,6 +10,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+try:
+    from ..config import CONFIDENCE_THRESHOLD, CSI_QUALITY_THRESHOLD, PRESENCE_THRESHOLD
+except ImportError:
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
+    from config import CONFIDENCE_THRESHOLD, CSI_QUALITY_THRESHOLD, PRESENCE_THRESHOLD  # type: ignore
+
 
 @dataclass(slots=True)
 class NodeWindowStats:
@@ -50,6 +57,9 @@ def build_detection_summary(
     history: list[dict[str, Any]],
     window_seconds: float = 5.0,
     reference_ts: float | None = None,
+    presence_threshold: float = PRESENCE_THRESHOLD,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    csi_quality_threshold: float = CSI_QUALITY_THRESHOLD,
 ) -> DetectionSummary:
     """基于最近窗口样本生成多节点规则研判和 AI 输入摘要。"""
 
@@ -106,9 +116,13 @@ def build_detection_summary(
     triggered: list[int] = []
     for node_id, latest in latest_by_node.items():
         node_state = nodes.get(node_id, {})
-        presence = _score(latest.get("presence_score", node_state.get("presence_score")))
-        confidence = _score(latest.get("confidence", node_state.get("confidence")))
-        if presence >= 0.5 and confidence >= 0.62:
+        if life_motion_triggered(
+            latest,
+            node_state,
+            presence_threshold=presence_threshold,
+            confidence_threshold=confidence_threshold,
+            csi_quality_threshold=csi_quality_threshold,
+        ):
             triggered.append(node_id)
 
     triggered = sorted(triggered)
@@ -170,6 +184,29 @@ def verdict_color_key(status: str) -> str:
     if status == "未检测到稳定微动":
         return "blue_soft"
     return "muted"
+
+
+def life_motion_triggered(
+    sample: dict[str, Any] | None,
+    node_state: dict[str, Any] | None = None,
+    *,
+    presence_threshold: float = PRESENCE_THRESHOLD,
+    confidence_threshold: float = CONFIDENCE_THRESHOLD,
+    csi_quality_threshold: float = CSI_QUALITY_THRESHOLD,
+) -> bool:
+    """统一判断生命微动触发，兼容旧协议缺失 CSI 质量字段的样本。"""
+
+    if not sample:
+        return False
+    node_state = node_state or {}
+    presence = _score(sample.get("presence_score", sample.get("presence", node_state.get("presence_score"))))
+    confidence = _score(sample.get("confidence", sample.get("conf", node_state.get("confidence"))))
+    if presence < presence_threshold or confidence < confidence_threshold:
+        return False
+    csi_quality = _optional_score(sample.get("csi_quality", node_state.get("csi_quality")))
+    if csi_quality is not None and csi_quality < csi_quality_threshold:
+        return False
+    return True
 
 
 def _empty_summary(
@@ -235,6 +272,12 @@ def _score(value: Any) -> float:
     if score > 1.0:
         score /= 100.0
     return max(0.0, min(score, 1.0))
+
+
+def _optional_score(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _score(value)
 
 
 def _float(value: Any, default: float = 0.0) -> float:

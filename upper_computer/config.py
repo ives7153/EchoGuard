@@ -31,7 +31,7 @@ BAUDRATE = 115200
 NODE_IDS = (1, 2, 3, 4)
 GATEWAY_ID = "GW_01"
 
-UI_REFRESH_MS = 120
+UI_REFRESH_MS = 200
 AUTO_PORT_REFRESH_MS = 3000
 OFFLINE_SECONDS = 8.0
 MAX_HISTORY_ROWS = 6000
@@ -292,6 +292,7 @@ GAS_ALARM_PPM = 2000.0          # 触发系统警告的 CO2 估算 ppm 上限
 GAS_THRESHOLD_RAW = GAS_THRESHOLD_PPM  # 兼容旧导入名；当前语义已迁移为 ppm
 GAS_ALARM_RAW = GAS_ALARM_PPM          # 兼容旧导入名；规则比较 ppm
 CONFIDENCE_THRESHOLD = 0.75     # 生命微动报警的置信度门限
+CSI_QUALITY_THRESHOLD = 0.45    # 可选 CSI 质量字段低于该值时只做观察，不触发稳定微动
 ALARM_DEDUP_SECONDS = 5.0       # 同类报警去重窗口
 
 DEFAULT_AFH_ENABLED = True      # 自动频率跳变
@@ -311,6 +312,10 @@ CSV_FIELDS = [
     "motion_score",
     "breath_bpm",
     "confidence",
+    "csi_quality",
+    "csi_sample_count",
+    "breath_lock",
+    "noise_floor",
     "gas",
     "gas_raw",
     "gas_ppm",

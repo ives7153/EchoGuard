@@ -77,6 +77,10 @@
 /* CSI 滑动窗口：callback 只写入轻量幅度统计，复杂特征在 csi_sensor_task 每秒计算。 */
 #define CSI_WINDOW_SIZE                 64
 #define CSI_MIN_VALID_SAMPLES           6
+#define CSI_MIN_MEAN_AMP                1.0f
+#define CSI_BASELINE_ALPHA_CALM         0.08f
+#define CSI_BASELINE_ALPHA_ACTIVE       0.015f
+#define CSI_BASELINE_ACTIVE_MARGIN      1.4f
 
 /* WiFi 事件位：任务间只传递状态，不额外创建 WiFi 管理任务。 */
 #define WIFI_STARTED_BIT                BIT0
@@ -171,6 +175,8 @@ static uint16_t s_csi_head;
 static uint16_t s_csi_count;
 static uint32_t s_csi_total_packets;
 static int8_t s_csi_last_rssi;
+static float s_csi_noise_floor;
+static bool s_csi_noise_ready;
 
 static node_fusion_sample_t s_latest_sample = {
     .presence_score = 0,
@@ -460,7 +466,7 @@ static void csi_sensor_task(void *arg)
         }
         ESP_LOGI(TAG,
                  "诊断: wifi=%d wifi_rssi=%d csi_total=%" PRIu32 " csi_delta=%" PRIu32
-                 " csi_rssi=%d mean=%.2f range=%.2f abs_dev=%.2f aht20=%d mpu6050=%d mq135=%d",
+                 " csi_rssi=%d mean=%.2f range=%.2f abs_dev=%.2f noise=%.2f aht20=%d mpu6050=%d mq135=%d",
                  wifi_connected ? 1 : 0,
                  wifi_rssi,
                  csi_features.total_packets,
@@ -469,6 +475,7 @@ static void csi_sensor_task(void *arg)
                  (double)csi_features.mean_amp,
                  (double)csi_features.range,
                  (double)csi_features.abs_dev,
+                 (double)s_csi_noise_floor,
                  sample.aht20_ok ? 1 : 0,
                  sample.mpu6050_ok ? 1 : 0,
                  sample.mq135_ok ? 1 : 0);
@@ -596,32 +603,62 @@ static void csi_features_to_scores(const csi_window_features_t *features,
 
     if (features->sample_count < CSI_MIN_VALID_SAMPLES) {
         sample->presence_score = 0;
-        sample->motion_score = clamp_u8_int((int)lroundf(accel_delta_g * 120.0f));
+        sample->motion_score = clamp_u8_int((int)lroundf(accel_delta_g * 95.0f));
         sample->breath_bpm = 0;
         sample->confidence = 10;
         return;
     }
 
-    int csi_presence = (int)lroundf(features->abs_dev * 2.0f + features->range * 0.4f);
-    int csi_motion = (int)lroundf(features->range * 1.8f + features->abs_dev * 1.2f);
-    int imu_motion = (int)lroundf(accel_delta_g * 140.0f);
+    float mean_amp = fmaxf(features->mean_amp, CSI_MIN_MEAN_AMP);
+    float norm_abs_dev = (features->abs_dev / mean_amp) * 100.0f;
+    float norm_range = (features->range / mean_amp) * 100.0f;
+    float disturbance = norm_abs_dev * 0.7f + norm_range * 0.3f;
+    bool baseline_ready_before_update = s_csi_noise_ready;
+
+    if (!s_csi_noise_ready) {
+        s_csi_noise_floor = disturbance;
+        s_csi_noise_ready = true;
+    } else {
+        float active_limit = s_csi_noise_floor * CSI_BASELINE_ACTIVE_MARGIN + 1.0f;
+        float alpha = disturbance <= active_limit ? CSI_BASELINE_ALPHA_CALM : CSI_BASELINE_ALPHA_ACTIVE;
+        s_csi_noise_floor = s_csi_noise_floor * (1.0f - alpha) + disturbance * alpha;
+    }
+
+    float excess = fmaxf(0.0f, disturbance - s_csi_noise_floor);
+    float range_over_noise = fmaxf(0.0f, norm_range - s_csi_noise_floor * 1.2f);
+    int csi_presence = (int)lroundf(excess * 14.0f + norm_abs_dev * 3.0f + norm_range * 0.8f);
+    int csi_motion = (int)lroundf(excess * 7.0f + range_over_noise * 1.8f + norm_abs_dev * 1.0f);
+    int imu_motion = (int)lroundf(accel_delta_g * 95.0f);
+    int fused_motion = (int)lroundf(csi_motion * 0.75f + imu_motion * 0.25f);
 
     sample->presence_score = clamp_u8_int(csi_presence);
-    sample->motion_score = clamp_u8_int(csi_motion > imu_motion ? csi_motion : imu_motion);
+    if ((!baseline_ready_before_update || excess < 0.4f) && imu_motion <= 35) {
+        fused_motion = fused_motion > 35 ? 35 : fused_motion;
+    }
+    sample->motion_score = clamp_u8_int(fused_motion);
 
     /*
      * 呼吸率 v1：用 CSI 幅度扰动强弱给出粗略稳定范围。
      * 后续迭代可在这里替换为带通滤波 + FFT/峰值间隔估计，不影响 LoRa 包格式。
      */
-    if (sample->presence_score < 12 || sample->motion_score > 75) {
+    bool breath_candidate = sample->presence_score >= 18 && sample->motion_score <= 70 && excess > 0.2f;
+    if (!breath_candidate) {
         sample->breath_bpm = 0;
     } else {
-        int bpm = 12 + (int)lroundf(features->abs_dev * 0.35f);
+        int bpm = 12 + (int)lroundf(fminf(16.0f, excess * 1.8f + norm_abs_dev * 0.7f));
         sample->breath_bpm = clamp_u8_int(bpm > 28 ? 28 : bpm);
     }
 
-    int confidence = 20 + (features->sample_count > 40 ? 30 : features->sample_count);
-    confidence += (features->last_rssi > -75) ? 10 : 0;
+    float sample_quality = fminf(1.0f, (float)features->sample_count / (float)CSI_WINDOW_SIZE);
+    float rssi_quality = fmaxf(0.0f, fminf(1.0f, ((float)features->last_rssi + 95.0f) / 35.0f));
+    float stability_quality = 1.0f - fminf(1.0f, s_csi_noise_floor / 18.0f);
+    int confidence = (int)lroundf(sample_quality * 45.0f + rssi_quality * 20.0f + stability_quality * 15.0f);
+    if (sample->presence_score >= 18 && sample->motion_score <= 70) {
+        confidence += 10;
+    }
+    if (sample->motion_score > 85) {
+        confidence -= 12;
+    }
     sample->confidence = clamp_u8_int(confidence);
 }
 

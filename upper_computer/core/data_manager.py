@@ -24,6 +24,7 @@ try:
         AUTO_PORT_REFRESH_MS,
         BAUDRATE,
         CONTROL_ID,
+        CSI_QUALITY_THRESHOLD,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
         GAS_THRESHOLD_PPM,
@@ -61,7 +62,7 @@ try:
         test_llm_result,
         wait_for_embedding_ready,
     )
-    from ..rules.detection_fusion import ai_fallback_text, build_detection_summary
+    from ..rules.detection_fusion import ai_fallback_text, build_detection_summary, life_motion_triggered
     from ..serial_handler import SerialReader
     from .alarm_rules import AlarmEngine
     from ..gas_calibration import (
@@ -82,6 +83,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         AUTO_PORT_REFRESH_MS,
         BAUDRATE,
         CONTROL_ID,
+        CSI_QUALITY_THRESHOLD,
         DEFAULT_AFH_ENABLED,
         DEFAULT_MESH_ENABLED,
         GAS_THRESHOLD_PPM,
@@ -119,7 +121,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         test_llm_result,
         wait_for_embedding_ready,
     )
-    from rules.detection_fusion import ai_fallback_text, build_detection_summary  # type: ignore
+    from rules.detection_fusion import ai_fallback_text, build_detection_summary, life_motion_triggered  # type: ignore
     from serial_handler import SerialReader
     from core.alarm_rules import AlarmEngine
     from gas_calibration import (
@@ -157,6 +159,10 @@ class NodeState:
     motion_score: float = 0.0
     breath_bpm: float = 0.0
     confidence: float = 0.0
+    csi_quality: float | None = None
+    csi_sample_count: int | None = None
+    breath_lock: bool | None = None
+    noise_floor: float | None = None
     gas: float = 0.0
     gas_raw: float = 0.0
     gas_ppm: float = 0.0
@@ -373,6 +379,7 @@ class DataManager(QObject):
         self.afh_enabled = DEFAULT_AFH_ENABLED
         self.mesh_enabled = DEFAULT_MESH_ENABLED
         self.gas_calibration_r0 = self._load_gas_calibration_r0()
+        self.gas_node_calibration_r0 = self._load_gas_node_calibration_r0()
         self.last_sync_at: float | None = None
 
         # 节点由 Gateway 串口帧自动发现；无真实数据时保持空状态。
@@ -965,25 +972,47 @@ class DataManager(QObject):
 
     @pyqtSlot()
     def calibrate_mq135_clean_air(self) -> None:
-        """用当前最新 MQ-135 原始值按 400 ppm 清洁空气估算 R0。"""
+        """用当前关注节点最新 MQ-135 原始值按 400 ppm 清洁空气估算该节点 R0。"""
 
         latest = self._latest_gas_raw_for_calibration()
         if latest is None:
-            self.status_changed.emit("MQ-135 校准失败：暂无真实气体原始值", False)
-            self._append_event("MQ-135 CALIBRATION FAILED", "暂无真实气体原始值，无法校准 R0", level="WARN", kind="config")
+            self.status_changed.emit("MQ-135 当前节点校准失败：暂无当前节点气体原始值", False)
+            self._append_event("MQ-135 CALIBRATION FAILED", "暂无当前节点气体原始值，无法校准 R0", level="WARN", kind="config")
             return
 
         node_id, gas_raw = latest
-        self.gas_calibration_r0 = calibrate_r0_from_clean_air_raw(gas_raw, MQ135_CLEAN_AIR_PPM)
-        save_ui_settings({"mq135_r0_kohm": self.gas_calibration_r0})
+        self.gas_node_calibration_r0[node_id] = calibrate_r0_from_clean_air_raw(gas_raw, MQ135_CLEAN_AIR_PPM)
+        self._save_gas_node_calibration()
         self._recalculate_gas_history()
         message = (
-            f"MQ-135 清洁空气校准完成：{self._node_label(node_id)} raw={gas_raw:.0f}，"
-            f"R0={self.gas_calibration_r0:.2f} kΩ"
+            f"MQ-135 当前节点校准完成：{self._node_label(node_id)} raw={gas_raw:.0f}，"
+            f"R0={self.gas_node_calibration_r0[node_id]:.2f} kΩ"
         )
         self.status_changed.emit(message, True)
         self._append_event("MQ-135 CALIBRATED", message, node_id=node_id, level="OK", kind="config")
         self._dirty = True
+
+    @pyqtSlot()
+    def calibrate_all_mq135_clean_air(self) -> None:
+        """对所有在线且已有原始值的节点分别按 400 ppm 清洁空气估算 R0。"""
+
+        latest_by_node = self._latest_gas_raw_by_node_for_calibration(online_only=True)
+        if not latest_by_node:
+            self.status_changed.emit("MQ-135 全部校准失败：暂无在线节点气体原始值", False)
+            self._append_event("MQ-135 CALIBRATION FAILED", "暂无在线节点气体原始值，无法校准 R0", level="WARN", kind="config")
+            return
+
+        for node_id, gas_raw in latest_by_node.items():
+            self.gas_node_calibration_r0[node_id] = calibrate_r0_from_clean_air_raw(gas_raw, MQ135_CLEAN_AIR_PPM)
+        self._save_gas_node_calibration()
+        self._recalculate_gas_history()
+
+        labels = [f"{self._node_label(node_id)} raw={gas_raw:.0f}" for node_id, gas_raw in sorted(latest_by_node.items())]
+        message = f"MQ-135 全部在线节点校准完成：{len(latest_by_node)} 个节点（" + "；".join(labels) + "）"
+        self.status_changed.emit(message, True)
+        self._append_event("MQ-135 CALIBRATED", message, level="OK", kind="config")
+        self._dirty = True
+
     @pyqtSlot(bool)
     def set_afh_enabled(self, enabled: bool) -> None:
         self.afh_enabled = bool(enabled)
@@ -1326,10 +1355,44 @@ class DataManager(QObject):
         value = _float(settings.get("mq135_r0_kohm"), DEFAULT_MQ135_R0_KOHM)
         return value if value > 0.0 else DEFAULT_MQ135_R0_KOHM
 
+    def _load_gas_node_calibration_r0(self) -> dict[int, float]:
+        settings = load_ui_settings()
+        payload = settings.get("mq135_node_r0_kohm")
+        if not isinstance(payload, dict):
+            return {}
+        result: dict[int, float] = {}
+        for key, value in payload.items():
+            try:
+                node_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            r0 = _float(value)
+            if node_id > 0 and r0 > 0.0:
+                result[node_id] = r0
+        return result
+
+    def _save_gas_node_calibration(self) -> None:
+        save_ui_settings(
+            {
+                "mq135_node_r0_kohm": {
+                    str(node_id): r0
+                    for node_id, r0 in sorted(self.gas_node_calibration_r0.items())
+                    if node_id > 0 and r0 > 0.0
+                }
+            }
+        )
+
+    def _gas_r0_for_node(self, node_id: int) -> float:
+        node_r0 = self.gas_node_calibration_r0.get(int(node_id))
+        if node_r0 is not None and node_r0 > 0.0:
+            return node_r0
+        return self.gas_calibration_r0 if self.gas_calibration_r0 > 0.0 else DEFAULT_MQ135_R0_KOHM
+
     def _apply_gas_calibration(self, sample: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(sample)
+        node_id = int(enriched.get("node_id") or enriched.get("id") or 0)
         gas_raw = _float(enriched.get("gas_raw", enriched.get("gas")))
-        gas_ppm = calculate_gas_ppm(gas_raw, self.gas_calibration_r0)
+        gas_ppm = calculate_gas_ppm(gas_raw, self._gas_r0_for_node(node_id))
         enriched["gas_raw"] = gas_raw
         enriched["gas_ppm"] = gas_ppm
         enriched["gas"] = gas_ppm
@@ -1337,29 +1400,49 @@ class DataManager(QObject):
 
     def _latest_gas_raw_for_calibration(self) -> tuple[int, float] | None:
         preferred_node = int(self._active_node or 0)
+        if preferred_node <= 0:
+            return None
         for sample in reversed(self.history):
             node_id = int(sample.get("node_id") or 0)
-            if preferred_node and node_id != preferred_node:
+            if node_id != preferred_node:
                 continue
-            gas_raw = _float(sample.get("gas_raw"))
-            if gas_raw > 0.0:
-                return node_id, gas_raw
-        for sample in reversed(self.history):
-            node_id = int(sample.get("node_id") or 0)
             gas_raw = _float(sample.get("gas_raw"))
             if gas_raw > 0.0:
                 return node_id, gas_raw
         return None
 
+    def _latest_gas_raw_by_node_for_calibration(self, online_only: bool = False) -> dict[int, float]:
+        target_ids = {
+            node_id
+            for node_id, node in self.nodes.items()
+            if node_id > 0 and (not online_only or node.online)
+        }
+        if online_only and not target_ids:
+            return {}
+        result: dict[int, float] = {}
+        for sample in reversed(self.history):
+            node_id = int(sample.get("node_id") or 0)
+            if node_id <= 0 or node_id in result:
+                continue
+            if target_ids and node_id not in target_ids:
+                continue
+            gas_raw = _float(sample.get("gas_raw"))
+            if gas_raw > 0.0:
+                result[node_id] = gas_raw
+            if target_ids and len(result) >= len(target_ids):
+                break
+        return result
+
     def _recalculate_gas_history(self) -> None:
         for sample in self.history:
+            node_id = int(sample.get("node_id") or 0)
             gas_raw = _float(sample.get("gas_raw", sample.get("gas")))
-            gas_ppm = calculate_gas_ppm(gas_raw, self.gas_calibration_r0)
+            gas_ppm = calculate_gas_ppm(gas_raw, self._gas_r0_for_node(node_id))
             sample["gas_raw"] = gas_raw
             sample["gas_ppm"] = gas_ppm
             sample["gas"] = gas_ppm
-        for node in self.nodes.values():
-            node.gas_ppm = calculate_gas_ppm(node.gas_raw, self.gas_calibration_r0)
+        for node_id, node in self.nodes.items():
+            node.gas_ppm = calculate_gas_ppm(node.gas_raw, self._gas_r0_for_node(node_id))
             node.gas = node.gas_ppm
 
     # ------------------------------------------------------------------ 样本应用
@@ -1395,6 +1478,10 @@ class DataManager(QObject):
         node.motion_score = _score(sample.get("motion_score", sample.get("motion")))
         node.breath_bpm = _float(sample.get("breath_bpm", sample.get("bpm")))
         node.confidence = _score(sample.get("confidence", sample.get("conf")))
+        node.csi_quality = _optional_score(sample.get("csi_quality"))
+        node.csi_sample_count = _optional_int(sample.get("csi_sample_count"))
+        node.breath_lock = _optional_bool(sample.get("breath_lock"))
+        node.noise_floor = _optional_float(sample.get("noise_floor"))
         node.gas_raw = _float(sample.get("gas_raw", sample.get("gas")))
         node.gas_ppm = _float(sample.get("gas_ppm", sample.get("gas")))
         node.gas = node.gas_ppm
@@ -1414,6 +1501,10 @@ class DataManager(QObject):
                 "snr": node.snr,
                 "packet_loss": node.packet_loss,
                 "battery": node.battery,
+                "csi_quality": node.csi_quality,
+                "csi_sample_count": node.csi_sample_count,
+                "breath_lock": node.breath_lock,
+                "noise_floor": node.noise_floor,
                 "gas": node.gas_ppm,
                 "gas_raw": node.gas_raw,
                 "gas_ppm": node.gas_ppm,
@@ -1458,7 +1549,11 @@ class DataManager(QObject):
         """根据状态变化生成右侧实时事件流。"""
 
         node_id = node.node_id
-        has_presence = node.presence_score >= max(0.5, self.presence_threshold) and node.confidence >= 0.62
+        has_presence = life_motion_triggered(
+            node.to_dict(),
+            presence_threshold=self.presence_threshold,
+            confidence_threshold=self.alarm_engine.confidence_threshold,
+        )
 
         if has_presence and not self._presence_flags[node_id]:
             self._append_event(
@@ -1583,7 +1678,12 @@ class DataManager(QObject):
     def _maybe_schedule_ai_analysis(self) -> None:
         """低频异步生成 AI 辅助解释；实时主判断仍由规则融合负责。"""
 
-        summary = build_detection_summary(self._node_dicts(), self._recent_history(5.0, 1200))
+        summary = build_detection_summary(
+            self._node_dicts(),
+            self._recent_history(5.0, 1200),
+            presence_threshold=self.presence_threshold,
+            confidence_threshold=self.alarm_engine.confidence_threshold,
+        )
         self._refresh_ai_fallback(summary)
         if not self.ai_settings.enabled or not self.ai_settings.embedding_enabled:
             return
@@ -1629,7 +1729,12 @@ class DataManager(QObject):
         if request_id != self._ai_request_id or not isinstance(result, dict):
             return
 
-        current_summary = build_detection_summary(self._node_dicts(), self._recent_history(5.0, 1200))
+        current_summary = build_detection_summary(
+            self._node_dicts(),
+            self._recent_history(5.0, 1200),
+            presence_threshold=self.presence_threshold,
+            confidence_threshold=self.alarm_engine.confidence_threshold,
+        )
         if str(result.get("state_key", "")) != current_summary.state_key:
             self.ai_state.update(
                 {
@@ -1727,7 +1832,12 @@ class DataManager(QObject):
         self._dirty = False
         nodes = self._node_dicts()
         recent_history = self._recent_history(60.0, 1200)
-        summary = build_detection_summary(nodes, recent_history)
+        summary = build_detection_summary(
+            nodes,
+            recent_history,
+            presence_threshold=self.presence_threshold,
+            confidence_threshold=self.alarm_engine.confidence_threshold,
+        )
         self._refresh_ai_fallback(summary)
         self.ai_state["running"] = self._ai_busy
         self.ai_state["jina_running"] = self.ai_runtime.is_running()
@@ -1739,6 +1849,8 @@ class DataManager(QObject):
                 "history": self.history,
                 "recent_history": recent_history,
                 "events": [event.to_dict() for event in self.events],
+                "detection_summary": summary,
+                "history_total": len(self.history),
                 "ai": dict(self.ai_state),
                 "serial_stats": dict(self._serial_stats),
                 "active_node": self._active_node,
@@ -1747,9 +1859,18 @@ class DataManager(QObject):
                 "diagnostics_report": self._diagnostics_report,
                 "config": {
                     "presence_threshold": self.presence_threshold,
+                    "confidence_threshold": self.alarm_engine.confidence_threshold,
+                    "csi_quality_threshold": CSI_QUALITY_THRESHOLD,
                     "gas_threshold": self.gas_threshold,
                     "gas_threshold_ppm": self.gas_threshold,
                     "gas_calibration_r0": self.gas_calibration_r0,
+                    "gas_node_calibration_count": len(self.gas_node_calibration_r0),
+                    "gas_calibrated_online": sum(
+                        1
+                        for node_id, node in self.nodes.items()
+                        if node.online and node_id in self.gas_node_calibration_r0
+                    ),
+                    "gas_online_nodes": sum(1 for node in self.nodes.values() if node.online),
                     "gas_clean_air_ppm": MQ135_CLEAN_AIR_PPM,
                     "afh_enabled": self.afh_enabled,
                     "mesh_enabled": self.mesh_enabled,
@@ -1827,6 +1948,36 @@ def _optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _optional_score(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _score(value)
 
 
 def _score(value: Any) -> float:

@@ -69,7 +69,7 @@ try:
         TopologyWidget,
     )
     from .icons import refresh_widget_icons
-    from ..rules.detection_fusion import ai_fallback_text, build_detection_summary, verdict_color_key
+    from ..rules.detection_fusion import ai_fallback_text, build_detection_summary, life_motion_triggered, verdict_color_key
 except ImportError:
     if __package__ and __package__.startswith("upper_computer"):
         raise
@@ -98,7 +98,7 @@ except ImportError:
         TopologyWidget,
     )
     from ui.icons import refresh_widget_icons
-    from rules.detection_fusion import ai_fallback_text, build_detection_summary, verdict_color_key  # type: ignore
+    from rules.detection_fusion import ai_fallback_text, build_detection_summary, life_motion_triggered, verdict_color_key  # type: ignore
 
 
 # 矩阵表列宽（首列拉伸，其余固定，保证表头与每行对齐）
@@ -722,6 +722,8 @@ class DashboardPage(QWidget):
         self._pending_verdict_since = 0.0
         self._display_verdict_since = 0.0
         self._verdict_chips: dict[str, QLabel] = {}
+        self._last_pause_text = ""
+        self._last_group_values: dict[str, tuple[str, str]] = {}
 
         body = QHBoxLayout(self)
         body.setContentsMargins(0, 0, 0, 0)
@@ -949,6 +951,7 @@ class DashboardPage(QWidget):
         history: list[dict[str, Any]] = snapshot.get("recent_history") or snapshot.get("history", [])
         events: list[dict[str, Any]] = snapshot.get("events", [])
         ai_state: dict[str, Any] = snapshot.get("ai", {})
+        config: dict[str, Any] = snapshot.get("config", {})
         requested_active = int(snapshot.get("active_node") or 0)
         active_node = self._refresh_focus_nodes(nodes, requested_active)
         active_state = nodes.get(active_node, {}) if active_node else {}
@@ -960,13 +963,16 @@ class DashboardPage(QWidget):
             self._ai_dialog.set_runtime_state(ai_state)
 
         self._paused = bool(snapshot.get("paused"))
-        self.pause_btn.setText("恢复刷新" if self._paused else "暂停刷新")
+        pause_text = "恢复刷新" if self._paused else "暂停刷新"
+        if pause_text != self._last_pause_text:
+            self._last_pause_text = pause_text
+            self.pause_btn.setText(pause_text)
 
         # 中文注释：不可见时跳过曲线与拓扑重绘，降低后台 CPU 占用。
         if not self.isVisible():
             return
 
-        self._update_metric_cards(active_state)
+        self._update_metric_cards(active_state, config)
         self._update_group_cards(active_state)
 
         filtered_events = self._filter_events(events)
@@ -989,7 +995,7 @@ class DashboardPage(QWidget):
         self._last_dashboard_heavy_refresh_at = now
 
         self.csi_plot.set_history(history, active_node, active_state)
-        self._update_verdict(nodes, history, ai_state)
+        self._update_verdict(nodes, history, ai_state, config, snapshot.get("detection_summary"))
         self.topology_widget.set_nodes(nodes)
 
     def _toggle_pause(self) -> None:
@@ -1091,8 +1097,16 @@ class DashboardPage(QWidget):
         nodes: dict[int, dict[str, Any]],
         history: list[dict[str, Any]],
         ai_state: dict[str, Any],
+        config: dict[str, Any],
+        snapshot_summary: Any | None = None,
     ) -> None:
-        summary = build_detection_summary(nodes, history)
+        summary = snapshot_summary or build_detection_summary(
+            nodes,
+            history,
+            presence_threshold=_float(config.get("presence_threshold"), PRESENCE_THRESHOLD),
+            confidence_threshold=_float(config.get("confidence_threshold"), 0.75),
+            csi_quality_threshold=_float(config.get("csi_quality_threshold"), 0.45),
+        )
         display_summary = self._stable_verdict_summary(summary)
         status = display_summary.status
         detail = display_summary.detail
@@ -1198,12 +1212,19 @@ class DashboardPage(QWidget):
             f"color: {THEME['blue_soft'] if ok else THEME['red']};"
         )
 
-    def _update_metric_cards(self, state: dict[str, Any]) -> None:
+    def _update_metric_cards(self, state: dict[str, Any], config: dict[str, Any] | None = None) -> None:
+        config = config or {}
         motion = _score(state.get("motion_score"))
         presence = _score(state.get("presence_score"))
         confidence = _score(state.get("confidence"))
+        triggered = life_motion_triggered(
+            state,
+            presence_threshold=_float(config.get("presence_threshold"), PRESENCE_THRESHOLD),
+            confidence_threshold=_float(config.get("confidence_threshold"), 0.75),
+            csi_quality_threshold=_float(config.get("csi_quality_threshold"), 0.45),
+        )
         motion_hint = "活跃" if motion >= 0.52 else "平稳"
-        presence_text = "疑似微动" if presence >= 0.5 and confidence >= 0.62 else "未检测"
+        presence_text = "疑似微动" if triggered else "未检测"
         presence_hint = f"{presence * 100:.0f}% 阈值响应"
         conf_hint = "可信" if confidence >= 0.75 else "观测中"
 
@@ -1227,20 +1248,30 @@ class DashboardPage(QWidget):
         snr = _float(state.get("snr"))
         loss = _float(state.get("packet_loss"))
 
-        self.group_values["temp"].setText(f"{temp:.1f}°C")
-        self.group_values["hum"].setText(f"{hum:.0f}%")
-        self.group_values["gas"].setText(f"{gas:.0f} ppm")
-        self.group_values["gas"].setStyleSheet(
-            f"font-size: 19px; color: {THEME['red'] if gas >= 2000 else THEME['orange'] if gas >= 1000 else THEME['text']};"
+        self._set_group_value("temp", f"{temp:.1f}°C")
+        self._set_group_value("hum", f"{hum:.0f}%")
+        self._set_group_value(
+            "gas",
+            f"{gas:.0f} ppm",
+            f"font-size: 19px; color: {THEME['red'] if gas >= 2000 else THEME['orange'] if gas >= 1000 else THEME['text']};",
         )
 
-        self.group_values["rssi"].setText(f"{rssi:.0f} dBm")
-        self.group_values["rssi"].setStyleSheet(f"font-size: 19px; color: {THEME['blue_soft']};")
-        self.group_values["snr"].setText(f"{snr:.1f} dB")
-        self.group_values["loss"].setText(f"{loss:.2f}%")
-        self.group_values["loss"].setStyleSheet(
-            f"font-size: 19px; color: {THEME['red'] if loss >= 8 else THEME['orange'] if loss >= 2 else THEME['text']};"
+        self._set_group_value("rssi", f"{rssi:.0f} dBm", f"font-size: 19px; color: {THEME['blue_soft']};")
+        self._set_group_value("snr", f"{snr:.1f} dB")
+        self._set_group_value(
+            "loss",
+            f"{loss:.2f}%",
+            f"font-size: 19px; color: {THEME['red'] if loss >= 8 else THEME['orange'] if loss >= 2 else THEME['text']};",
         )
+
+    def _set_group_value(self, key: str, text: str, style: str = "font-size: 19px;") -> None:
+        cached = self._last_group_values.get(key)
+        if cached == (text, style):
+            return
+        self._last_group_values[key] = (text, style)
+        label = self.group_values[key]
+        label.setText(text)
+        label.setStyleSheet(style)
 
     def refresh_theme(self) -> None:
         status, detail, _color = self._last_verdict
@@ -1253,6 +1284,7 @@ class DashboardPage(QWidget):
         self.topology_widget.update()
         for card in self.metric_cards.values():
             card.refresh_theme()
+        self._last_group_values.clear()
         if self._latest_active_state:
             self._update_metric_cards(self._latest_active_state)
             self._update_group_cards(self._latest_active_state)
@@ -1375,6 +1407,7 @@ class SensorMatrixPage(QWidget):
     presence_threshold_changed = pyqtSignal(float)
     gas_threshold_changed = pyqtSignal(float)
     gas_calibration_requested = pyqtSignal()
+    gas_calibration_all_requested = pyqtSignal()
     afh_toggled = pyqtSignal(bool)
     mesh_toggled = pyqtSignal(bool)
     sync_requested = pyqtSignal()
@@ -1522,12 +1555,17 @@ class SensorMatrixPage(QWidget):
         self.gas_slider.valueChanged.connect(self.gas_threshold_changed.emit)
         layout.addWidget(self.gas_slider)
 
-        self.gas_calibrate_btn = QPushButton("MQ-135 清洁空气校准")
+        self.gas_calibrate_btn = QPushButton("校准当前节点")
         self.gas_calibrate_btn.setObjectName("GhostButton")
         self.gas_calibrate_btn.clicked.connect(self.gas_calibration_requested.emit)
         layout.addWidget(self.gas_calibrate_btn)
 
-        self.gas_calibration_label = QLabel("MQ-135 R0：默认估算")
+        self.gas_calibrate_all_btn = QPushButton("校准全部在线节点")
+        self.gas_calibrate_all_btn.setObjectName("GhostButton")
+        self.gas_calibrate_all_btn.clicked.connect(self.gas_calibration_all_requested.emit)
+        layout.addWidget(self.gas_calibrate_all_btn)
+
+        self.gas_calibration_label = QLabel("MQ-135：按节点校准未完成")
         self.gas_calibration_label.setObjectName("SubtleText")
         self.gas_calibration_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.gas_calibration_label)
@@ -1605,8 +1643,16 @@ class SensorMatrixPage(QWidget):
                 "最后同步时间: " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(last_sync)))
             )
         r0 = _float(config.get("gas_calibration_r0"))
-        if r0 > 0.0:
-            self.gas_calibration_label.setText(f"MQ-135 R0：{r0:.2f} kΩ · 清洁空气 {config.get('gas_clean_air_ppm', 400):.0f} ppm")
+        online = int(config.get("gas_online_nodes") or 0)
+        calibrated = int(config.get("gas_calibrated_online") or 0)
+        total_calibrated = int(config.get("gas_node_calibration_count") or 0)
+        clean_air = _float(config.get("gas_clean_air_ppm"), 400.0)
+        if online > 0:
+            self.gas_calibration_label.setText(f"MQ-135：已校准 {calibrated}/{online} 个在线节点 · 清洁空气 {clean_air:.0f} ppm")
+        elif total_calibrated > 0:
+            self.gas_calibration_label.setText(f"MQ-135：已保存 {total_calibrated} 个节点 R0 · 清洁空气 {clean_air:.0f} ppm")
+        elif r0 > 0.0:
+            self.gas_calibration_label.setText(f"MQ-135：默认/旧全局 R0 {r0:.2f} kΩ")
 
         # 严重错误节点 → 底部系统警告条
         critical = next((m for m in matrix if m.get("health") == HEALTH_CRITICAL), None)
@@ -1733,6 +1779,8 @@ class AnalysisPage(QWidget):
         self._window_seconds = 60
         self._selected_node = 0
         self._known_nodes: list[tuple[int, str]] = []
+        self._last_stats_at = 0.0
+        self._last_stats_key: tuple[Any, ...] | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -1826,29 +1874,45 @@ class AnalysisPage(QWidget):
             return
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         history: list[dict[str, Any]] = snapshot.get("history", [])
+        recent_history: list[dict[str, Any]] = snapshot.get("recent_history", [])
         self._refresh_analysis_nodes(nodes)
         self._selected_node = int(self.analysis_node_combo.currentData() or 0)
         self._metric_key = str(self.metric_combo.currentData() or "motion_score")
         self._window_seconds = int(self.window_combo.currentData() or 0)
-        filtered_history = self._analysis_history(history)
-        self.analysis_empty_label.setVisible(not bool(filtered_history))
-
-        self.stat_cards["samples"].set_value(f"{len(filtered_history)}", "当前筛选")
-        motions = [_score(s.get("motion_score")) for s in filtered_history]
-        avg_motion = sum(motions) / len(motions) if motions else 0.0
-        self.stat_cards["avg_motion"].set_value(f"{avg_motion:.2f}", "当前筛选")
-        gases = [_float(s.get("gas_ppm", s.get("gas"))) for s in filtered_history]
-        max_gas = max(gases) if gases else 0.0
-        self.stat_cards["max_gas"].set_value(
-            f"{max_gas:.0f} ppm", "当前筛选", THEME["red"] if max_gas >= 2000 else THEME["orange"] if max_gas >= 1000 else None
-        )
-        online = sum(1 for n in nodes.values() if n.get("online"))
-        self.stat_cards["online"].set_value(
-            f"{online} / {len(nodes)}", "已发现节点",
-            THEME["green"] if online else None,
-        )
+        source_history = recent_history if self._window_seconds and recent_history else history
+        filtered_history = self._analysis_history(source_history)
 
         now = time.time()
+        last_sample = filtered_history[-1] if filtered_history else {}
+        stats_key = (
+            len(source_history),
+            len(filtered_history),
+            self._selected_node,
+            self._metric_key,
+            self._window_seconds,
+            last_sample.get("node_id"),
+            last_sample.get("seq"),
+            last_sample.get("timestamp"),
+        )
+        if stats_key != self._last_stats_key and now - self._last_stats_at >= 0.5:
+            self._last_stats_key = stats_key
+            self._last_stats_at = now
+            self.analysis_empty_label.setVisible(not bool(filtered_history))
+            self.stat_cards["samples"].set_value(f"{len(filtered_history)}", "当前筛选")
+            motions = [_score(s.get("motion_score")) for s in filtered_history]
+            avg_motion = sum(motions) / len(motions) if motions else 0.0
+            self.stat_cards["avg_motion"].set_value(f"{avg_motion:.2f}", "当前筛选")
+            gases = [_float(s.get("gas_ppm", s.get("gas"))) for s in filtered_history]
+            max_gas = max(gases) if gases else 0.0
+            self.stat_cards["max_gas"].set_value(
+                f"{max_gas:.0f} ppm", "当前筛选", THEME["red"] if max_gas >= 2000 else THEME["orange"] if max_gas >= 1000 else None
+            )
+            online = sum(1 for n in nodes.values() if n.get("online"))
+            self.stat_cards["online"].set_value(
+                f"{online} / {len(nodes)}", "已发现节点",
+                THEME["green"] if online else None,
+            )
+
         if now - self._last_plot_at < 0.8:
             return
         self._last_plot_at = now
@@ -1904,6 +1968,8 @@ class AnalysisPage(QWidget):
         if node_id:
             self.active_node_changed.emit(node_id)
         self._last_plot_at = 0.0
+        self._last_stats_at = 0.0
+        self._last_stats_key = None
 
     def refresh_theme(self) -> None:
         self.plot.setBackground(THEME["card"])
@@ -2138,7 +2204,7 @@ class HistoryPage(QWidget):
     clear_history_requested = pyqtSignal()
 
     _COLUMNS = ("时间", "节点", "有效性", "存在", "运动", "置信度", "CO2 ppm", "温度", "湿度", "RSSI")
-    _TABLE_MAX_ROWS = 1000
+    _TABLE_MAX_ROWS = 500
 
     def __init__(self) -> None:
         super().__init__()
@@ -2169,8 +2235,9 @@ class HistoryPage(QWidget):
         self.history_node_combo.addItem("全部节点", 0)
         self.history_node_combo.currentIndexChanged.connect(self._invalidate_table_render)
         self.history_limit_combo = QComboBox()
-        for label, limit in (("最新 200", 200), ("最新 500", 500), ("最新 1000", 1000)):
+        for label, limit in (("最新 100", 100), ("最新 300", 300), ("最新 500", 500)):
             self.history_limit_combo.addItem(label, limit)
+        self.history_limit_combo.setCurrentIndex(1)
         self.history_limit_combo.currentIndexChanged.connect(self._invalidate_table_render)
         export_btn = QPushButton("CSV 导出")
         export_btn.setObjectName("PrimaryButton")
@@ -2216,13 +2283,14 @@ class HistoryPage(QWidget):
             return
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         history: list[dict[str, Any]] = snapshot.get("history", [])
+        history_total = int(snapshot.get("history_total") or len(history))
         self._refresh_history_nodes(nodes)
         filtered = self._filter_history(history)
         self._latest_filtered = filtered
         limit = min(int(self.history_limit_combo.currentData() or self._TABLE_MAX_ROWS), self._TABLE_MAX_ROWS)
         recent = filtered[-limit:][::-1]
         self.subtitle.setText(
-            f"最近 {len(history)} 条样本（当前筛选 {len(filtered)} 条，表格显示 {len(recent)} 条）"
+            f"最近 {history_total} 条样本（当前筛选 {len(filtered)} 条，表格显示 {len(recent)} 条）"
         )
         self.empty_label.setVisible(not bool(recent))
 
@@ -2323,6 +2391,8 @@ class HistoryPage(QWidget):
                 ("Presence", f"{_score(sample.get('presence_score')):.2f}"),
                 ("Motion", f"{_score(sample.get('motion_score')):.2f}"),
                 ("Confidence", f"{_score(sample.get('confidence')) * 100:.0f}%"),
+                ("呼吸锁定", _format_optional_bool(sample.get("breath_lock"))),
+                ("噪声基线", _format_optional_float(sample.get("noise_floor"))),
                 ("CO2 估算 ppm", f"{_float(sample.get('gas_ppm', sample.get('gas'))):.0f} ppm"),
                 ("气体原始值", f"{_float(sample.get('gas_raw')):.0f}"),
                 ("Raw", sample.get("raw", "")),
@@ -2421,16 +2491,54 @@ def _matrix_advice(state: dict[str, Any]) -> tuple[str, str]:
 
 
 def _sample_validity(sample: dict[str, Any]) -> str:
-    presence = _score(sample.get("presence_score"))
     confidence = _score(sample.get("confidence"))
     gas = _float(sample.get("gas"))
     if gas >= 550:
         return "异常"
-    if presence >= 0.5 and confidence >= 0.62:
+    if life_motion_triggered(sample):
         return "疑似微动"
     if confidence and confidence < 0.45:
         return "低置信"
     return "有效"
+
+
+def _format_optional_score(value: Any) -> str:
+    if value is None:
+        return "--"
+    return f"{_score(value):.2f}"
+
+
+def _format_optional_int(value: Any) -> str:
+    if value is None:
+        return "--"
+    try:
+        return str(int(value))
+    except (TypeError, ValueError):
+        return "--"
+
+
+def _format_optional_float(value: Any) -> str:
+    if value is None:
+        return "--"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "--"
+
+
+def _format_optional_bool(value: Any) -> str:
+    if value is None:
+        return "--"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, (int, float)):
+        return "是" if bool(value) else "否"
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return "是"
+    if text in {"0", "false", "no", "n", "off"}:
+        return "否"
+    return "--"
 
 
 def _score(value: Any) -> float:

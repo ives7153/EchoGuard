@@ -43,6 +43,10 @@ def parse_gateway_frame(line: str) -> dict[str, Any]:
         "motion_score": 0.0,
         "breath_bpm": 0.0,
         "confidence": 0.0,
+        "csi_quality": None,
+        "csi_sample_count": None,
+        "breath_lock": None,
+        "noise_floor": None,
         "gas": 0.0,
         "gas_raw": 0.0,
         "gas_ppm": 0.0,
@@ -87,6 +91,10 @@ def parse_gateway_frame(line: str) -> dict[str, Any]:
             "motion_score": _normalize_score(_first(payload, "motion", "motion_score")),
             "breath_bpm": _number(_first(payload, "bpm", "breath_bpm"), 0.0),
             "confidence": _normalize_score(_first(payload, "conf", "confidence")),
+            "csi_quality": _optional_score(_first(payload, "csi_quality", "quality")),
+            "csi_sample_count": _optional_int(_first(payload, "csi_sample_count", "csi_n", "sample_count")),
+            "breath_lock": _optional_bool(_first(payload, "breath_lock", "breath_locked")),
+            "noise_floor": _optional_float(_first(payload, "noise_floor", "csi_noise_floor")),
             "gas": gas_ppm,
             "gas_raw": gas_raw,
             "gas_ppm": gas_ppm,
@@ -125,11 +133,41 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
 def _text(value: Any) -> str:
     if value is None:
         return ""
     text = str(value).strip()
     return text
+
+
+def _optional_score(value: Any) -> float | None:
+    if value is None:
+        return None
+    return _normalize_score(value)
 
 
 def _normalize_score(value: Any) -> float:

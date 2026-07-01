@@ -8,11 +8,17 @@ from __future__ import annotations
 
 from typing import Any, overload
 
-OFFLINE_SECONDS = 8.0
+try:
+    from ..config import CONFIDENCE_THRESHOLD, GAS_ALARM_PPM, OFFLINE_SECONDS, PRESENCE_THRESHOLD
+    from .detection_fusion import life_motion_triggered
+except ImportError:
+    if __package__ and __package__.startswith("upper_computer"):
+        raise
+    from config import CONFIDENCE_THRESHOLD, GAS_ALARM_PPM, OFFLINE_SECONDS, PRESENCE_THRESHOLD  # type: ignore
+    from rules.detection_fusion import life_motion_triggered  # type: ignore
+
 DEDUP_SECONDS = 5.0
-PRESENCE_THRESHOLD = 0.65
-CONFIDENCE_THRESHOLD = 0.75
-GAS_THRESHOLD = 550.0
+GAS_THRESHOLD = GAS_ALARM_PPM
 
 _LAST_ALARM_AT: dict[tuple[int, str], float] = {}
 
@@ -58,11 +64,13 @@ def evaluate_sample(
 
     if sample and sample.get("valid", True):
         node_id = int(sample.get("node_id") or 0)
-        presence = _score(sample, "presence_score", "presence")
-        confidence = _score(sample, "confidence", "conf")
         gas = _number(sample.get("gas"))
 
-        if node_id > 0 and presence > PRESENCE_THRESHOLD and confidence > CONFIDENCE_THRESHOLD:
+        if node_id > 0 and life_motion_triggered(
+            sample,
+            presence_threshold=PRESENCE_THRESHOLD,
+            confidence_threshold=CONFIDENCE_THRESHOLD,
+        ):
             _append_alarm(dict_events, text_events, now, node_id, "life_motion", "疑似生命微动")
         if node_id > 0 and gas > GAS_THRESHOLD:
             _append_alarm(dict_events, text_events, now, node_id, "gas", "气体异常")
@@ -110,13 +118,6 @@ def _append_alarm(
             "message": message,
         }
     )
-
-
-def _score(sample: dict[str, Any], primary: str, alias: str) -> float:
-    value = _number(sample.get(primary, sample.get(alias, 0.0)))
-    if value > 1.0:
-        value /= 100.0
-    return max(0.0, min(value, 1.0))
 
 
 def _number(value: Any, default: float = 0.0) -> float:
