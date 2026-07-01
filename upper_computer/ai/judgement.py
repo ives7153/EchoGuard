@@ -192,16 +192,21 @@ def run_ai_judgement(settings: AISettings, summary: DetectionSummary) -> dict[st
     result["source"] = "local_jina"
     result["status"] = "本地 Jina 模式匹配完成"
     result["text"] = _local_match_text(summary, matches)
+    result["detail"] = build_ai_detail(summary, matches=matches, headline=result["text"])
+    result["detail_source"] = "local_jina"
 
     if settings.llm_enabled and settings.llm_base_url and settings.llm_model:
         try:
             llm_text = generate_llm_explanation(settings, summary, matches)
+            llm_detail = generate_llm_detail(settings, summary, matches)
         except Exception as exc:  # noqa: BLE001
             result["error"] = str(exc)
             return result
         result["source"] = "llm_api"
         result["status"] = "大模型辅助解释完成"
         result["text"] = llm_text
+        result["detail"] = llm_detail
+        result["detail_source"] = "llm_api"
 
     return result
 
@@ -642,6 +647,43 @@ def generate_llm_explanation(
     return text
 
 
+def generate_llm_detail(
+    settings: AISettings,
+    summary: DetectionSummary,
+    matches: list[dict[str, Any]],
+) -> dict[str, str]:
+    match_text = "\n".join(
+        f"- {item['label']}，score={float(item['score']):.2f}，建议：{item['advice']}"
+        for item in matches
+    ) or "无"
+    user_text = (
+        f"规则判断：{summary.status}\n"
+        f"参与节点：{', '.join(summary.participant_labels) or '无'}\n"
+        f"触发节点：{', '.join(summary.triggered_labels) or '无'}\n"
+        f"时间窗口：最近 {summary.window_seconds:.0f} 秒\n"
+        f"Jina 相似模式：\n{match_text}\n"
+        f"结构化摘要：\n{summary.summary_text}\n\n"
+        "请输出四行现场辅助研判，严格使用以下标签：\n"
+        "依据：...\n风险：...\n趋势：...\n建议：...\n"
+        "每行不超过 55 个中文字符，不能写确认生命、确定有人或类似确定性结论。"
+    )
+    content = _chat_completion(
+        settings,
+        [
+            {
+                "role": "system",
+                "content": "你是灾后救援上位机的现场辅助研判模块。只解释规则融合和数据质量，给出谨慎复核建议。",
+            },
+            {"role": "user", "content": user_text},
+        ],
+        max_tokens=260,
+    )
+    parsed = _parse_detail_lines(content)
+    fallback = build_ai_detail(summary, matches=matches)
+    fallback.update({key: value for key, value in parsed.items() if value})
+    return fallback
+
+
 def _chat_completion(settings: AISettings, messages: list[dict[str, str]], max_tokens: int) -> str:
     content, _status, _endpoint = _chat_completion_result(settings, messages, max_tokens)
     return content
@@ -680,6 +722,7 @@ def _chat_completion_result(
 
 
 def _base_result(settings: AISettings, summary: DetectionSummary) -> dict[str, Any]:
+    now = time.time()
     return {
         "enabled": settings.enabled,
         "running": False,
@@ -688,10 +731,13 @@ def _base_result(settings: AISettings, summary: DetectionSummary) -> dict[str, A
         "source": "rule_fallback",
         "window_start": summary.window_start,
         "window_end": summary.window_end,
-        "updated_at": time.time(),
+        "updated_at": now,
         "top_matches": [],
         "error": "",
         "state_key": summary.state_key,
+        "detail": build_ai_detail(summary),
+        "detail_source": "rule_fallback",
+        "detail_updated_at": now,
     }
 
 
@@ -715,6 +761,76 @@ def _sanitize_ai_text(text: str) -> str:
     for old, new in replacements.items():
         cleaned = cleaned.replace(old, new)
     return cleaned.strip("` \t")
+
+
+def build_ai_detail(
+    summary: DetectionSummary,
+    matches: list[dict[str, Any]] | None = None,
+    headline: str = "",
+) -> dict[str, str]:
+    participants = "、".join(summary.participant_labels) or "无"
+    triggered = "、".join(summary.triggered_labels) or "无"
+    stats = summary.stats or []
+    avg_presence = sum(item.presence_avg for item in stats) / len(stats) if stats else 0.0
+    avg_conf = sum(item.confidence_avg for item in stats) / len(stats) if stats else 0.0
+    motion_peak = max((item.motion_peak for item in stats), default=0.0)
+    best_match = matches[0] if matches else {}
+    match_text = ""
+    if best_match:
+        match_text = f"；本地相似模式为{best_match.get('label')}({float(best_match.get('score') or 0.0) * 100:.0f}%)"
+
+    if not summary.participant_ids:
+        risk = "尚无有效节点样本，当前不能形成可靠辅助判断。"
+        trend = "等待 Gateway 串口与节点上报后再观察趋势。"
+        advice = "先确认 Gateway 连接、节点供电和串口输出。"
+    elif summary.status == "数据不足":
+        risk = "仅少量节点参与，单点扰动或链路波动可能放大误判。"
+        trend = f"最近{summary.window_seconds:.0f}秒平均存在{avg_presence:.2f}，仍需交叉验证。"
+        advice = "保持采集，等待相邻节点形成支持后再升级现场处置。"
+    elif summary.status == "疑似局部微动":
+        risk = "当前主要由单点支持，需防止人员移动、遮挡或无线扰动影响。"
+        trend = f"运动峰值{motion_peak:.2f}，置信均值{avg_conf:.2f}，建议继续看连续性。"
+        advice = "优先复核触发节点覆盖区域，并观察相邻节点是否跟随。"
+    elif summary.status == "多节点疑似生命微动":
+        risk = "多节点同窗触发需要重点关注，但仍不能替代现场确认。"
+        trend = f"最近{summary.window_seconds:.0f}秒触发节点{triggered}，置信均值{avg_conf:.2f}。"
+        advice = "重点复核重叠覆盖区域，保持采集并结合现场声音/热源复核。"
+    else:
+        risk = "暂未形成稳定微动，低置信或弱样本仍可能掩盖短时变化。"
+        trend = f"最近{summary.window_seconds:.0f}秒平均存在{avg_presence:.2f}，运动峰值{motion_peak:.2f}。"
+        advice = "继续采集并关注 presence、confidence 是否连续抬升。"
+
+    basis = (
+        f"{summary.status}；参与节点{participants}；触发节点{triggered}；"
+        f"窗口{summary.window_seconds:.0f}秒{match_text}。"
+    )
+    return {
+        "headline": _sanitize_ai_text(headline or ai_fallback_text(summary.status, summary)),
+        "basis": _limit_detail_text(basis),
+        "risk": _limit_detail_text(risk),
+        "trend": _limit_detail_text(trend),
+        "advice": _limit_detail_text(advice),
+    }
+
+
+def _parse_detail_lines(text: str) -> dict[str, str]:
+    mapping = {"依据": "basis", "风险": "risk", "趋势": "trend", "建议": "advice"}
+    result: dict[str, str] = {}
+    for raw_line in str(text or "").splitlines():
+        line = _sanitize_ai_text(raw_line)
+        for prefix, key in mapping.items():
+            marker = f"{prefix}："
+            if line.startswith(marker):
+                result[key] = _limit_detail_text(line[len(marker) :].strip())
+                break
+    return result
+
+
+def _limit_detail_text(text: str, limit: int = 92) -> str:
+    cleaned = _sanitize_ai_text(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
 
 
 def _request_json(

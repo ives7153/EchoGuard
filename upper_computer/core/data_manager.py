@@ -46,6 +46,7 @@ try:
     from ..ai import (
         AISettings,
         LocalJinaRuntime,
+        build_ai_detail,
         create_jina_offline_package,
         deploy_jina_package,
         fetch_llm_models,
@@ -105,6 +106,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
     from ai import (  # type: ignore
         AISettings,
         LocalJinaRuntime,
+        build_ai_detail,
         create_jina_offline_package,
         deploy_jina_package,
         fetch_llm_models,
@@ -360,6 +362,12 @@ class DataManager(QObject):
             "status": "规则回退",
             "text": ai_fallback_text("等待数据"),
             "source": "rule_fallback",
+            "detail": build_ai_detail(
+                build_detection_summary({}, [], reference_ts=time.time())
+            ),
+            "detail_source": "rule_fallback",
+            "detail_updated_at": 0.0,
+            "detail_history": [],
             "window_start": 0.0,
             "window_end": 0.0,
             "updated_at": 0.0,
@@ -371,6 +379,7 @@ class DataManager(QObject):
         self._ai_request_id = 0
         self._ai_last_started_at = 0.0
         self._ai_last_state_key = ""
+        self._ai_detail_event_key = ""
 
         # 报警引擎（阈值可被传感器页热更新）
         self.alarm_engine = AlarmEngine()
@@ -626,6 +635,9 @@ class DataManager(QObject):
             )
             return
         action = str(payload.get("action") or "").strip()
+        if action == "refresh_ai_detail":
+            self._schedule_ai_analysis(force=True, manual=True)
+            return
         if action == "save":
             config = payload.get("config")
             if not isinstance(config, dict):
@@ -1678,6 +1690,9 @@ class DataManager(QObject):
     def _maybe_schedule_ai_analysis(self) -> None:
         """低频异步生成 AI 辅助解释；实时主判断仍由规则融合负责。"""
 
+        self._schedule_ai_analysis(force=False, manual=False)
+
+    def _schedule_ai_analysis(self, force: bool = False, manual: bool = False) -> None:
         summary = build_detection_summary(
             self._node_dicts(),
             self._recent_history(5.0, 1200),
@@ -1686,16 +1701,26 @@ class DataManager(QObject):
         )
         self._refresh_ai_fallback(summary)
         if not self.ai_settings.enabled or not self.ai_settings.embedding_enabled:
+            if manual:
+                self.ai_operation_message_changed.emit("AI 详情已使用规则回退刷新", True)
             return
         if not summary.participant_ids:
+            if manual:
+                self.ai_operation_message_changed.emit("暂无有效节点样本，AI 详情使用规则回退", False)
             return
         if self._ai_busy:
+            if manual:
+                self.ai_operation_message_changed.emit("AI 正在生成详情，请稍后再刷新", False)
             return
 
         now = time.time()
-        if now - self._ai_last_started_at < 3.0:
+        if not force and now - self._ai_last_started_at < 3.0:
             return
-        if summary.state_key == self._ai_last_state_key and now - _float(self.ai_state.get("updated_at")) < 8.0:
+        if (
+            not force
+            and summary.state_key == self._ai_last_state_key
+            and now - _float(self.ai_state.get("updated_at")) < 8.0
+        ):
             return
 
         self._ai_busy = True
@@ -1708,12 +1733,15 @@ class DataManager(QObject):
                 "running": True,
                 "status": "AI 分析中",
                 "text": str(self.ai_state.get("text") or ai_fallback_text(summary.status, summary)),
+                "detail": self.ai_state.get("detail") or build_ai_detail(summary),
                 "state_key": summary.state_key,
                 "window_start": summary.window_start,
                 "window_end": summary.window_end,
                 "config": self._public_ai_config(),
             }
         )
+        if manual:
+            self.ai_operation_message_changed.emit("AI 详情生成中...", True)
         self._dirty = True
         settings = self.ai_settings.copy()
 
@@ -1736,15 +1764,19 @@ class DataManager(QObject):
             confidence_threshold=self.alarm_engine.confidence_threshold,
         )
         if str(result.get("state_key", "")) != current_summary.state_key:
+            now = time.time()
             self.ai_state.update(
                 {
                     "running": False,
                     "status": "上一轮 AI 结果已过期，等待更新",
                     "text": ai_fallback_text(current_summary.status, current_summary),
                     "source": "rule_fallback",
+                    "detail": build_ai_detail(current_summary),
+                    "detail_source": "rule_fallback",
+                    "detail_updated_at": now,
                     "window_start": current_summary.window_start,
                     "window_end": current_summary.window_end,
-                    "updated_at": time.time(),
+                    "updated_at": now,
                     "top_matches": [],
                     "error": "",
                     "state_key": current_summary.state_key,
@@ -1755,8 +1787,10 @@ class DataManager(QObject):
             result["running"] = False
             result["config"] = self._public_ai_config()
             result["jina_running"] = self.ai_runtime.is_running()
+            result["detail_updated_at"] = time.time()
             self.ai_state.update(result)
 
+        self._record_ai_detail(current_summary)
         self._dirty = True
 
     @pyqtSlot(str, bool)
@@ -1806,6 +1840,13 @@ class DataManager(QObject):
             return
         if self.ai_state.get("source") != "rule_fallback" and self.ai_state.get("state_key") == current_key:
             return
+        if (
+            self.ai_state.get("source") == "rule_fallback"
+            and self.ai_state.get("state_key") == current_key
+            and isinstance(self.ai_state.get("detail"), dict)
+        ):
+            return
+        now = time.time()
         self.ai_state.update(
             {
                 "enabled": self.ai_settings.enabled,
@@ -1813,6 +1854,9 @@ class DataManager(QObject):
                 "status": "规则回退" if self.ai_settings.enabled else "AI 未启用，使用规则回退",
                 "text": ai_fallback_text(summary.status, summary),
                 "source": "rule_fallback",
+                "detail": build_ai_detail(summary),
+                "detail_source": "rule_fallback",
+                "detail_updated_at": now,
                 "window_start": summary.window_start,
                 "window_end": summary.window_end,
                 "updated_at": _float(self.ai_state.get("updated_at")),
@@ -1823,6 +1867,44 @@ class DataManager(QObject):
                 "config": self._public_ai_config(),
             }
         )
+        self._record_ai_detail(summary)
+
+    def _record_ai_detail(self, summary: object) -> None:
+        if not hasattr(summary, "state_key"):
+            return
+        detail = self.ai_state.get("detail")
+        if not isinstance(detail, dict):
+            return
+        source = str(self.ai_state.get("detail_source") or self.ai_state.get("source") or "rule_fallback")
+        state_key = str(summary.state_key)
+        record_key = f"{state_key}|{source}|{detail.get('headline', '')}"
+        history = list(self.ai_state.get("detail_history") or [])
+        if not history or str(history[-1].get("record_key") or "") != record_key:
+            history.append(
+                {
+                    "record_key": record_key,
+                    "time": time.time(),
+                    "status": str(getattr(summary, "status", "")),
+                    "source": source,
+                    "headline": str(detail.get("headline") or self.ai_state.get("text") or ""),
+                    "basis": str(detail.get("basis") or ""),
+                    "risk": str(detail.get("risk") or ""),
+                    "trend": str(detail.get("trend") or ""),
+                    "advice": str(detail.get("advice") or ""),
+                }
+            )
+            self.ai_state["detail_history"] = history[-20:]
+        if getattr(summary, "participant_ids", None):
+            self._append_ai_summary_event(summary, detail, source)
+
+    def _append_ai_summary_event(self, summary: object, detail: dict[str, Any], source: str) -> None:
+        state_key = str(getattr(summary, "state_key", ""))
+        event_key = f"{state_key}|{source}"
+        if not state_key or event_key == self._ai_detail_event_key:
+            return
+        self._ai_detail_event_key = event_key
+        message = str(detail.get("advice") or detail.get("headline") or "AI 已生成辅助研判")
+        self._append_event("AI SUMMARY", message, level="INFO", kind="ai")
 
     # ------------------------------------------------------------------ 快照
     def _publish_snapshot(self) -> None:

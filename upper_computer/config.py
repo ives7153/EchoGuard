@@ -20,7 +20,7 @@ from pathlib import Path
 # 品牌与基础常量
 # ---------------------------------------------------------------------------
 BRAND_NAME = "EchoGuard"
-BRAND_VERSION = "v0.2.0"
+BRAND_VERSION = "v0.3.0"
 APP_TITLE = "EchoGuard"
 WINDOW_TITLE = "EchoGuard"
 CONTROL_ID = "0xFF-AD-01"
@@ -222,6 +222,7 @@ NAV_ITEMS = (
     {"key": "dashboard", "text": "仪表盘", "icon": "layout-dashboard"},
     {"key": "sensors", "text": "节点管理", "icon": "radio"},
     {"key": "analysis", "text": "数据分析", "icon": "chart-line"},
+    {"key": "ai_assist", "text": "AI 辅助", "icon": "brain-circuit"},
     {"key": "diagnostics", "text": "技术诊断", "icon": "wrench"},
     {"key": "history", "text": "历史记录", "icon": "history"},
 )

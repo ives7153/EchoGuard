@@ -4,6 +4,7 @@ try:
     from .judgement import (
         AISettings,
         LocalJinaRuntime,
+        build_ai_detail,
         create_jina_offline_package,
         deploy_jina_package,
         fetch_llm_models,
@@ -27,6 +28,7 @@ except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
     from judgement import (  # type: ignore
         AISettings,
         LocalJinaRuntime,
+        build_ai_detail,
         create_jina_offline_package,
         deploy_jina_package,
         fetch_llm_models,
@@ -48,6 +50,7 @@ except ImportError:  # 兼容 cd upper_computer 后直接 python main.py
 __all__ = [
     "AISettings",
     "LocalJinaRuntime",
+    "build_ai_detail",
     "create_jina_offline_package",
     "deploy_jina_package",
     "fetch_llm_models",

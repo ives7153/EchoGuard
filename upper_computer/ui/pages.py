@@ -1802,6 +1802,263 @@ class SensorMatrixPage(QWidget):
 
 
 # ===========================================================================
+# AI 辅助页
+# ===========================================================================
+class AIAssistPage(QWidget):
+    """联网增强 AI 研判页，主判断仍由规则融合负责。"""
+
+    ai_action_requested = pyqtSignal(object)
+
+    _DETAIL_TITLES = (
+        ("basis", "依据"),
+        ("risk", "风险"),
+        ("trend", "趋势"),
+        ("advice", "建议"),
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._latest_snapshot: dict[str, Any] = {}
+        self._detail_labels: dict[str, QLabel] = {}
+        self._last_history_key: tuple[Any, ...] | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(16)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        title_box = QVBoxLayout()
+        title_box.setSpacing(4)
+        title = QLabel("AI 辅助")
+        title.setObjectName("SectionTitle")
+        title.setStyleSheet("font-size: 19px; font-weight: 700;")
+        subtitle = QLabel("联网增强研判、规则回退与节点贡献解释")
+        subtitle.setObjectName("SectionSub")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        header.addLayout(title_box)
+        header.addStretch(1)
+        self.refresh_detail_btn = QPushButton("刷新研判")
+        self.refresh_detail_btn.setObjectName("PrimaryButton")
+        self.refresh_detail_btn.clicked.connect(
+            lambda: self.ai_action_requested.emit({"action": "refresh_ai_detail"})
+        )
+        header.addWidget(self.refresh_detail_btn)
+        layout.addLayout(header)
+
+        cards = QGridLayout()
+        cards.setHorizontalSpacing(16)
+        cards.setVerticalSpacing(16)
+        self.ai_cards: dict[str, MetricCard] = {
+            "status": MetricCard("当前主判断\n(VERDICT)", "等待数据", "规则融合"),
+            "source": MetricCard("AI 来源\n(SOURCE)", "规则回退", "离线可用"),
+            "updated": MetricCard("详情更新\n(UPDATED)", "--", "等待刷新"),
+            "participants": MetricCard("参与节点\n(NODES)", "0", "最近窗口"),
+        }
+        for index, card in enumerate(self.ai_cards.values()):
+            cards.addWidget(card, 0, index)
+        layout.addLayout(cards)
+
+        detail_grid = QGridLayout()
+        detail_grid.setHorizontalSpacing(16)
+        detail_grid.setVerticalSpacing(16)
+        for index, (key, title_text) in enumerate(self._DETAIL_TITLES):
+            card = CardFrame()
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(18, 16, 18, 16)
+            card_layout.setSpacing(8)
+            title_label = QLabel(title_text)
+            title_label.setObjectName("SectionTitle")
+            body = QLabel("等待 AI 或规则融合生成详情")
+            body.setObjectName("SubtleText")
+            body.setWordWrap(True)
+            body.setMinimumHeight(54)
+            body.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            card_layout.addWidget(title_label)
+            card_layout.addWidget(body, 1)
+            self._detail_labels[key] = body
+            detail_grid.addWidget(card, index // 2, index % 2)
+        layout.addLayout(detail_grid)
+
+        middle = QHBoxLayout()
+        middle.setSpacing(16)
+        contribution_card = CardFrame()
+        contribution_layout = QVBoxLayout(contribution_card)
+        contribution_layout.setContentsMargins(18, 16, 18, 16)
+        contribution_layout.setSpacing(10)
+        contribution_title = QLabel("节点贡献 (NODE CONTRIBUTION)")
+        contribution_title.setObjectName("SectionTitle")
+        self.contribution_table = QTableWidget(0, 6)
+        self.contribution_table.setHorizontalHeaderLabels(("节点", "角色", "样本", "存在", "置信", "运动"))
+        self.contribution_table.verticalHeader().setVisible(False)
+        self.contribution_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.contribution_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.contribution_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.contribution_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.contribution_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        contribution_header = self.contribution_table.horizontalHeader()
+        for col in range(self.contribution_table.columnCount()):
+            contribution_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        contribution_layout.addWidget(contribution_title)
+        contribution_layout.addWidget(self.contribution_table)
+        middle.addWidget(contribution_card, 3)
+
+        history_card = CardFrame()
+        history_layout = QVBoxLayout(history_card)
+        history_layout.setContentsMargins(18, 16, 18, 16)
+        history_layout.setSpacing(10)
+        history_title = QLabel("AI 研判历史 (AI HISTORY)")
+        history_title.setObjectName("SectionTitle")
+        self.history_table = QTableWidget(0, 4)
+        self.history_table.setHorizontalHeaderLabels(("时间", "来源", "结论", "建议"))
+        self.history_table.verticalHeader().setVisible(False)
+        self.history_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.history_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.history_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.history_table.setWordWrap(True)
+        self.history_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.history_table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        history_header = self.history_table.horizontalHeader()
+        history_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.history_table.setColumnWidth(0, 76)
+        history_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.history_table.setColumnWidth(1, 78)
+        history_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        history_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.history_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        history_layout.addWidget(history_title)
+        history_layout.addWidget(self.history_table)
+        middle.addWidget(history_card, 4)
+        layout.addLayout(middle, 1)
+
+    def update_snapshot(self, snapshot: dict[str, Any]) -> None:
+        self._latest_snapshot = snapshot
+        ai_state: dict[str, Any] = snapshot.get("ai", {})
+        summary = snapshot.get("detection_summary")
+        nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
+        detail = ai_state.get("detail") if isinstance(ai_state.get("detail"), dict) else {}
+        detail = detail or self._fallback_detail(summary, ai_state)
+
+        status = str(getattr(summary, "status", "等待数据"))
+        participant_count = len(getattr(summary, "participant_ids", []) or [])
+        triggered_count = len(getattr(summary, "triggered_ids", []) or [])
+        source = self._source_label(str(ai_state.get("detail_source") or ai_state.get("source") or "rule_fallback"))
+        updated_at = _float(ai_state.get("detail_updated_at") or ai_state.get("updated_at"))
+        age = max(0.0, time.time() - updated_at) if updated_at else 0.0
+
+        status_color = THEME[verdict_color_key(status)]
+        self.ai_cards["status"].set_value(status, "规则融合主判断", status_color)
+        self.ai_cards["source"].set_value(source, str(ai_state.get("status") or "等待 AI 状态"))
+        self.ai_cards["updated"].set_value(f"{age:.0f}s 前" if updated_at else "--", "详情生成时间")
+        self.ai_cards["participants"].set_value(
+            f"{participant_count}", f"触发 {triggered_count} 个节点",
+            THEME["green"] if triggered_count >= 2 else THEME["orange"] if triggered_count else None,
+        )
+        self.refresh_detail_btn.setEnabled(not bool(ai_state.get("running")))
+        self.refresh_detail_btn.setText("生成中..." if ai_state.get("running") else "刷新研判")
+
+        for key, _title in self._DETAIL_TITLES:
+            text = str(detail.get(key) or "暂无详情，等待有效样本或 AI 结果")
+            self._detail_labels[key].setText(text)
+            self._detail_labels[key].setToolTip(text)
+
+        self._render_contribution_table(summary, nodes)
+        self._render_history_table(list(ai_state.get("detail_history") or []))
+
+    def _fallback_detail(self, summary: Any, ai_state: dict[str, Any]) -> dict[str, str]:
+        status = str(getattr(summary, "status", "等待数据"))
+        text = str(ai_state.get("text") or ai_fallback_text(status))
+        return {
+            "basis": text,
+            "risk": "AI 详情尚未生成，当前仅展示规则回退信息。",
+            "trend": "等待更多实时样本后刷新趋势解释。",
+            "advice": "保持采集，必要时点击刷新研判。",
+        }
+
+    def _render_contribution_table(self, summary: Any, nodes: dict[int, dict[str, Any]]) -> None:
+        stats = list(getattr(summary, "stats", []) or [])
+        triggered_ids = set(getattr(summary, "triggered_ids", []) or [])
+        if not stats:
+            discovered = [
+                (node_id, state)
+                for node_id, state in sorted(nodes.items())
+                if state.get("last_received") is not None
+            ]
+            self.contribution_table.setRowCount(len(discovered))
+            for row, (node_id, state) in enumerate(discovered):
+                values = (
+                    _node_label(node_id, state),
+                    "观测中",
+                    "--",
+                    f"{_score(state.get('presence_score')):.2f}",
+                    f"{_score(state.get('confidence')):.2f}",
+                    f"{_score(state.get('motion_score')):.2f}",
+                )
+                self._set_table_row(self.contribution_table, row, values)
+            return
+
+        self.contribution_table.setRowCount(len(stats))
+        for row, item in enumerate(stats):
+            role = "触发" if int(item.node_id) in triggered_ids else "参与"
+            values = (
+                str(item.label),
+                role,
+                str(item.sample_count),
+                f"{item.presence_avg:.2f}",
+                f"{item.confidence_avg:.2f}",
+                f"{item.motion_peak:.2f}",
+            )
+            self._set_table_row(self.contribution_table, row, values)
+
+    def _render_history_table(self, history: list[dict[str, Any]]) -> None:
+        shown = history[-12:][::-1]
+        history_key = tuple((item.get("record_key"), item.get("time")) for item in shown)
+        if history_key == self._last_history_key:
+            return
+        self._last_history_key = history_key
+        self.history_table.setRowCount(len(shown))
+        for row, item in enumerate(shown):
+            ts = _float(item.get("time"))
+            values = (
+                time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "--",
+                self._source_label(str(item.get("source") or "")),
+                str(item.get("headline") or item.get("status") or ""),
+                str(item.get("advice") or ""),
+            )
+            self._set_table_row(self.history_table, row, values)
+        self.history_table.resizeRowsToContents()
+        for row in range(self.history_table.rowCount()):
+            self.history_table.setRowHeight(row, max(self.history_table.rowHeight(row), 54))
+
+    def _set_table_row(self, table: QTableWidget, row: int, values: tuple[str, ...]) -> None:
+        for col, text in enumerate(values):
+            item = QTableWidgetItem(text)
+            item.setToolTip(text)
+            if table is self.history_table and col >= 2:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            else:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(row, col, item)
+
+    def _source_label(self, source: str) -> str:
+        return {
+            "llm_api": "大模型",
+            "local_jina": "本地 Jina",
+            "rule_fallback": "规则回退",
+        }.get(source, source or "规则回退")
+
+    def refresh_theme(self) -> None:
+        for card in self.ai_cards.values():
+            card.refresh_theme()
+        for label in self._detail_labels.values():
+            label.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 13px; line-height: 19px;")
+        if self._latest_snapshot:
+            self.update_snapshot(self._latest_snapshot)
+        refresh_widget_icons(self)
+
+
+# ===========================================================================
 # 数据分析页
 # ===========================================================================
 class AnalysisPage(QWidget):

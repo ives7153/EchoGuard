@@ -38,6 +38,7 @@ try:
     from .components import StatusPill
     from .icons import IconButton, SvgIcon, refresh_widget_icons
     from .pages import (
+        AIAssistPage,
         AnalysisPage,
         DashboardPage,
         DiagnosticsPage,
@@ -61,6 +62,7 @@ except ImportError:
     from ui.components import StatusPill
     from ui.icons import IconButton, SvgIcon, refresh_widget_icons
     from ui.pages import (
+        AIAssistPage,
         AnalysisPage,
         DashboardPage,
         DiagnosticsPage,
@@ -290,6 +292,7 @@ class MainWindow(QMainWindow):
         self.dashboard_page = DashboardPage()
         self.sensor_page = SensorMatrixPage()
         self.analysis_page = AnalysisPage()
+        self.ai_assist_page = AIAssistPage()
         self.diagnostics_page = DiagnosticsPage()
         self.history_page = HistoryPage()
 
@@ -297,6 +300,7 @@ class MainWindow(QMainWindow):
             "dashboard": self.dashboard_page,
             "sensors": self.sensor_page,
             "analysis": self.analysis_page,
+            "ai_assist": self.ai_assist_page,
             "diagnostics": self.diagnostics_page,
             "history": self.history_page,
         }
@@ -341,6 +345,7 @@ class MainWindow(QMainWindow):
         # 分析 / 诊断页动作
         self.analysis_page.active_node_changed.connect(self.active_node_changed.emit)
         self.analysis_page.analysis_shot_requested.connect(self.analysis_shot_requested.emit)
+        self.ai_assist_page.ai_action_requested.connect(self.ai_action_requested.emit)
         self.diagnostics_page.diagnostics_requested.connect(self.diagnostics_requested.emit)
 
     # ------------------------------------------------------------------ 导航
@@ -348,6 +353,7 @@ class MainWindow(QMainWindow):
         "dashboard": "实时生命体征监测",
         "sensors": "节点管理与配置",
         "analysis": "数据分析与趋势",
+        "ai_assist": "AI 辅助研判",
         "diagnostics": "诊断与维护",
         "history": "历史记录",
     }

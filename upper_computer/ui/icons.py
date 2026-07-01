@@ -36,6 +36,13 @@ ICON_PATHS: dict[str, str] = {
         '<path d="M19.8 4.2a11 11 0 0 1 0 15.6"/>'
     ),
     "chart-line": '<path d="M3 19h18"/><path d="M5 15l4-4 4 3 6-8"/>',
+    "brain-circuit": (
+        '<path d="M9 3a3 3 0 0 0-3 3 3 3 0 0 0-2 5.5A3.5 3.5 0 0 0 7.5 17H9"/>'
+        '<path d="M15 3a3 3 0 0 1 3 3 3 3 0 0 1 2 5.5A3.5 3.5 0 0 1 16.5 17H15"/>'
+        '<path d="M9 3v18"/><path d="M15 3v18"/><path d="M9 8h6"/><path d="M9 13h6"/>'
+        '<circle cx="6" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/>'
+        '<path d="M9 18l-2 2"/><path d="M15 18l2 2"/>'
+    ),
     "wrench": (
         '<path d="M14.7 5.3a5 5 0 0 0 5 6.6l-8.6 8.6a2.2 2.2 0 0 1-3.1-3.1l8.6-8.6a5 5 0 0 0-6.6-5z"/>'
     ),
