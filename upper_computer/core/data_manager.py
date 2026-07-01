@@ -55,6 +55,7 @@ try:
         jina_deployment_status,
         load_ai_settings,
         online_deploy_jina,
+        run_ai_chat,
         run_ai_judgement,
         save_ai_settings,
         settings_from_dict,
@@ -115,6 +116,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         jina_deployment_status,
         load_ai_settings,
         online_deploy_jina,
+        run_ai_chat,
         run_ai_judgement,
         save_ai_settings,
         settings_from_dict,
@@ -342,6 +344,7 @@ class DataManager(QObject):
     ai_operation_result_changed = pyqtSignal(object)
     ai_models_changed = pyqtSignal(object)
     _ai_analysis_ready = pyqtSignal(int, object)
+    _ai_chat_ready = pyqtSignal(int, object)
     _ai_operation_ready = pyqtSignal(str, bool)
     _ai_operation_result_ready = pyqtSignal(object)
     _ai_models_ready = pyqtSignal(object, bool, str)
@@ -368,6 +371,11 @@ class DataManager(QObject):
             "detail_source": "rule_fallback",
             "detail_updated_at": 0.0,
             "detail_history": [],
+            "chat_history": [],
+            "chat_running": False,
+            "chat_error": "",
+            "chat_source": "rule_fallback",
+            "chat_context_label": "当前快照 + 最近5分钟",
             "window_start": 0.0,
             "window_end": 0.0,
             "updated_at": 0.0,
@@ -377,6 +385,8 @@ class DataManager(QObject):
         }
         self._ai_busy = False
         self._ai_request_id = 0
+        self._ai_chat_request_id = 0
+        self._ai_chat_busy = False
         self._ai_last_started_at = 0.0
         self._ai_last_state_key = ""
         self._ai_detail_event_key = ""
@@ -443,6 +453,7 @@ class DataManager(QObject):
         self._ai_timer.timeout.connect(self._maybe_schedule_ai_analysis)
 
         self._ai_analysis_ready.connect(self._handle_ai_analysis_ready)
+        self._ai_chat_ready.connect(self._handle_ai_chat_ready)
         self._ai_operation_ready.connect(self._handle_ai_operation_ready)
         self._ai_operation_result_ready.connect(self._handle_ai_operation_result_ready)
         self._ai_models_ready.connect(self._handle_ai_models_ready)
@@ -637,6 +648,17 @@ class DataManager(QObject):
         action = str(payload.get("action") or "").strip()
         if action == "refresh_ai_detail":
             self._schedule_ai_analysis(force=True, manual=True)
+            return
+        if action == "ask_ai_chat":
+            self._schedule_ai_chat(str(payload.get("question") or ""))
+            return
+        if action == "clear_ai_chat":
+            self.ai_state["chat_history"] = []
+            self.ai_state["chat_error"] = ""
+            self.ai_state["chat_running"] = False
+            self.ai_state["chat_source"] = "rule_fallback"
+            self.ai_state["chat_context_label"] = "当前快照 + 最近5分钟"
+            self._dirty = True
             return
         if action == "save":
             config = payload.get("config")
@@ -1692,6 +1714,135 @@ class DataManager(QObject):
 
         self._schedule_ai_analysis(force=False, manual=False)
 
+    def _schedule_ai_chat(self, question: str) -> None:
+        question = " ".join(str(question or "").split())
+        if not question:
+            self.ai_state["chat_error"] = "请输入要询问的问题"
+            self._dirty = True
+            return
+        if self._ai_chat_busy:
+            self.ai_state["chat_error"] = "AI 对话正在生成，请稍后再问"
+            self._dirty = True
+            return
+
+        now = time.time()
+        history = list(self.ai_state.get("chat_history") or [])
+        history.append({"role": "user", "content": question, "time": now})
+        history = history[-20:]
+        context = self._build_ai_chat_context()
+
+        self._ai_chat_busy = True
+        self._ai_chat_request_id += 1
+        request_id = self._ai_chat_request_id
+        self.ai_state.update(
+            {
+                "chat_history": history,
+                "chat_running": True,
+                "chat_error": "",
+                "chat_context_label": str(context.get("context_label") or "当前快照 + 最近5分钟"),
+                "config": self._public_ai_config(),
+            }
+        )
+        self._dirty = True
+        settings = self.ai_settings.copy()
+        chat_history = [
+            {"role": str(item.get("role") or ""), "content": str(item.get("content") or "")}
+            for item in history[-8:]
+        ]
+
+        def run() -> None:
+            try:
+                result = run_ai_chat(settings, question, context, chat_history)
+            except Exception as exc:  # noqa: BLE001
+                result = {
+                    "answer": "AI 对话暂不可用，建议先依据右侧规则融合和节点贡献继续复核。",
+                    "source": "rule_fallback",
+                    "status": "AI 对话失败",
+                    "error": str(exc),
+                    "context_label": str(context.get("context_label") or "当前快照 + 最近5分钟"),
+                }
+            self._ai_chat_ready.emit(request_id, result)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @pyqtSlot(int, object)
+    def _handle_ai_chat_ready(self, request_id: int, result: object) -> None:
+        if request_id != self._ai_chat_request_id:
+            return
+        self._ai_chat_busy = False
+        if not isinstance(result, dict):
+            return
+        history = list(self.ai_state.get("chat_history") or [])
+        answer = str(result.get("answer") or "暂无回答")
+        history.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "time": time.time(),
+                "source": str(result.get("source") or "rule_fallback"),
+            }
+        )
+        self.ai_state.update(
+            {
+                "chat_history": history[-20:],
+                "chat_running": False,
+                "chat_error": str(result.get("error") or ""),
+                "chat_source": str(result.get("source") or "rule_fallback"),
+                "chat_context_label": str(result.get("context_label") or "当前快照 + 最近5分钟"),
+                "status": str(result.get("status") or self.ai_state.get("status") or "AI 对话完成"),
+                "config": self._public_ai_config(),
+            }
+        )
+        self._dirty = True
+
+    def _build_ai_chat_context(self) -> dict[str, Any]:
+        nodes = self._node_dicts()
+        recent_history = self._recent_history(300.0, 1200)
+        summary = build_detection_summary(
+            nodes,
+            self._recent_history(5.0, 1200),
+            presence_threshold=self.presence_threshold,
+            confidence_threshold=self.alarm_engine.confidence_threshold,
+        )
+        node_lines: list[str] = []
+        for node_id, node in sorted(nodes.items()):
+            if node.get("last_received") is None:
+                continue
+            node_lines.append(
+                (
+                    f"{node.get('label') or self._node_label(node_id)} "
+                    f"online={bool(node.get('online'))} "
+                    f"presence={_score(node.get('presence_score')):.2f} "
+                    f"motion={_score(node.get('motion_score')):.2f} "
+                    f"confidence={_score(node.get('confidence')):.2f} "
+                    f"gas_ppm={_float(node.get('gas_ppm')):.0f}"
+                )
+            )
+        event_lines = [
+            f"{event.title}: {event.message}"
+            for event in self.events[-8:]
+            if event.kind in {"ai", "alarm", "serial", "node", "config", "system"}
+        ]
+        thresholds = (
+            f"presence>={self.presence_threshold:.2f}, "
+            f"confidence>={self.alarm_engine.confidence_threshold:.2f}, "
+            f"gas>={self.gas_threshold:.0f}ppm"
+        )
+        detail = self.ai_state.get("detail") if isinstance(self.ai_state.get("detail"), dict) else {}
+        return {
+            "context_label": "当前快照 + 最近5分钟",
+            "status": summary.status,
+            "detail": summary.detail,
+            "participants": "、".join(summary.participant_labels) or "无",
+            "triggered": "、".join(summary.triggered_labels) or "无",
+            "summary_text": summary.summary_text,
+            "node_lines": node_lines,
+            "event_lines": event_lines,
+            "history_samples": len(recent_history),
+            "thresholds": thresholds,
+            "ai_detail": detail,
+        }
+
     def _schedule_ai_analysis(self, force: bool = False, manual: bool = False) -> None:
         summary = build_detection_summary(
             self._node_dicts(),
@@ -1922,6 +2073,7 @@ class DataManager(QObject):
         )
         self._refresh_ai_fallback(summary)
         self.ai_state["running"] = self._ai_busy
+        self.ai_state["chat_running"] = self._ai_chat_busy
         self.ai_state["jina_running"] = self.ai_runtime.is_running()
         self.ai_state["config"] = self._public_ai_config()
         self.snapshot_changed.emit(

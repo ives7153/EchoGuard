@@ -18,7 +18,7 @@ import time
 from typing import Any
 
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QApplication,
@@ -38,6 +38,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -67,6 +68,7 @@ try:
         SystemWarningBar,
         ThresholdSlider,
         TopologyWidget,
+        clear_layout,
     )
     from .icons import refresh_widget_icons
     from ..rules.detection_fusion import ai_fallback_text, build_detection_summary, life_motion_triggered, verdict_color_key
@@ -96,6 +98,7 @@ except ImportError:
         SystemWarningBar,
         ThresholdSlider,
         TopologyWidget,
+        clear_layout,
     )
     from ui.icons import refresh_widget_icons
     from rules.detection_fusion import ai_fallback_text, build_detection_summary, life_motion_triggered, verdict_color_key  # type: ignore
@@ -765,10 +768,6 @@ class DashboardPage(QWidget):
         controls.addWidget(self.pause_btn)
         controls.addWidget(self.detail_btn)
         controls.addStretch(1)
-        self.export_message = QLabel("")
-        self.export_message.setObjectName("SubtleText")
-        self.export_message.setMaximumWidth(230)
-        controls.addWidget(self.export_message)
         csv_btn = QPushButton("CSV 导出")
         csv_btn.setObjectName("PrimaryButton")
         csv_btn.clicked.connect(self.export_csv_requested.emit)
@@ -1245,10 +1244,6 @@ class DashboardPage(QWidget):
 
     def set_export_message(self, text: str, ok: bool = True) -> None:
         self._export_ok = ok
-        self.export_message.setText(text)
-        self.export_message.setStyleSheet(
-            f"color: {THEME['blue_soft'] if ok else THEME['red']};"
-        )
 
     def _update_metric_cards(self, state: dict[str, Any], config: dict[str, Any] | None = None) -> None:
         config = config or {}
@@ -1316,7 +1311,6 @@ class DashboardPage(QWidget):
         color = THEME[verdict_color_key(status)]
         self._last_verdict = (status, detail, color)
         self._apply_verdict_styles(color)
-        self.set_export_message(self.export_message.text(), self._export_ok)
         self.csi_plot.refresh_theme()
         self.event_panel.refresh_theme()
         self.topology_widget.update()
@@ -1821,6 +1815,7 @@ class AIAssistPage(QWidget):
         self._latest_snapshot: dict[str, Any] = {}
         self._detail_labels: dict[str, QLabel] = {}
         self._last_history_key: tuple[Any, ...] | None = None
+        self._last_chat_key: tuple[Any, ...] | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 22)
@@ -1847,9 +1842,88 @@ class AIAssistPage(QWidget):
         header.addWidget(self.refresh_detail_btn)
         layout.addLayout(header)
 
+        body = QHBoxLayout()
+        body.setSpacing(16)
+
+        chat_card = CardFrame()
+        chat_card.setMinimumWidth(520)
+        chat_layout = QVBoxLayout(chat_card)
+        chat_layout.setContentsMargins(18, 16, 18, 16)
+        chat_layout.setSpacing(12)
+
+        chat_header = QHBoxLayout()
+        chat_title_box = QVBoxLayout()
+        chat_title_box.setSpacing(2)
+        chat_title = QLabel("现场 AI 对话")
+        chat_title.setObjectName("SectionTitle")
+        self.chat_context_label = QLabel("上下文：当前快照 + 最近5分钟")
+        self.chat_context_label.setObjectName("SectionSub")
+        chat_title_box.addWidget(chat_title)
+        chat_title_box.addWidget(self.chat_context_label)
+        chat_header.addLayout(chat_title_box)
+        chat_header.addStretch(1)
+        self.clear_chat_btn = QPushButton("清空对话")
+        self.clear_chat_btn.setObjectName("GhostButton")
+        self.clear_chat_btn.clicked.connect(lambda: self.ai_action_requested.emit({"action": "clear_ai_chat"}))
+        chat_header.addWidget(self.clear_chat_btn)
+        chat_layout.addLayout(chat_header)
+
+        quick_row = QGridLayout()
+        quick_row.setHorizontalSpacing(8)
+        quick_row.setVerticalSpacing(8)
+        quick_questions = ("为什么低置信？", "哪个节点最关键？", "CO2/空气质量怎么看？", "下一步怎么排查？", "当前是否需要复核？")
+        for index, text in enumerate(quick_questions):
+            btn = QPushButton(text)
+            btn.setObjectName("GhostButton")
+            btn.clicked.connect(lambda _checked=False, value=text: self._ask_ai(value))
+            quick_row.addWidget(btn, index // 3, index % 3)
+        chat_layout.addLayout(quick_row)
+
+        self.chat_scroll = QScrollArea()
+        self.chat_scroll.setWidgetResizable(True)
+        self.chat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.chat_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.chat_scroll.setMinimumHeight(420)
+        self.chat_container = QWidget()
+        self.chat_messages_layout = QVBoxLayout(self.chat_container)
+        self.chat_messages_layout.setContentsMargins(0, 4, 0, 4)
+        self.chat_messages_layout.setSpacing(10)
+        self.chat_messages_layout.addStretch(1)
+        self.chat_scroll.setWidget(self.chat_container)
+        chat_layout.addWidget(self.chat_scroll, 1)
+
+        input_row = QHBoxLayout()
+        input_row.setSpacing(10)
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("询问当前研判、节点贡献、CO2 或下一步排查...")
+        self.chat_input.returnPressed.connect(self._ask_ai)
+        self.chat_send_btn = QPushButton("发送")
+        self.chat_send_btn.setObjectName("PrimaryButton")
+        self.chat_send_btn.clicked.connect(self._ask_ai)
+        input_row.addWidget(self.chat_input, 1)
+        input_row.addWidget(self.chat_send_btn)
+        chat_layout.addLayout(input_row)
+        self.chat_error_label = QLabel("")
+        self.chat_error_label.setObjectName("SectionSub")
+        self.chat_error_label.setWordWrap(True)
+        chat_layout.addWidget(self.chat_error_label)
+        body.addWidget(chat_card, 5)
+
+        context_scroll = QScrollArea()
+        context_scroll.setWidgetResizable(True)
+        context_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        context_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        context_scroll.setMinimumWidth(410)
+        context_scroll.setMaximumWidth(480)
+        context_rail = QWidget()
+        context_rail.setMinimumWidth(390)
+        context_layout = QVBoxLayout(context_rail)
+        context_layout.setContentsMargins(2, 2, 10, 2)
+        context_layout.setSpacing(18)
+
         cards = QGridLayout()
-        cards.setHorizontalSpacing(16)
-        cards.setVerticalSpacing(16)
+        cards.setHorizontalSpacing(14)
+        cards.setVerticalSpacing(14)
         self.ai_cards: dict[str, MetricCard] = {
             "status": MetricCard("当前主判断\n(VERDICT)", "等待数据", "规则融合"),
             "source": MetricCard("AI 来源\n(SOURCE)", "规则回退", "离线可用"),
@@ -1857,35 +1931,33 @@ class AIAssistPage(QWidget):
             "participants": MetricCard("参与节点\n(NODES)", "0", "最近窗口"),
         }
         for index, card in enumerate(self.ai_cards.values()):
-            cards.addWidget(card, 0, index)
-        layout.addLayout(cards)
+            cards.addWidget(card, index // 2, index % 2)
+        context_layout.addLayout(cards)
 
         detail_grid = QGridLayout()
-        detail_grid.setHorizontalSpacing(16)
-        detail_grid.setVerticalSpacing(16)
+        detail_grid.setHorizontalSpacing(14)
+        detail_grid.setVerticalSpacing(14)
         for index, (key, title_text) in enumerate(self._DETAIL_TITLES):
             card = CardFrame()
             card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(18, 16, 18, 16)
+            card_layout.setContentsMargins(16, 14, 16, 14)
             card_layout.setSpacing(8)
             title_label = QLabel(title_text)
             title_label.setObjectName("SectionTitle")
-            body = QLabel("等待 AI 或规则融合生成详情")
-            body.setObjectName("SubtleText")
-            body.setWordWrap(True)
-            body.setMinimumHeight(54)
-            body.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+            body_label = QLabel("等待 AI 或规则融合生成详情")
+            body_label.setObjectName("SubtleText")
+            body_label.setWordWrap(True)
+            body_label.setMinimumHeight(58)
+            body_label.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
             card_layout.addWidget(title_label)
-            card_layout.addWidget(body, 1)
-            self._detail_labels[key] = body
+            card_layout.addWidget(body_label, 1)
+            self._detail_labels[key] = body_label
             detail_grid.addWidget(card, index // 2, index % 2)
-        layout.addLayout(detail_grid)
+        context_layout.addLayout(detail_grid)
 
-        middle = QHBoxLayout()
-        middle.setSpacing(16)
         contribution_card = CardFrame()
         contribution_layout = QVBoxLayout(contribution_card)
-        contribution_layout.setContentsMargins(18, 16, 18, 16)
+        contribution_layout.setContentsMargins(16, 14, 16, 14)
         contribution_layout.setSpacing(10)
         contribution_title = QLabel("节点贡献 (NODE CONTRIBUTION)")
         contribution_title.setObjectName("SectionTitle")
@@ -1900,13 +1972,15 @@ class AIAssistPage(QWidget):
         contribution_header = self.contribution_table.horizontalHeader()
         for col in range(self.contribution_table.columnCount()):
             contribution_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        self.contribution_table.setMinimumHeight(180)
+        self.contribution_table.setMaximumHeight(260)
         contribution_layout.addWidget(contribution_title)
         contribution_layout.addWidget(self.contribution_table)
-        middle.addWidget(contribution_card, 3)
+        context_layout.addWidget(contribution_card)
 
         history_card = CardFrame()
         history_layout = QVBoxLayout(history_card)
-        history_layout.setContentsMargins(18, 16, 18, 16)
+        history_layout.setContentsMargins(16, 14, 16, 14)
         history_layout.setSpacing(10)
         history_title = QLabel("AI 研判历史 (AI HISTORY)")
         history_title.setObjectName("SectionTitle")
@@ -1927,10 +2001,15 @@ class AIAssistPage(QWidget):
         history_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         history_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.history_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.history_table.setMinimumHeight(240)
         history_layout.addWidget(history_title)
         history_layout.addWidget(self.history_table)
-        middle.addWidget(history_card, 4)
-        layout.addLayout(middle, 1)
+        context_layout.addWidget(history_card)
+        context_layout.addStretch(1)
+
+        context_scroll.setWidget(context_rail)
+        body.addWidget(context_scroll, 3)
+        layout.addLayout(body, 1)
 
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
         self._latest_snapshot = snapshot
@@ -1957,14 +2036,135 @@ class AIAssistPage(QWidget):
         )
         self.refresh_detail_btn.setEnabled(not bool(ai_state.get("running")))
         self.refresh_detail_btn.setText("生成中..." if ai_state.get("running") else "刷新研判")
+        chat_running = bool(ai_state.get("chat_running"))
+        self.chat_send_btn.setEnabled(not chat_running)
+        self.chat_send_btn.setText("生成中..." if chat_running else "发送")
+        self.chat_input.setEnabled(not chat_running)
+        self.clear_chat_btn.setEnabled(not chat_running)
+        self.chat_context_label.setText(
+            f"上下文：{str(ai_state.get('chat_context_label') or '当前快照 + 最近5分钟')}"
+        )
+        chat_error = str(ai_state.get("chat_error") or "")
+        if chat_error:
+            self.chat_error_label.setText(f"提示：{chat_error}")
+        else:
+            chat_source = self._source_label(str(ai_state.get("chat_source") or "rule_fallback"))
+            self.chat_error_label.setText(f"回答来源：{chat_source} · AI 不改变报警和主判断")
 
         for key, _title in self._DETAIL_TITLES:
             text = str(detail.get(key) or "暂无详情，等待有效样本或 AI 结果")
             self._detail_labels[key].setText(text)
             self._detail_labels[key].setToolTip(text)
 
+        self._render_chat_history(list(ai_state.get("chat_history") or []), chat_running)
         self._render_contribution_table(summary, nodes)
         self._render_history_table(list(ai_state.get("detail_history") or []))
+
+    def _ask_ai(self, text: str | None = None) -> None:
+        question = str(text if text is not None else self.chat_input.text()).strip()
+        if not question:
+            self.chat_error_label.setText("提示：请输入要询问的问题")
+            return
+        self.ai_action_requested.emit({"action": "ask_ai_chat", "question": question})
+        if text is None:
+            self.chat_input.clear()
+        self._schedule_chat_scroll_to_bottom()
+
+    def _render_chat_history(self, history: list[dict[str, Any]], running: bool) -> None:
+        chat_key = tuple((item.get("role"), item.get("content"), item.get("source")) for item in history)
+        full_key = chat_key + (("running", running),)
+        if full_key == self._last_chat_key:
+            return
+        self._last_chat_key = full_key
+        while self.chat_messages_layout.count() > 1:
+            item = self.chat_messages_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+                continue
+            sub_layout = item.layout()
+            if sub_layout is not None:
+                clear_layout(sub_layout)
+        if not history:
+            self._add_markdown_turn(
+                "",
+                "可以问我当前为什么低置信、哪个节点贡献最大、CO2/空气质量怎么看，或下一步如何排查。",
+            )
+        else:
+            pending_question = ""
+            for item in history:
+                role = str(item.get("role") or "assistant")
+                content = str(item.get("content") or "")
+                if role == "user":
+                    if pending_question:
+                        self._add_markdown_turn(pending_question, "")
+                    pending_question = content
+                else:
+                    self._add_markdown_turn(pending_question, content)
+                    pending_question = ""
+            if pending_question:
+                self._add_markdown_turn(pending_question, "生成中..." if running else "")
+            elif running:
+                self._add_markdown_turn("", "生成中...")
+        self._schedule_chat_scroll_to_bottom()
+
+    def _add_markdown_turn(self, question: str, answer: str) -> None:
+        turn = QFrame()
+        turn.setObjectName("AIChatTurn")
+        turn_layout = QVBoxLayout(turn)
+        turn_layout.setContentsMargins(14, 12, 14, 12)
+        turn_layout.setSpacing(10)
+
+        if question:
+            question_title = QLabel("用户问题")
+            question_title.setObjectName("SectionSub")
+            question_text = QLabel(question)
+            question_text.setWordWrap(True)
+            question_text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            question_text.setStyleSheet(f"color: {THEME['text']}; font-size: 13px; line-height: 19px;")
+            turn_layout.addWidget(question_title)
+            turn_layout.addWidget(question_text)
+
+        if answer:
+            answer_title = QLabel("AI 回复")
+            answer_title.setObjectName("SectionSub")
+            answer_view = QTextBrowser()
+            answer_view.setFrameShape(QFrame.Shape.NoFrame)
+            answer_view.setOpenExternalLinks(False)
+            answer_view.setReadOnly(True)
+            answer_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            answer_view.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            answer_view.setMarkdown(answer)
+            answer_view.setStyleSheet(
+                f"QTextBrowser {{ background: transparent; color: {THEME['text']};"
+                " border: 0; font-size: 13px; line-height: 20px; }}"
+            )
+            turn_layout.addWidget(answer_title)
+            turn_layout.addWidget(answer_view)
+            QTimer.singleShot(0, lambda view=answer_view: self._fit_markdown_view(view))
+            QTimer.singleShot(80, lambda view=answer_view: self._fit_markdown_view(view))
+
+        turn.setStyleSheet(
+            f"QFrame#AIChatTurn {{ background: {THEME['card_alt']};"
+            f" border: 1px solid {THEME['border']}; border-radius: 8px; }}"
+        )
+        insert_at = max(0, self.chat_messages_layout.count() - 1)
+        self.chat_messages_layout.insertWidget(insert_at, turn)
+
+    def _fit_markdown_view(self, view: QTextBrowser) -> None:
+        width = max(240, view.viewport().width())
+        view.document().setTextWidth(width)
+        height = int(view.document().size().height()) + 8
+        view.setFixedHeight(max(42, min(height, 520)))
+
+    def _schedule_chat_scroll_to_bottom(self) -> None:
+        QTimer.singleShot(0, self._scroll_chat_to_bottom)
+        QTimer.singleShot(80, self._scroll_chat_to_bottom)
+        QTimer.singleShot(180, self._scroll_chat_to_bottom)
+
+    def _scroll_chat_to_bottom(self) -> None:
+        bar = self.chat_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _fallback_detail(self, summary: Any, ai_state: dict[str, Any]) -> dict[str, str]:
         status = str(getattr(summary, "status", "等待数据"))
@@ -2549,9 +2749,6 @@ class HistoryPage(QWidget):
         header.addWidget(export_filter_btn)
         header.addWidget(clear_btn)
         layout.addLayout(header)
-        self.export_message = QLabel("")
-        self.export_message.setObjectName("SubtleText")
-        layout.addWidget(self.export_message)
         self.empty_label = QLabel("暂无历史样本，请连接网关后开始采集")
         self.empty_label.setObjectName("SubtleText")
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2696,14 +2893,9 @@ class HistoryPage(QWidget):
 
     def set_export_message(self, text: str, ok: bool = True) -> None:
         self._export_ok = ok
-        self.export_message.setText(text)
-        self.export_message.setStyleSheet(
-            f"color: {THEME['blue_soft'] if ok else THEME['red']};"
-        )
 
     def refresh_theme(self) -> None:
         self.empty_label.setStyleSheet(f"color: {THEME['muted']}; padding: 8px;")
-        self.set_export_message(self.export_message.text(), self._export_ok)
         refresh_widget_icons(self)
 
     def showEvent(self, event: object) -> None:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -115,6 +115,75 @@ class NavItem(QFrame):
         return THEME["blue_bright"] if selected else THEME["text_soft"]
 
 
+class ToastStack(QWidget):
+    """右上角全局 Toast 通知容器。"""
+
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFixedWidth(340)
+        self.setObjectName("ToastStack")
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(10)
+        self._layout.addStretch(1)
+        self.hide()
+
+    def show_toast(self, text: str, ok: bool = True, timeout_ms: int = 3200) -> None:
+        toast = QFrame(self)
+        toast.setObjectName("Toast")
+        toast.setProperty("ok", ok)
+        toast.setMinimumHeight(54)
+        toast.setStyleSheet(self._toast_style(ok))
+        layout = QVBoxLayout(toast)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(2)
+        title = QLabel(self._title(text, ok))
+        title.setStyleSheet(f"color: {THEME['text']}; font-size: 13px; font-weight: 700;")
+        detail = QLabel(self._detail(text))
+        detail.setWordWrap(True)
+        detail.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 12px;")
+        layout.addWidget(title)
+        if detail.text():
+            layout.addWidget(detail)
+        insert_at = max(0, self._layout.count() - 1)
+        self._layout.insertWidget(insert_at, toast)
+        self.show()
+        self.raise_()
+        QTimer.singleShot(timeout_ms, lambda item=toast: self._remove_toast(item))
+
+    def _remove_toast(self, toast: QFrame) -> None:
+        self._layout.removeWidget(toast)
+        toast.setParent(None)
+        toast.deleteLater()
+        if self._layout.count() <= 1:
+            self.hide()
+
+    def _toast_style(self, ok: bool) -> str:
+        accent = THEME["green"] if ok else THEME["red"]
+        return (
+            f"QFrame#Toast {{ background: {THEME['card']}; border: 1px solid {THEME['border']};"
+            " border-radius: 8px;"
+            f" border-left: 4px solid {accent}; }}"
+        )
+
+    @staticmethod
+    def _title(text: str, ok: bool) -> str:
+        if not ok:
+            return "操作失败"
+        if "CSV" in text:
+            return "CSV 导出完成"
+        if "截图" in text:
+            return "截图已保存"
+        return "操作完成"
+
+    @staticmethod
+    def _detail(text: str) -> str:
+        if "：" in text:
+            return text.split("：", 1)[1].strip()
+        return text.strip()
+
+
 class MainWindow(QMainWindow):
     """EchoGuard 控制台主窗口。"""
 
@@ -170,6 +239,7 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         root = QWidget()
         root.setObjectName("Root")
+        self.root_widget = root
         self.setCentralWidget(root)
 
         root_layout = QVBoxLayout(root)
@@ -183,6 +253,8 @@ class MainWindow(QMainWindow):
         body.addWidget(self._build_left_nav())
         body.addWidget(self._build_stack(), 1)
         root_layout.addLayout(body, 1)
+        self.toast_stack = ToastStack(root)
+        self._position_toasts()
 
     def _build_top_bar(self) -> QWidget:
         top = QFrame()
@@ -395,8 +467,8 @@ class MainWindow(QMainWindow):
         self.latest_frame_label.setText(text)
 
     def show_export_message(self, text: str, ok: bool = True) -> None:
-        self.dashboard_page.set_export_message(text, ok)
-        self.history_page.set_export_message(text, ok)
+        self.toast_stack.show_toast(text, ok)
+        self._position_toasts()
 
     def show_ai_operation_message(self, text: str, ok: bool = True) -> None:
         self.dashboard_page.set_ai_operation_message(text, ok)
@@ -454,3 +526,20 @@ class MainWindow(QMainWindow):
             if callable(refresh):
                 refresh()
         refresh_widget_icons(self)
+        if hasattr(self, "toast_stack"):
+            self.toast_stack.raise_()
+
+    def resizeEvent(self, event: object) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._position_toasts()
+
+    def _position_toasts(self) -> None:
+        if not hasattr(self, "toast_stack") or not hasattr(self, "root_widget"):
+            return
+        margin = 22
+        top = 76
+        width = self.toast_stack.width()
+        x = max(margin, self.root_widget.width() - width - margin)
+        height = max(120, self.root_widget.height() - top - margin)
+        self.toast_stack.setGeometry(x, top, width, height)
+        self.toast_stack.raise_()

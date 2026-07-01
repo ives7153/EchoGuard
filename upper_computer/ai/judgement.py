@@ -211,6 +211,68 @@ def run_ai_judgement(settings: AISettings, summary: DetectionSummary) -> dict[st
     return result
 
 
+def run_ai_chat(
+    settings: AISettings,
+    question: str,
+    context: dict[str, Any],
+    history: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    """回答 AI 辅助页对话问题；只解释快照，不参与主判断。"""
+
+    cleaned_question = _sanitize_ai_text(question)
+    if not cleaned_question:
+        raise RuntimeError("请输入要询问的问题")
+
+    now = time.time()
+    result: dict[str, Any] = {
+        "answer": "",
+        "source": "rule_fallback",
+        "status": "规则回退回答",
+        "error": "",
+        "updated_at": now,
+        "retrieved": [],
+        "context_label": str(context.get("context_label") or "当前快照 + 最近5分钟"),
+    }
+
+    if _is_model_identity_question(cleaned_question):
+        result["answer"] = _model_identity_answer(settings)
+        if settings.enabled and settings.llm_enabled and settings.llm_model:
+            result["source"] = "llm_api"
+            result["status"] = "模型身份说明"
+        elif settings.enabled and settings.embedding_enabled:
+            result["source"] = "local_jina"
+            result["status"] = "本地模型身份说明"
+        return result
+
+    snippets: list[dict[str, Any]] = []
+    if settings.enabled and settings.embedding_enabled:
+        try:
+            snippets = retrieve_chat_snippets(settings, cleaned_question)
+            result["source"] = "local_jina"
+            result["status"] = "本地 Jina 检索回答"
+        except Exception as exc:  # noqa: BLE001 - 对话失败不能影响主业务。
+            result["error"] = str(exc)
+
+    if not snippets:
+        snippets = _fallback_chat_snippets(cleaned_question)
+    result["retrieved"] = snippets[:3]
+
+    if settings.enabled and settings.llm_enabled and settings.llm_base_url and settings.llm_model:
+        try:
+            result["answer"] = _visible_chat_answer(
+                generate_llm_chat_answer(settings, cleaned_question, context, snippets, history or [])
+            )
+            result["source"] = "llm_api"
+            result["status"] = "大模型现场问答完成"
+            result["error"] = ""
+            return result
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = str(exc)
+
+    result["answer"] = build_local_chat_answer(cleaned_question, context, snippets)
+    return result
+
+
 def test_embedding(settings: AISettings, text: str = "EchoGuard AI 辅助研判测试") -> dict[str, Any]:
     vectors = embed_texts(settings, [text])
     vector = vectors[0] if vectors else []
@@ -522,6 +584,25 @@ def match_with_jina(settings: AISettings, summary_text: str) -> list[dict[str, A
     return sorted(matches, key=lambda item: item["score"], reverse=True)[:3]
 
 
+def retrieve_chat_snippets(settings: AISettings, question: str, limit: int = 3) -> list[dict[str, Any]]:
+    inputs = [question] + [snippet["text"] for snippet in _CHAT_SNIPPETS]
+    vectors = embed_texts(settings, inputs)
+    if len(vectors) < len(inputs):
+        raise RuntimeError("embedding 返回数量不足")
+    current = vectors[0]
+    matches: list[dict[str, Any]] = []
+    for snippet, vector in zip(_CHAT_SNIPPETS, vectors[1:], strict=False):
+        matches.append(
+            {
+                "label": snippet["label"],
+                "text": snippet["text"],
+                "answer": snippet["answer"],
+                "score": round(_cosine(current, vector), 4),
+            }
+        )
+    return sorted(matches, key=lambda item: item["score"], reverse=True)[:limit]
+
+
 def embed_texts(settings: AISettings, texts: list[str]) -> list[list[float]]:
     payload = {
         "model": settings.embedding_model or DEFAULT_EMBEDDING_MODEL,
@@ -684,6 +765,56 @@ def generate_llm_detail(
     return fallback
 
 
+def generate_llm_chat_answer(
+    settings: AISettings,
+    question: str,
+    context: dict[str, Any],
+    snippets: list[dict[str, Any]],
+    history: list[dict[str, str]],
+) -> str:
+    snippet_text = "\n".join(
+        f"- {item.get('label')}：{item.get('answer')}" for item in snippets[:3]
+    ) or "无"
+    recent_dialog = "\n".join(
+        f"{item.get('role', 'user')}：{item.get('content', '')}" for item in history[-6:]
+    ) or "无"
+    user_text = (
+        f"用户问题：{question}\n\n"
+        f"当前现场上下文：\n{_format_chat_context(context)}\n\n"
+        f"本地检索片段：\n{snippet_text}\n\n"
+        f"最近对话：\n{recent_dialog}\n\n"
+        "请用中文直接给出简短回复，控制在 80 字以内。"
+        "不要使用“建议：”“下一步建议：”这类固定前缀。"
+        "不要复述规则结论、参与节点、触发节点、时间窗口、依据、上下文。"
+        "不能确认生命存在，不能替代现场复核，不能声称已看到原始 CSI。"
+    )
+    content = _chat_completion(
+        settings,
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是 EchoGuard 灾后救援上位机的 AI 辅助助手。"
+                    "你只解释规则融合、节点数据质量和现场排查建议，不改变报警结论。"
+                ),
+            },
+            {"role": "user", "content": user_text},
+        ],
+        max_tokens=300,
+    )
+    return _visible_chat_answer(content)
+
+
+def build_local_chat_answer(
+    question: str,
+    context: dict[str, Any],
+    snippets: list[dict[str, Any]] | None = None,
+) -> str:
+    best = (snippets or [{}])[0]
+    base_answer = str(best.get("answer") or _keyword_chat_answer(question))
+    return _visible_chat_answer(base_answer)
+
+
 def _chat_completion(settings: AISettings, messages: list[dict[str, str]], max_tokens: int) -> str:
     content, _status, _endpoint = _chat_completion_result(settings, messages, max_tokens)
     return content
@@ -831,6 +962,142 @@ def _limit_detail_text(text: str, limit: int = 92) -> str:
     if len(cleaned) <= limit:
         return cleaned
     return cleaned[: limit - 3] + "..."
+
+
+def _limit_chat_answer(text: str, limit: int = 220) -> str:
+    cleaned = _sanitize_ai_text(text)
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
+
+
+def _visible_chat_answer(text: str, limit: int = 160) -> str:
+    cleaned = _sanitize_ai_text(text)
+    blocked_prefixes = (
+        "当前规则结论为",
+        "规则结论为",
+        "参与节点",
+        "触发节点",
+        "时间窗口",
+        "依据当前",
+        "依据：",
+        "风险：",
+    )
+    for prefix in blocked_prefixes:
+        if cleaned.startswith(prefix):
+            marker = "建议"
+            index = cleaned.find(marker)
+            if index >= 0:
+                cleaned = cleaned[index:]
+                break
+    cleaned = cleaned.replace("下一步建议保持", "下一步建议：保持")
+    cleaned = cleaned.replace("建议：下一步建议：", "下一步建议：")
+    for prefix in ("下一步建议：", "下一步建议", "建议：", "建议"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix) :].lstrip("：: ，,")
+            break
+    if len(cleaned) <= limit:
+        return cleaned
+    return cleaned[: limit - 3] + "..."
+
+
+def _is_model_identity_question(question: str) -> bool:
+    lowered = question.lower()
+    model_words = ("模型", "底层", "model", "llm", "glm", "gpt", "jina")
+    identity_words = ("你是", "你叫", "身份", "谁", "什么")
+    return any(word in lowered or word in question for word in model_words) and any(
+        word in lowered or word in question for word in identity_words
+    )
+
+
+def _model_identity_answer(settings: AISettings) -> str:
+    lines = ["我是 EchoGuard 的 AI 辅助助手，负责解释当前研判、节点数据和现场复核思路，不参与报警触发。"]
+    if settings.enabled and settings.llm_enabled and settings.llm_model:
+        lines.append(f"当前底层语言模型是 {_llm_model_label(settings)}。")
+        if settings.embedding_enabled:
+            lines.append("本地 Jina embedding 只用于相似问题检索，不负责生成对话。")
+    elif settings.enabled and settings.embedding_enabled:
+        lines.append("当前使用本地 Jina embedding 做问题匹配，并结合 EchoGuard 规则模板生成回复。")
+        lines.append("Jina 是向量检索模型，不是聊天大模型。")
+    else:
+        lines.append("当前没有可用的大模型或本地 Jina 服务，正在使用 EchoGuard 内置规则模板回答。")
+    lines.append("EchoGuard 规则融合负责现场判断，我只提供解释和复核建议。")
+    return "\n\n".join(lines)
+
+
+def _llm_model_label(settings: AISettings) -> str:
+    provider = _normalize_provider(settings.llm_provider, asdict(settings))
+    model = _normalize_model(settings.llm_model, provider) or str(settings.llm_model or "未配置模型")
+    if provider == "zhipu_glm":
+        return f"智谱 {model.upper()}"
+    if provider == "openai_compatible":
+        return f"OpenAI 兼容接口中的 {model}"
+    if provider == "custom":
+        return f"自定义接口中的 {model}"
+    return model
+
+
+def _format_chat_context(context: dict[str, Any]) -> str:
+    lines = [
+        f"上下文范围：{context.get('context_label') or '当前快照 + 最近5分钟'}",
+        f"规则结论：{context.get('status') or '等待数据'}",
+        f"规则详情：{context.get('detail') or '无'}",
+        f"参与节点：{context.get('participants') or '无'}",
+        f"触发节点：{context.get('triggered') or '无'}",
+        f"阈值：{context.get('thresholds') or '默认阈值'}",
+    ]
+    node_lines = list(context.get("node_lines") or [])
+    event_lines = list(context.get("event_lines") or [])
+    ai_detail = context.get("ai_detail") if isinstance(context.get("ai_detail"), dict) else {}
+    if node_lines:
+        lines.append("节点状态：" + "；".join(str(item) for item in node_lines[:6]))
+    if event_lines:
+        lines.append("最近事件：" + "；".join(str(item) for item in event_lines[:8]))
+    if ai_detail:
+        lines.append(
+            "当前AI详情："
+            + "；".join(
+                str(ai_detail.get(key) or "")
+                for key in ("basis", "risk", "trend", "advice")
+                if ai_detail.get(key)
+            )
+        )
+    return "\n".join(line for line in lines if line.strip())
+
+
+def _fallback_chat_snippets(question: str) -> list[dict[str, Any]]:
+    question_lower = question.lower()
+    scored: list[tuple[int, dict[str, str]]] = []
+    for snippet in _CHAT_SNIPPETS:
+        score = 0
+        haystack = f"{snippet['label']} {snippet['text']}".lower()
+        for token in ("低置信", "置信", "confidence", "节点", "co2", "ppm", "空气", "校准", "下一步", "排查", "复核", "多节点", "触发"):
+            if token in question_lower and token in haystack:
+                score += 1
+        scored.append((score, snippet))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [
+        {
+            "label": item["label"],
+            "text": item["text"],
+            "answer": item["answer"],
+            "score": float(score),
+        }
+        for score, item in scored[:3]
+    ]
+
+
+def _keyword_chat_answer(question: str) -> str:
+    lowered = question.lower()
+    if "co2" in lowered or "ppm" in lowered or "空气" in question or "mq135" in lowered:
+        return "CO2/空气质量为 MQ135 估算值，受预热、R0 校准和环境气体影响较大，建议先确认按节点校准并观察趋势。"
+    if "低置信" in question or "置信" in question or "confidence" in lowered:
+        return "低置信通常来自 CSI 样本不足、RSSI 偏弱、基线未稳定或单点扰动，建议先看样本连续性和相邻节点支持。"
+    if "哪个" in question and "节点" in question:
+        return "优先看触发节点、presence 均值、confidence 均值和 motion 峰值；单节点强响应仍需要相邻节点交叉支持。"
+    if "下一步" in question or "排查" in question or "怎么办" in question:
+        return "保持采集，确认 Gateway 和节点在线，复核触发覆盖区，同时结合声音、热源、人工搜索等手段交叉判断。"
+    return "建议围绕当前规则结论、触发节点、置信度和最近事件继续复核；AI 只做解释，不替代现场确认。"
 
 
 def _request_json(
@@ -1163,5 +1430,39 @@ _TEMPLATES = (
         "label": "无有效数据",
         "text": "最近窗口内缺少有效 Gateway 串口样本，无法进行多节点融合判断。",
         "advice": "建议连接 Gateway 后继续采集",
+    },
+)
+
+
+_CHAT_SNIPPETS = (
+    {
+        "label": "低置信解释",
+        "text": "用户询问为什么低置信 confidence 偏低 CSI 样本不足 RSSI 弱 基线不稳定 单节点扰动",
+        "answer": "低置信多由 CSI 样本不足、WiFi RSSI 偏弱、基线未稳定或传感器状态不足导致，建议先看样本连续性和相邻节点支持。",
+    },
+    {
+        "label": "关键节点判断",
+        "text": "用户询问哪个节点最关键 节点贡献 触发节点 presence confidence motion 样本数",
+        "answer": "关键节点优先看触发状态、presence 均值、confidence 均值、motion 峰值和样本数；单节点强响应应等待相邻节点交叉验证。",
+    },
+    {
+        "label": "CO2/MQ135 校准",
+        "text": "用户询问 CO2 ppm MQ135 空气质量 校准 R0 清洁空气 节点独立校准",
+        "answer": "CO2 ppm 是 MQ135 估算值，受预热、R0、温湿度和混合气体影响明显；应按节点在清洁空气中校准并主要观察趋势。",
+    },
+    {
+        "label": "多节点触发解释",
+        "text": "用户询问多节点疑似生命微动 多节点触发 规则融合 交叉验证 覆盖区域",
+        "answer": "多节点同窗触发说明多个覆盖区域出现一致微动特征，可信度高于单节点，但仍只能作为疑似提示，需要现场复核。",
+    },
+    {
+        "label": "现场排查建议",
+        "text": "用户询问下一步 怎么处理 排查 复核 检查 Gateway 节点 现场搜救",
+        "answer": "保持采集，确认 Gateway 和节点在线，复核触发覆盖区，同时结合声音、热源、人工搜索等手段交叉判断。",
+    },
+    {
+        "label": "规则边界",
+        "text": "用户询问 AI 是否确认生命 是否报警 是否改变规则 融合架构 结论边界",
+        "answer": "AI 只解释当前规则融合和数据质量，不参与报警触发，不确认生命存在，也不改变节点、Gateway 或 LoRa 数据链路。",
     },
 )

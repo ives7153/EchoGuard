@@ -20,7 +20,7 @@ from pathlib import Path
 # 品牌与基础常量
 # ---------------------------------------------------------------------------
 BRAND_NAME = "EchoGuard"
-BRAND_VERSION = "v0.3.0"
+BRAND_VERSION = "v0.3.1"
 APP_TITLE = "EchoGuard"
 WINDOW_TITLE = "EchoGuard"
 CONTROL_ID = "0xFF-AD-01"
