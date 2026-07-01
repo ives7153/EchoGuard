@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <errno.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,6 +21,8 @@
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 #include "nvs_flash.h"
 
 /* 节点基本信息：STA 连接 Gateway 开放 SoftAP，用于获得稳定的 WiFi 包流并触发 CSI 回调。 */
@@ -32,11 +35,16 @@
 
 /* FreeRTOS 任务参数：本固件只创建 3 个业务任务，优先级与栈大小集中写在这里便于现场调整。 */
 #define WIFI_TASK_STACK_SIZE            4096
+#define UDP_KEEPALIVE_TASK_STACK_SIZE   4096
 #define CSI_SENSOR_TASK_STACK_SIZE      6144
 #define LORA_SEND_TASK_STACK_SIZE       4096
 #define WIFI_TASK_PRIORITY              5
+#define UDP_KEEPALIVE_TASK_PRIORITY     4
 #define CSI_SENSOR_TASK_PRIORITY        6
 #define LORA_SEND_TASK_PRIORITY         5
+
+/* Gateway 向该端口发送轻量 UDP keepalive，用于制造稳定 WiFi 下行包并触发 CSI 回调。 */
+#define UDP_KEEPALIVE_PORT              33333
 
 /* LoRa/SX1278 引脚定义：必须与 Gateway 和 hardware/readme.md 完全一致。 */
 #define LORA_SPI_HOST                   SPI2_HOST
@@ -190,6 +198,7 @@ static node_fusion_sample_t s_latest_sample = {
 
 static esp_err_t nvs_init_for_wifi(void);
 static void wifi_sta_task(void *arg);
+static void udp_keepalive_rx_task(void *arg);
 static void csi_sensor_task(void *arg);
 static void lora_send_task(void *arg);
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
@@ -235,13 +244,16 @@ void app_main(void)
 
     BaseType_t wifi_ok = xTaskCreate(wifi_sta_task, "wifi_sta", WIFI_TASK_STACK_SIZE,
                                      NULL, WIFI_TASK_PRIORITY, NULL);
+    BaseType_t udp_ok = xTaskCreate(udp_keepalive_rx_task, "udp_keepalive_rx",
+                                    UDP_KEEPALIVE_TASK_STACK_SIZE, NULL,
+                                    UDP_KEEPALIVE_TASK_PRIORITY, NULL);
     BaseType_t csi_ok = xTaskCreate(csi_sensor_task, "csi_sensor", CSI_SENSOR_TASK_STACK_SIZE,
                                     NULL, CSI_SENSOR_TASK_PRIORITY, NULL);
     BaseType_t lora_ok = xTaskCreate(lora_send_task, "lora_send", LORA_SEND_TASK_STACK_SIZE,
                                      NULL, LORA_SEND_TASK_PRIORITY, NULL);
 
-    if (wifi_ok != pdPASS || csi_ok != pdPASS || lora_ok != pdPASS) {
-        ESP_LOGE(TAG, "创建 3 个核心任务失败，请增大 heap 或检查 FreeRTOS 配置");
+    if (wifi_ok != pdPASS || udp_ok != pdPASS || csi_ok != pdPASS || lora_ok != pdPASS) {
+        ESP_LOGE(TAG, "创建核心任务失败，请增大 heap 或检查 FreeRTOS 配置");
     }
 }
 
@@ -353,6 +365,71 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGI(TAG, "WiFi 已连接 Gateway，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+    }
+}
+
+static void udp_keepalive_rx_task(void *arg)
+{
+    (void)arg;
+
+    uint32_t received = 0;
+
+    while (true) {
+        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGW(TAG, "UDP keepalive socket create failed: errno=%d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        struct sockaddr_in local_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(UDP_KEEPALIVE_PORT),
+            .sin_addr.s_addr = htonl(INADDR_ANY),
+        };
+        if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+            ESP_LOGW(TAG, "UDP keepalive bind failed: errno=%d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        struct timeval timeout = {
+            .tv_sec = 1,
+            .tv_usec = 0,
+        };
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        ESP_LOGI(TAG, "UDP keepalive listener ready on port %d", UDP_KEEPALIVE_PORT);
+
+        while ((xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0) {
+            char buffer[32];
+            struct sockaddr_in source_addr = {0};
+            socklen_t source_len = sizeof(source_addr);
+            int len = recvfrom(sock, buffer, sizeof(buffer) - 1, 0,
+                               (struct sockaddr *)&source_addr, &source_len);
+            if (len > 0) {
+                buffer[len] = '\0';
+                received++;
+                if (received == 1 || (received % 100U) == 0U) {
+                    esp_ip4_addr_t source_ip = {
+                        .addr = source_addr.sin_addr.s_addr,
+                    };
+                    ESP_LOGI(TAG, "UDP keepalive received count=%" PRIu32 " from=" IPSTR,
+                             received, IP2STR(&source_ip));
+                }
+                continue;
+            }
+
+            if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                ESP_LOGW(TAG, "UDP keepalive recv failed: errno=%d", errno);
+                break;
+            }
+        }
+
+        close(sock);
+        ESP_LOGI(TAG, "UDP keepalive listener stopped, waiting WiFi reconnect");
     }
 }
 
@@ -630,6 +707,13 @@ static void csi_features_to_scores(const csi_window_features_t *features,
     int csi_motion = (int)lroundf(excess * 7.0f + range_over_noise * 1.8f + norm_abs_dev * 1.0f);
     int imu_motion = (int)lroundf(accel_delta_g * 95.0f);
     int fused_motion = (int)lroundf(csi_motion * 0.75f + imu_motion * 0.25f);
+
+    bool imu_quiet = imu_motion <= 12;
+    bool csi_spiky_but_stable = imu_quiet && norm_abs_dev < 16.0f && norm_range > s_csi_noise_floor * 1.8f;
+    if (csi_spiky_but_stable) {
+        csi_presence = csi_presence > 55 ? 55 : csi_presence;
+        fused_motion = fused_motion > 35 ? 35 : fused_motion;
+    }
 
     sample->presence_score = clamp_u8_int(csi_presence);
     if ((!baseline_ready_before_update || excess < 0.4f) && imu_motion <= 35) {

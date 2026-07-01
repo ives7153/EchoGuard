@@ -1707,7 +1707,7 @@ class DataManager(QObject):
             {
                 "running": True,
                 "status": "AI 分析中",
-                "text": "AI辅助研判：分析中... 规则结论已实时刷新",
+                "text": str(self.ai_state.get("text") or ai_fallback_text(summary.status, summary)),
                 "state_key": summary.state_key,
                 "window_start": summary.window_start,
                 "window_end": summary.window_end,
@@ -1740,7 +1740,7 @@ class DataManager(QObject):
                 {
                     "running": False,
                     "status": "上一轮 AI 结果已过期，等待更新",
-                    "text": ai_fallback_text(current_summary.status),
+                    "text": ai_fallback_text(current_summary.status, current_summary),
                     "source": "rule_fallback",
                     "window_start": current_summary.window_start,
                     "window_end": current_summary.window_end,
@@ -1811,7 +1811,7 @@ class DataManager(QObject):
                 "enabled": self.ai_settings.enabled,
                 "running": False,
                 "status": "规则回退" if self.ai_settings.enabled else "AI 未启用，使用规则回退",
-                "text": ai_fallback_text(summary.status),
+                "text": ai_fallback_text(summary.status, summary),
                 "source": "rule_fallback",
                 "window_start": summary.window_start,
                 "window_end": summary.window_end,

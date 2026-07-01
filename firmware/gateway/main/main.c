@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,8 +14,11 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 #include "nvs_flash.h"
 
 /* Gateway 基本信息：开放 SoftAP，仅用于现场局域网发现与后续调试。 */
@@ -43,6 +47,13 @@
 #define WIFI_TASK_STACK_SIZE      4096
 #define LORA_TASK_STACK_SIZE      4096
 #define SERIAL_TASK_STACK_SIZE    4096
+#define UDP_KEEPALIVE_TASK_STACK_SIZE 4096
+
+/* Gateway 主动给 SoftAP 在线节点发 UDP 小包，制造稳定 WiFi 下行帧用于节点 CSI 采样。 */
+#define UDP_KEEPALIVE_PORT        33333
+#define UDP_KEEPALIVE_INTERVAL_MS 100
+
+#define WIFI_AP_STARTED_BIT       BIT0
 
 /* SX1278 常用寄存器地址。 */
 #define REG_FIFO                  0x00
@@ -93,9 +104,13 @@ typedef struct {
 
 static const char *TAG = "rescue_gateway";
 
+static EventGroupHandle_t s_wifi_event_group;
 static QueueHandle_t s_lora_queue;
 static spi_device_handle_t s_lora_spi;
+static esp_netif_t *s_softap_netif;
 
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
+static void udp_keepalive_task(void *arg);
 static esp_err_t lora_spi_bus_init_once(void);
 static esp_err_t lora_chip_configure(void);
 static void lora_set_op_mode(uint8_t mode);
@@ -120,7 +135,9 @@ static void wifi_softap_task(void *arg)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    s_softap_netif = esp_netif_create_default_wifi_ap();
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                        wifi_event_handler, NULL, NULL));
 
     wifi_init_config_t wifi_init_config = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wifi_init_config));
@@ -143,6 +160,7 @@ static void wifi_softap_task(void *arg)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    xEventGroupSetBits(s_wifi_event_group, WIFI_AP_STARTED_BIT);
 
     ESP_LOGI(TAG, "SoftAP started, ssid=%s, channel=%d, auth=open",
              WIFI_SOFTAP_SSID, WIFI_SOFTAP_CHANNEL);
@@ -151,6 +169,106 @@ static void wifi_softap_task(void *arg)
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(30000));
         ESP_LOGI(TAG, "SoftAP alive");
+    }
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+
+    if (event_base != WIFI_EVENT) {
+        return;
+    }
+
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+        wifi_event_ap_staconnected_t *event = (wifi_event_ap_staconnected_t *)event_data;
+        ESP_LOGI(TAG, "SoftAP STA connected mac=%02x:%02x:%02x:%02x:%02x:%02x aid=%d",
+                 event->mac[0], event->mac[1], event->mac[2],
+                 event->mac[3], event->mac[4], event->mac[5],
+                 event->aid);
+        return;
+    }
+
+    if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        wifi_event_ap_stadisconnected_t *event = (wifi_event_ap_stadisconnected_t *)event_data;
+        ESP_LOGI(TAG, "SoftAP STA disconnected mac=%02x:%02x:%02x:%02x:%02x:%02x aid=%d",
+                 event->mac[0], event->mac[1], event->mac[2],
+                 event->mac[3], event->mac[4], event->mac[5],
+                 event->aid);
+    }
+}
+
+static void udp_keepalive_task(void *arg)
+{
+    (void)arg;
+
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_AP_STARTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+
+    uint32_t seq = 0;
+    uint32_t warn_throttle = 0;
+
+    while (true) {
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGW(TAG, "UDP keepalive socket create failed: errno=%d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "UDP CSI keepalive started: port=%d interval=%dms",
+                 UDP_KEEPALIVE_PORT, UDP_KEEPALIVE_INTERVAL_MS);
+
+        while (true) {
+            wifi_sta_list_t wifi_sta_list = {0};
+            esp_err_t ret = esp_wifi_ap_get_sta_list(&wifi_sta_list);
+
+            if (ret == ESP_OK && wifi_sta_list.num > 0 && s_softap_netif != NULL) {
+                esp_netif_pair_mac_ip_t mac_ip_pairs[WIFI_SOFTAP_MAX_CONN] = {0};
+                uint8_t pair_count = wifi_sta_list.num;
+                if (pair_count > WIFI_SOFTAP_MAX_CONN) {
+                    pair_count = WIFI_SOFTAP_MAX_CONN;
+                }
+
+                for (int i = 0; i < pair_count; ++i) {
+                    memcpy(mac_ip_pairs[i].mac, wifi_sta_list.sta[i].mac, sizeof(mac_ip_pairs[i].mac));
+                }
+
+                ret = esp_netif_dhcps_get_clients_by_mac(s_softap_netif, pair_count, mac_ip_pairs);
+                if (ret != ESP_OK) {
+                    if ((warn_throttle++ % 50U) == 0U) {
+                        ESP_LOGW(TAG, "UDP keepalive DHCP client lookup unavailable: %s", esp_err_to_name(ret));
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(UDP_KEEPALIVE_INTERVAL_MS));
+                    continue;
+                }
+
+                for (int i = 0; i < pair_count; ++i) {
+                    uint32_t ip_addr = mac_ip_pairs[i].ip.addr;
+                    if (ip_addr == 0) {
+                        continue;
+                    }
+
+                    struct sockaddr_in dest = {
+                        .sin_family = AF_INET,
+                        .sin_port = htons(UDP_KEEPALIVE_PORT),
+                        .sin_addr.s_addr = ip_addr,
+                    };
+                    char payload[24] = {0};
+                    int payload_len = snprintf(payload, sizeof(payload), "EGCSI:%" PRIu32, seq++);
+                    int sent = sendto(sock, payload, payload_len, 0,
+                                      (struct sockaddr *)&dest, sizeof(dest));
+                    if (sent < 0 && (warn_throttle++ % 50U) == 0U) {
+                        ESP_LOGW(TAG, "UDP keepalive send failed ip=" IPSTR " errno=%d",
+                                 IP2STR(&mac_ip_pairs[i].ip), errno);
+                    }
+                }
+            }
+            else if (ret != ESP_OK && (warn_throttle++ % 50U) == 0U) {
+                ESP_LOGW(TAG, "UDP keepalive station list unavailable: %s", esp_err_to_name(ret));
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(UDP_KEEPALIVE_INTERVAL_MS));
+        }
     }
 }
 
@@ -232,20 +350,24 @@ void app_main(void)
 
     nvs_init_for_wifi();
 
+    s_wifi_event_group = xEventGroupCreate();
     s_lora_queue = xQueueCreate(LORA_QUEUE_LENGTH, sizeof(rescue_lora_packet_t));
-    if (s_lora_queue == NULL) {
-        ESP_LOGE(TAG, "Failed to create LoRa packet queue");
+    if (s_wifi_event_group == NULL || s_lora_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create WiFi event group or LoRa packet queue");
         return;
     }
 
     BaseType_t wifi_task_ok = xTaskCreate(wifi_softap_task, "wifi_softap", WIFI_TASK_STACK_SIZE,
                                           NULL, 5, NULL);
+    BaseType_t udp_task_ok = xTaskCreate(udp_keepalive_task, "udp_keepalive",
+                                         UDP_KEEPALIVE_TASK_STACK_SIZE, NULL, 4, NULL);
     BaseType_t lora_task_ok = xTaskCreate(lora_receive_task, "lora_receive", LORA_TASK_STACK_SIZE,
                                           NULL, 6, NULL);
     BaseType_t serial_task_ok = xTaskCreate(serial_forward_task, "serial_forward",
                                             SERIAL_TASK_STACK_SIZE, NULL, 5, NULL);
 
-    if (wifi_task_ok != pdPASS || lora_task_ok != pdPASS || serial_task_ok != pdPASS) {
+    if (wifi_task_ok != pdPASS || udp_task_ok != pdPASS ||
+        lora_task_ok != pdPASS || serial_task_ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create one or more gateway tasks");
     }
 }

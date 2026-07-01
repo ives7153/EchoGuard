@@ -165,15 +165,37 @@ def build_detection_summary(
     )
 
 
-def ai_fallback_text(status: str) -> str:
-    messages = {
-        "等待数据": "AI辅助研判：暂无有效样本，建议连接 Gateway 后继续采集",
-        "数据不足": "AI辅助研判：当前仅单节点参与，建议等待更多节点形成交叉验证",
-        "疑似局部微动": "AI辅助研判：单节点出现异常响应，建议继续观察并等待多节点支持",
-        "多节点疑似生命微动": "AI辅助研判：多节点在最近窗口内同时触发，支持继续重点观察",
-        "未检测到稳定微动": "AI辅助研判：多节点暂未形成稳定微动特征，建议保持采集",
-    }
-    return messages.get(status, "AI辅助研判：建议结合多节点数据继续观察")
+def ai_fallback_text(status: str, summary: DetectionSummary | None = None) -> str:
+    """生成不依赖大模型的现场辅助摘要。"""
+
+    if summary is None:
+        messages = {
+            "等待数据": "AI辅助研判：暂无有效样本，建议连接 Gateway 后继续采集",
+            "数据不足": "AI辅助研判：当前仅单节点参与，建议等待更多节点形成交叉验证",
+            "疑似局部微动": "AI辅助研判：单节点出现异常响应，建议继续观察并等待多节点支持",
+            "多节点疑似生命微动": "AI辅助研判：多节点同窗触发，建议重点复核覆盖区域并持续采集",
+            "未检测到稳定微动": "AI辅助研判：暂未形成稳定微动特征，建议保持采集并关注趋势",
+        }
+        return messages.get(status, "AI辅助研判：建议结合多节点数据继续观察")
+
+    participants = len(summary.participant_ids)
+    triggered = len(summary.triggered_ids)
+    window = f"{summary.window_seconds:.0f}秒"
+    trigger_text = _join_labels(summary.triggered_labels, "无")
+    participant_text = _join_labels(summary.participant_labels, "无")
+
+    if status == "等待数据":
+        return "AI辅助研判：等待 Gateway 有效样本，保持串口连接后继续采集"
+    if status == "数据不足":
+        return f"AI辅助研判：最近{window}仅{participants}个节点参与，建议等待更多节点交叉验证"
+    if status == "疑似局部微动":
+        node = trigger_text if triggered else participant_text
+        return f"AI辅助研判：{node}单点触发，建议复核覆盖区域并等待相邻节点支持"
+    if status == "多节点疑似生命微动":
+        return f"AI辅助研判：{trigger_text}在最近{window}同窗高置信触发，建议重点复核并持续采集"
+    if status == "未检测到稳定微动":
+        return f"AI辅助研判：最近{window}{participants}个节点未形成稳定微动，建议保持采集关注趋势"
+    return "AI辅助研判：建议结合触发节点、时间窗口和现场环境继续观察"
 
 
 def verdict_color_key(status: str) -> str:
@@ -248,6 +270,14 @@ def _build_summary_text(
         )
     lines.append(f"规则融合结果：{status}。")
     return "\n".join(lines)
+
+
+def _join_labels(labels: list[str], empty: str) -> str:
+    if not labels:
+        return empty
+    shown = labels[:3]
+    suffix = f"等{len(labels)}个节点" if len(labels) > len(shown) else ""
+    return "、".join(shown) + suffix
 
 
 def _node_label(

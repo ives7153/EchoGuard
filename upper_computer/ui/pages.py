@@ -700,7 +700,9 @@ class DashboardPage(QWidget):
         "多节点疑似生命微动": 4,
     }
     _VERDICT_MIN_HOLD_SECONDS = 2.0
-    _VERDICT_STABLE_SECONDS = 1.2
+    _VERDICT_STABLE_SECONDS = 1.5
+    _AI_TEXT_MIN_HOLD_SECONDS = 5.0
+    _AI_CARD_TEXT_LIMIT = 60
 
     def __init__(self) -> None:
         super().__init__()
@@ -721,6 +723,10 @@ class DashboardPage(QWidget):
         self._pending_verdict_summary: Any | None = None
         self._pending_verdict_since = 0.0
         self._display_verdict_since = 0.0
+        self._display_ai_text = ""
+        self._display_ai_tooltip = ""
+        self._display_ai_key = ""
+        self._display_ai_since = 0.0
         self._verdict_chips: dict[str, QLabel] = {}
         self._last_pause_text = ""
         self._last_group_values: dict[str, tuple[str, str]] = {}
@@ -778,12 +784,12 @@ class DashboardPage(QWidget):
         layout.addLayout(controls)
 
         self.verdict_card = CardFrame()
-        self.verdict_card.setFixedHeight(128)
+        self.verdict_card.setFixedHeight(156)
         verdict_layout = QHBoxLayout(self.verdict_card)
-        verdict_layout.setContentsMargins(18, 14, 18, 14)
-        verdict_layout.setSpacing(18)
+        verdict_layout.setContentsMargins(18, 12, 18, 12)
+        verdict_layout.setSpacing(16)
         verdict_title_box = QVBoxLayout()
-        verdict_title_box.setSpacing(6)
+        verdict_title_box.setSpacing(5)
         verdict_title = QLabel("综合研判结果")
         verdict_title.setObjectName("SectionTitle")
         verdict_subtitle = QLabel("基于多节点最近数据的辅助判断")
@@ -798,7 +804,7 @@ class DashboardPage(QWidget):
         verdict_title_box.addStretch(1)
 
         verdict_status_box = QVBoxLayout()
-        verdict_status_box.setSpacing(6)
+        verdict_status_box.setSpacing(5)
         self.verdict_status = QLabel("等待数据")
         self.verdict_status.setObjectName("MetricValue")
         self.verdict_meta = QLabel("规则融合 · 最近 5 秒 · 稳定显示")
@@ -809,6 +815,8 @@ class DashboardPage(QWidget):
         self.ai_verdict = QLabel("AI辅助研判：暂无有效样本，建议连接 Gateway 后继续采集")
         self.ai_verdict.setObjectName("SubtleText")
         self.ai_verdict.setWordWrap(True)
+        self.ai_verdict.setMaximumHeight(40)
+        self.ai_verdict.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         verdict_status_box.addWidget(self.verdict_status)
         verdict_status_box.addWidget(self.verdict_meta)
         verdict_status_box.addWidget(self.verdict_detail)
@@ -1134,14 +1142,8 @@ class DashboardPage(QWidget):
             self._pending_verdict_since = now
             return current
 
-        current_priority = self._VERDICT_PRIORITY.get(current.status, 0)
-        candidate_priority = self._VERDICT_PRIORITY.get(candidate.status, 0)
-        stable_seconds = (
-            0.25
-            if candidate_priority > current_priority and candidate_priority >= 4
-            else self._VERDICT_STABLE_SECONDS
-        )
-        hold_seconds = 0.4 if candidate_priority > current_priority else self._VERDICT_MIN_HOLD_SECONDS
+        stable_seconds = self._VERDICT_STABLE_SECONDS
+        hold_seconds = self._VERDICT_MIN_HOLD_SECONDS
         if (
             now - self._pending_verdict_since >= stable_seconds
             and now - self._display_verdict_since >= hold_seconds
@@ -1167,21 +1169,57 @@ class DashboardPage(QWidget):
         self._verdict_chips["updated"].setText(f"更新：{age:.0f}s前")
         self._apply_verdict_styles(color)
 
-        ai_text = str(ai_state.get("text") or ai_fallback_text(summary.status))
-        updated_at = _float(ai_state.get("updated_at"))
-        if updated_at > 0 and ai_state.get("source") != "rule_fallback":
-            ai_age = max(0.0, time.time() - updated_at)
-            ai_text = f"{ai_text}（{ai_age:.0f}s前）"
-        display_ai_text = ai_text if len(ai_text) <= 92 else ai_text[:89] + "..."
+        display_ai_text, tooltip = self._paced_ai_text(summary, ai_state)
         self.ai_verdict.setText(display_ai_text)
-        self.ai_verdict.setToolTip(ai_text)
+        self.ai_verdict.setToolTip(tooltip)
+
+    def _paced_ai_text(self, summary: Any, ai_state: dict[str, Any]) -> tuple[str, str]:
+        now = time.time()
+        raw_text = str(ai_state.get("text") or "").strip()
+        if not raw_text or "分析中" in raw_text:
+            raw_text = ai_fallback_text(summary.status, summary)
+
+        source = str(ai_state.get("source") or "rule_fallback")
+        state_key = str(ai_state.get("state_key") or summary.state_key)
+        candidate_key = f"{state_key}|{source}|{raw_text}"
+        updated_at = _float(ai_state.get("updated_at"))
+        tooltip = raw_text
+        if updated_at > 0 and source != "rule_fallback":
+            ai_age = max(0.0, now - updated_at)
+            tooltip = f"{raw_text}（{ai_age:.0f}s前）"
+
+        if not self._display_ai_text:
+            self._store_display_ai(raw_text, tooltip, candidate_key, now)
+        elif candidate_key != self._display_ai_key and now - self._display_ai_since >= self._AI_TEXT_MIN_HOLD_SECONDS:
+            self._store_display_ai(raw_text, tooltip, candidate_key, now)
+        elif candidate_key == self._display_ai_key:
+            self._display_ai_tooltip = tooltip
+
+        display_text = self._short_ai_text(self._display_ai_text)
+        display_tooltip = self._display_ai_tooltip or tooltip
+        if bool(ai_state.get("running")):
+            display_text = self._short_ai_text(f"{self._display_ai_text} · 更新中")
+            display_tooltip = f"{display_tooltip}\nAI 正在更新，上一条有效结论继续保留。"
+        return display_text, display_tooltip
+
+    def _store_display_ai(self, text: str, tooltip: str, key: str, now: float) -> None:
+        self._display_ai_text = text
+        self._display_ai_tooltip = tooltip
+        self._display_ai_key = key
+        self._display_ai_since = now
+
+    def _short_ai_text(self, text: str) -> str:
+        text = " ".join(str(text or "").split())
+        if len(text) <= self._AI_CARD_TEXT_LIMIT:
+            return text
+        return text[: self._AI_CARD_TEXT_LIMIT - 3] + "..."
 
     def _apply_verdict_styles(self, color: str) -> None:
         self.verdict_status.setStyleSheet(f"font-size: 25px; font-weight: 800; color: {color};")
         self.verdict_detail.setStyleSheet(f"color: {THEME['text_soft']}; font-size: 13px;")
         self.verdict_meta.setStyleSheet(f"color: {THEME['muted']}; font-size: 12px;")
         self.ai_verdict.setStyleSheet(
-            f"color: {THEME['blue_soft']}; font-size: 13px; font-weight: 600;"
+            f"color: {THEME['blue_soft']}; font-size: 12px; font-weight: 600; line-height: 18px;"
         )
         chip_style = (
             f"background: {THEME['card_alt']};"

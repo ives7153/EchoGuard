@@ -176,14 +176,14 @@ def run_ai_judgement(settings: AISettings, summary: DetectionSummary) -> dict[st
 
     result = _base_result(settings, summary)
     if not settings.enabled or not settings.embedding_enabled or not summary.participant_ids:
-        result["text"] = ai_fallback_text(summary.status)
+        result["text"] = ai_fallback_text(summary.status, summary)
         result["status"] = "规则回退"
         return result
 
     try:
         matches = match_with_jina(settings, summary.summary_text)
     except Exception as exc:  # noqa: BLE001 - AI 辅助失败不能影响主判断。
-        result["text"] = ai_fallback_text(summary.status)
+        result["text"] = ai_fallback_text(summary.status, summary)
         result["status"] = "本地 Jina 不可用，使用规则回退"
         result["error"] = str(exc)
         return result
@@ -622,14 +622,15 @@ def generate_llm_explanation(
         f"时间窗口：最近 {summary.window_seconds:.0f} 秒\n"
         f"Jina 相似模式：\n{match_text}\n"
         f"结构化摘要：\n{summary.summary_text}\n\n"
-        "请输出一句谨慎的 AI 辅助研判，最多 45 个中文字符，不能写确认生命。"
+        "请输出一句现场辅助研判摘要，最多 60 个中文字符，包含依据、风险或建议中的关键点；"
+        "不能写确认生命、确定有人或类似确定性结论。"
     )
     content = _chat_completion(
         settings,
         [
             {
                 "role": "system",
-                "content": "你是灾后救援上位机的辅助研判模块。只做解释和建议，不做确认生命结论。",
+                "content": "你是灾后救援上位机的现场辅助研判模块。依据规则融合结果给出谨慎解释和复核建议，不确认生命结论。",
             },
             {"role": "user", "content": user_text},
         ],
@@ -683,7 +684,7 @@ def _base_result(settings: AISettings, summary: DetectionSummary) -> dict[str, A
         "enabled": settings.enabled,
         "running": False,
         "status": "等待 AI 分析",
-        "text": ai_fallback_text(summary.status),
+        "text": ai_fallback_text(summary.status, summary),
         "source": "rule_fallback",
         "window_start": summary.window_start,
         "window_end": summary.window_end,
@@ -696,10 +697,10 @@ def _base_result(settings: AISettings, summary: DetectionSummary) -> dict[str, A
 
 def _local_match_text(summary: DetectionSummary, matches: list[dict[str, Any]]) -> str:
     if not matches:
-        return ai_fallback_text(summary.status)
+        return ai_fallback_text(summary.status, summary)
     best = matches[0]
     score = float(best.get("score") or 0.0)
-    return f"AI辅助研判：本地模式匹配为“{best['label']}”({score * 100:.0f}%)，{best['advice']}"
+    return f"AI辅助研判：依据本地模式“{best['label']}”({score * 100:.0f}%)，{best['advice']}"
 
 
 def _sanitize_ai_text(text: str) -> str:
